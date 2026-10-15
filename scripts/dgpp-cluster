@@ -386,6 +386,15 @@ class Cluster:
     # the largest N with fixed + N * slope <= AUTO_MEMORY_FRACTION * available
     # memory (MemAvailable). The count is the minimum over the nodes, capped at
     # AUTO_SEAT_CAP (the QSA index addresses at most 2^21 pools).
+    def available_memory_gib(self, rank, host):
+        """MemAvailable on a node in GiB (the head reads its own /proc/meminfo)."""
+        if rank == 0:
+            with open("/proc/meminfo") as f:
+                kib = next((line.split()[1] for line in f if line.startswith("MemAvailable:")), "")
+        else:
+            kib = self.ssh_out(host, "awk '/^MemAvailable:/{print $2}' /proc/meminfo")
+        return int(kib) / 2**20 if kib.isdigit() else None
+
     def size_seats(self):
         engine = self.cfg["engine"]
         if engine.get("max_concurrency", "auto") != "auto":
@@ -419,15 +428,10 @@ class Cluster:
             return False
         per_node = []
         for rank, host in enumerate(self.nodes):
-            if rank == 0:  # the head runs on this host
-                with open('/proc/meminfo') as f:
-                    kib = next((line.split()[1] for line in f if line.startswith('MemAvailable:')), '')
-            else:
-                kib = self.ssh_out(host, "awk '/^MemAvailable:/{print $2}' /proc/meminfo")
-            if not kib.isdigit():
+            avail = self.available_memory_gib(rank, host)
+            if avail is None:
                 say(f"AUTO seats: could not read available memory on rank {rank} ({host})")
                 return False
-            avail = int(kib) / 2**20
             n_rank = int((frac * avail - fixed) // slope)
             per_node.append(n_rank)
             say(f"AUTO seats: rank {rank} ({host}) available {avail:.2f} GiB -> {n_rank} seat(s)")
