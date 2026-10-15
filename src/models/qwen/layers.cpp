@@ -909,7 +909,8 @@ void QwenQsaLayer::project_rows(const uint16_t* x, int tokens, const QwenQsaRows
                      mscale_, stream);
   // The caches: K/V rows, then the compressed keys and the ring.
   qsa_kv_append(kn_, KW, v_, KW, d_req, d_pos, T, cache.block_tables, cache.blocks_per_request,
-                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream);
+                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream,
+                cache.k_scales, cache.v_scales, cache.format, cache.row_bytes);
 }
 
 void QwenQsaLayer::attend_rows(int tokens, const QwenQsaRows& rows, QwenQsaCache& cache,
@@ -953,15 +954,25 @@ void QwenQsaLayer::attend_rows(int tokens, const QwenQsaRows& rows, QwenQsaCache
     const char* e = std::getenv("DGPP_QSA_WARP");
     return !(e != nullptr && e[0] == '0');
   }();
-  if (warp_attn && !rows.decode && T >= 128 && qsa_warp_supported(D, lh_, lkv_)) {
+  // A quantized cache prefills through the partial kernels: the warp
+  // kernel's quantized stage is correct (it zero-fills past the list like
+  // the cp.async path; qsa_quantized_attention_equals_the_kernels_over_the_
+  // dequantized_cache) but its synchronous per-row decode is the slower
+  // leg at long context (a 27K-token prompt, GB10, 2026-10-14: fp8 TTFT
+  // 27.5 s warp vs 23.4 s partial, fp4 36.0 s vs 24.9 s; bf16 keeps the
+  // warp kernel, 15.7 s vs 21.4 s).
+  if (warp_attn && cache.format == LatentFormat::kBf16 && !rows.decode && T >= 128 &&
+      qsa_warp_supported(D, lh_, lkv_)) {
     qsa_attn_prefill_warp(query, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
                           max_selected_, counts_, T, lh_, lkv_, cache.block_tokens, cache.block_tables,
-                          cache.blocks_per_request, scale_, attended, stream);
+                          cache.blocks_per_request, scale_, attended, stream,
+                          cache.k_scales, cache.v_scales, cache.format, cache.row_bytes);
   } else {
     const auto attend = !rows.decode && T >= 128 ? qsa_attn_prefill_partial : qsa_attn_partial;
     attend(query, static_cast<int64_t>(lh_) * D, cache.k_cache, cache.v_cache, d_req, topk_,
            max_selected_, counts_, T, n_split_, lh_, lkv_, D, cache.block_tokens,
-           cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream);
+           cache.block_tables, cache.blocks_per_request, scale_, m_ws_, l_ws_, c_ws_, stream,
+           cache.k_scales, cache.v_scales, cache.format, cache.row_bytes);
     dsa_attn_combine(m_ws_, l_ws_, c_ws_, T, n_split_, lh_, D, attended, stream);
   }
 }
@@ -1137,7 +1148,8 @@ void QwenFullAttnLayer::project_rows(const uint16_t* x, int tokens, const QwenQs
                      mscale_, stream);
   // The caches: K/V rows (no compressed keys, no ring).
   qsa_kv_append(kn_, KW, v_, KW, d_req, d_pos, T, cache.block_tables, cache.blocks_per_request,
-                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream);
+                cache.block_tokens, lkv_, D, cache.k_cache, cache.v_cache, stream,
+                cache.k_scales, cache.v_scales, cache.format, cache.row_bytes);
 }
 
 void QwenFullAttnLayer::attend_rows(int T, const QwenQsaRows& rows, QwenFullAttnCache& cache,

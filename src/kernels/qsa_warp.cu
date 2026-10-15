@@ -21,6 +21,7 @@
 // dsa_attn_combine (qsa_test), not bitwise -- the same class as SGLang's
 // kernel, which also rounds P to bf16.
 #include "kernels/qsa.hpp"
+#include "kernels/qsa_kv_io.cuh"
 
 #include <cmath>
 #include <stdexcept>
@@ -70,7 +71,9 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     const uint16_t* __restrict__ q, int64_t q_row_stride, const uint16_t* __restrict__ k_cache,
     const uint16_t* __restrict__ v_cache, const int32_t* __restrict__ req_ids, const int32_t* __restrict__ topk,
     int topk_stride, const int32_t* __restrict__ counts, int local_heads, int kv_heads, int block_tokens,
-    const int32_t* __restrict__ block_tables, int blocks_per_request, float scale, float* __restrict__ out) {
+    const int32_t* __restrict__ block_tables, int blocks_per_request, float scale, float* __restrict__ out,
+    const float* __restrict__ k_scales, const float* __restrict__ v_scales, LatentFormat format,
+    int64_t row_bytes) {
   extern __shared__ __align__(16) uint16_t sm[];
   const int64_t r = blockIdx.x;
   const int kvh = blockIdx.y;
@@ -99,6 +102,8 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     }
   }
 
+  const uint8_t* __restrict__ kplane = reinterpret_cast<const uint8_t*>(k_cache);
+  const uint8_t* __restrict__ vplane = reinterpret_cast<const uint8_t*>(v_cache);
   // Stage a tile: 16 tokens x (K, V) x 32 16-byte chunks = 1024 chunks, 32 per lane.
   auto stage = [&](int tile, int buf) {
     uint16_t* kt = sm + buf * kStageElems;
@@ -106,6 +111,40 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     const int base = tile * kTileTok;
     // Lanes 0..15 resolve the tile's 16 physical rows in one round of loads
     // (a serial token -> block-table chain per issue step starved the copies).
+    if (format != LatentFormat::kBf16) {
+      // The quantized cache: the warp decodes the tile's rows into the same
+      // bf16 stages (qsa_kv_io.cuh); no cp.async group, the syncwarp below
+      // the wait stands in for the copy's completion.
+      int64_t my_off = 0, my_soff = 0;
+      if (lane < kTileTok && base + lane < cnt) {
+        const int tok = toks[base + lane];
+        const int64_t phys = static_cast<int64_t>(bt[tok / block_tokens]) * block_tokens + tok % block_tokens;
+        my_off = phys * row_bytes;                       // the row's first stored byte
+        my_soff = phys * kv_heads;  // decode_head adds elem/kD (this head) itself
+      }
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        const int64_t off = __shfl_sync(0xffffffffu, my_off, i);
+        const int64_t soff = __shfl_sync(0xffffffffu, my_soff, i);
+        const int64_t elem = static_cast<int64_t>(kvh) * kD + lane * 8;  // the row-wide index
+        if (base + i < cnt) {
+          qsa_io::decode_head(kt + i * kRow + lane * 8, kplane + off, elem, kD,
+                              static_cast<int64_t>(width) / 2,
+                              k_scales ? k_scales + soff : nullptr, format);
+          qsa_io::decode_head(vt + i * kRow + lane * 8, vplane + off, elem, kD,
+                              static_cast<int64_t>(width) / 2,
+                              v_scales ? v_scales + soff : nullptr, format);
+        } else {
+          // Past the list: zeros, as the bf16 path's zero-fill cp.async
+          // writes. The masked P is 0, but 0 x a stale NaN in the V stage
+          // is NaN (the fp8/fp4 engine's non-finite logits, 2026-10-14).
+          *reinterpret_cast<uint4*>(kt + i * kRow + lane * 8) = make_uint4(0u, 0u, 0u, 0u);
+          *reinterpret_cast<uint4*>(vt + i * kRow + lane * 8) = make_uint4(0u, 0u, 0u, 0u);
+        }
+      }
+      __syncwarp();
+      return;
+    }
     int64_t my_off = 0;
     if (lane < kTileTok && base + lane < cnt) {
       const int tok = toks[base + lane];
@@ -232,7 +271,8 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
                            const uint16_t* v_cache, const int32_t* req_ids, const int32_t* topk, int topk_stride,
                            const int32_t* counts, int rows, int local_heads, int kv_heads, int block_tokens,
                            const int32_t* block_tables, int blocks_per_request, float scale, float* out,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, const float* k_scales, const float* v_scales,
+                           LatentFormat format, int64_t row_bytes) {
   if (rows <= 0) return;
   if (!qsa_warp_supported(kD, local_heads, kv_heads))
     throw std::invalid_argument("qsa_attn_prefill_warp: dim 256, <= 16 query heads per KV head");
@@ -245,11 +285,14 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
     return true;
   }();
   (void)opted;
+  const int64_t rb = row_bytes > 0
+                         ? row_bytes
+                         : qsa_io::row_bytes(format, static_cast<int64_t>(kv_heads) * kD);
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(kv_heads));
   qsa_attn_prefill_warp_kernel<<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache, req_ids, topk,
                                                               topk_stride, counts, local_heads, kv_heads,
                                                               block_tokens, block_tables, blocks_per_request,
-                                                              scale, out);
+                                                              scale, out, k_scales, v_scales, format, rb);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

@@ -34,6 +34,14 @@ struct QwenKvPoolShape {
   int block_tokens = 0;    // a multiple of kpool
   int max_requests = 0;
   int64_t token_slots = 0; // pool capacity in tokens, a multiple of block_tokens
+  // The K/V caches' storage format (engine.kv_dtype, 2026-10-13): kBf16 the
+  // historical cache (bitwise, the parity gate), kFp8 e4m3 row quantization
+  // (one fp32 scale per token and kv head, half the bytes), kFp4 the NVFP4
+  // recipe (e2m1 codes with e4m3 scales per 16 elements on top of the fp32
+  // row scale, a quarter of the bytes). The index cache and the rings stay
+  // bf16 in every format — the index rows are 64 B per token against the
+  // K/V rows' 2 KiB, and the compressed keys drive the top-k selection.
+  LatentFormat format = LatentFormat::kBf16;
 };
 
 class QwenKvPool {
@@ -92,12 +100,28 @@ class QwenKvPool {
   QwenKvPoolShape shape_;
   bool initialized_ = false;
   PagedBlockTable table_;
-  uint16_t* k_base_ = nullptr;      // [layers][token_slots][kv_heads * dim]
+  uint16_t* k_base_ = nullptr;      // [layers][token_slots][kv_heads * dim];
+                                    // a quantized format: the codes' plane
   uint16_t* v_base_ = nullptr;
+  float* k_scale_base_ = nullptr;   // fp8/fp4: [layers][token_slots][kv_heads]
+  float* v_scale_base_ = nullptr;
   uint16_t* idx_base_ = nullptr;    // [layers][pool_slots][idx_dim]
   uint16_t* ring_base_ = nullptr;   // [layers][max_requests][kpool][idx_dim]
   size_t kv_row_elems() const { return static_cast<size_t>(shape_.kv_heads) * shape_.dim; }
+  // The stored bytes of one token's K (or V) row under the format (the same
+  // arithmetic as qsa_io::row_bytes, kernels/qsa_kv_io.cuh).
+  size_t kv_row_bytes() const {
+    const size_t e = kv_row_elems();
+    return shape_.format == LatentFormat::kFp8      ? e
+           : shape_.format == LatentFormat::kFp4    ? e / 2 + e / 16
+                                                    : e * 2;
+  }
   size_t layer_kv_elems() const { return static_cast<size_t>(shape_.token_slots) * kv_row_elems(); }
+  size_t layer_kv_bytes() const { return static_cast<size_t>(shape_.token_slots) * kv_row_bytes(); }
+  size_t layer_scale_bytes() const {
+    return shape_.format == LatentFormat::kBf16 ? 0
+                                                : static_cast<size_t>(shape_.token_slots) * shape_.kv_heads * 4;
+  }
   size_t layer_idx_elems() const { return static_cast<size_t>(pool_slots()) * shape_.idx_dim; }
   size_t layer_ring_elems() const {
     return static_cast<size_t>(shape_.max_requests) * shape_.kpool * shape_.idx_dim;

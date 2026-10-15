@@ -36,6 +36,7 @@ import shlex
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -60,6 +61,9 @@ def say(msg=""):
 def expand(p):
     return os.path.expanduser(p)
 
+
+AUTO_MEMORY_FRACTION = 0.96
+AUTO_SEAT_CAP = 31
 
 class Cluster:
     def __init__(self, args, namespace=None):
@@ -375,6 +379,69 @@ class Cluster:
         with self.launcher_lock():
             return self._up()
 
+    # ---- automatic seat count ------------------------------------------------
+    # engine.max_concurrency "auto" (or absent): the launcher sizes the seats
+    # from the engine's own memory plan. Each seat's KV cost is the plan's slope
+    # (plan(2) - plan(1)); the fixed part is what remains. Per node the seats are
+    # the largest N with fixed + N * slope <= AUTO_MEMORY_FRACTION * available
+    # memory (MemAvailable). The count is the minimum over the nodes, capped at
+    # AUTO_SEAT_CAP (the QSA index addresses at most 2^21 pools).
+    def size_seats(self):
+        engine = self.cfg["engine"]
+        if engine.get("max_concurrency", "auto") != "auto":
+            return True
+        frac = float(os.environ.get("DGPP_AUTO_MEMORY_FRACTION", AUTO_MEMORY_FRACTION))
+        context = 262144
+        plans = {}
+        for n in (1, 2):
+            cfg = json.loads(json.dumps(self.cfg))
+            cfg["engine"]["max_concurrency"] = n
+            cfg["engine"]["kv_capacity"] = n * context
+            cfg["engine"]["queue_limit"] = max(2 * n, 1)
+            cfg["http"] = dict(cfg.get("http", {}), port=18399)
+            cfg["ports"] = dict(cfg.get("ports", {}), http=18399)
+            path = os.path.join(self.log_dir, f"autoseat-plan-{n}.json")
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(cfg, f, indent=2)
+            r = subprocess.run([self.bin, "--config", path, "--port", "18399", "--memory-plan"],
+                               capture_output=True, text=True, timeout=300)
+            m = re.findall(r"memory plan total ([0-9.]+) GiB", r.stdout + r.stderr)
+            if r.returncode or not m:
+                say(f"AUTO seats: the memory plan failed at {n} seat(s) (rc={r.returncode}); "
+                    "set engine.max_concurrency explicitly")
+                return False
+            plans[n] = float(m[0])
+        slope = plans[2] - plans[1]
+        fixed = plans[1] - slope
+        if slope <= 0:
+            say("AUTO seats: the plan does not grow with seats; set engine.max_concurrency explicitly")
+            return False
+        per_node = []
+        for rank, host in enumerate(self.nodes):
+            if rank == 0:  # the head runs on this host
+                with open('/proc/meminfo') as f:
+                    kib = next((line.split()[1] for line in f if line.startswith('MemAvailable:')), '')
+            else:
+                kib = self.ssh_out(host, "awk '/^MemAvailable:/{print $2}' /proc/meminfo")
+            if not kib.isdigit():
+                say(f"AUTO seats: could not read available memory on rank {rank} ({host})")
+                return False
+            avail = int(kib) / 2**20
+            n_rank = int((frac * avail - fixed) // slope)
+            per_node.append(n_rank)
+            say(f"AUTO seats: rank {rank} ({host}) available {avail:.2f} GiB -> {n_rank} seat(s)")
+        seats = min(min(per_node), AUTO_SEAT_CAP)
+        if seats < 1:
+            say("AUTO seats: not enough memory for one seat; reduce the prefix cache or the model footprint")
+            return False
+        say(f"AUTO seats: fixed {fixed:.2f} GiB, {slope:.3f} GiB per seat, {frac:.0%} of available; "
+            f"seats = {seats} (cap {AUTO_SEAT_CAP})")
+        self.cfg["engine"]["max_concurrency"] = seats
+        self.cfg["engine"]["kv_capacity"] = seats * context
+        self.cfg["engine"]["queue_limit"] = max(2 * seats, 1)
+        return True
+
     def _up(self):
         say(f"=== starting {self.label}")
         say("=== checking for existing rank processes")
@@ -390,6 +457,8 @@ class Cluster:
             if cluster_doctor.check_cluster(self.cfg, self.bin, self.log_dir, self.stage_dir, self.user,
                                             self.peer_bin if self.installed else None):
                 return 1
+        if not self.size_seats():
+            return 1
         if not self.stage():
             return 1
         # These logs belong to a stopped deployment and must not contain old

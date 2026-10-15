@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 
 #include "kernels/gemm.hpp"
+#include "kernels/latent_format.hpp"
 #include "kernels/kda.hpp"
 #include "models/qwen/config.hpp"
 #include "models/qwen/loader.hpp"
@@ -252,8 +253,20 @@ class QwenGdnLayer {
 // pool (models/qwen/kv_pool.hpp) hands out per layer: the block table is
 // shared by every layer, blocks_per_request == the pool's total blocks.
 struct QwenQsaCache {
+  // The bf16 pointers are the planes' base either way; under a quantized
+  // engine.kv_dtype (2026-10-13) the bytes are the codes and the scale
+  // planes: fp8 = e4m3 codes [slots, lkv * D] + fp32 row scales
+  // [slots, lkv] (absmax/448); fp4 = the NVFP4 row (e2m1 codes [slots,
+  // lkv*D/2] with the e4m3 block scales [slots, lkv*D/16] after the codes)
+  // plus the same row-scale planes (absmax/(6*448)). row_bytes is the
+  // stored width of one token's row. The index cache and the rings stay
+  // bf16 in every format.
   uint16_t* k_cache = nullptr;      // bf16 [slots, lkv * D]
   uint16_t* v_cache = nullptr;      // bf16 [slots, lkv * D]
+  float* k_scales = nullptr;        // fp8/fp4 row scales [slots, lkv]
+  float* v_scales = nullptr;        // fp8/fp4 row scales [slots, lkv]
+  int64_t row_bytes = 0;            // the stored bytes of one token's row
+  LatentFormat format = LatentFormat::kBf16;
   uint16_t* index_cache = nullptr;  // bf16 [pool_slots, Di]
   uint16_t* ring = nullptr;         // bf16 [max_requests, kpool, Di]
   int32_t* block_tables = nullptr;  // int32 [max_requests, blocks_per_request]
@@ -355,6 +368,13 @@ class QwenQsaLayer {
 struct QwenFullAttnCache {
   uint16_t* k_cache = nullptr;      // bf16 [slots, lkv * D]
   uint16_t* v_cache = nullptr;      // bf16 [slots, lkv * D]
+  // The quantized-cache view (2026-10-13), the QwenQsaCache fields above:
+  // the qwen3_5 pool serves them bf16 (null scales, 2E row_bytes), and the
+  // dense kernels read them through the bf16 path unchanged.
+  float* k_scales = nullptr;
+  float* v_scales = nullptr;
+  int64_t row_bytes = 0;
+  LatentFormat format = LatentFormat::kBf16;
   const int32_t* block_tables = nullptr;  // int32 [max_requests, blocks_per_request]
   int block_tokens = 0;
   int blocks_per_request = 0;

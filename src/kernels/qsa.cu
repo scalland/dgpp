@@ -1,4 +1,5 @@
 #include "kernels/qsa.hpp"
+#include "kernels/qsa_kv_io.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -98,22 +99,129 @@ __global__ void norm_rope_kernel(const uint16_t* __restrict__ x, int64_t x_row_s
   if (d < dim) out[r * out_row_stride + static_cast<int64_t>(h) * dim + d] = o;
 }
 
+// bf16: the plain copy it always was. fp8/fp4 (2026-10-13): a row per block,
+// each thread owning an 8-element vector; the row's (fp8: per kv head) or
+// the 16-element block's absmax goes through a shared reduction, then the
+// codes land in the code plane and the fp32 row scale in the scale plane.
+// The latent_format.hpp codecs keep the rows bit-identical to the host
+// reference's.
+template <LatentFormat F>
 __global__ void kv_append_kernel(const uint16_t* __restrict__ k, int64_t k_row_stride,
                                  const uint16_t* __restrict__ v, int64_t v_row_stride,
                                  const int32_t* __restrict__ req_ids,
                                  const int64_t* __restrict__ pos,
                                  const int32_t* __restrict__ block_tables,
-                                 int blocks_per_request, int block_tokens, int width,
-                                 uint16_t* __restrict__ k_cache, uint16_t* __restrict__ v_cache) {
+                                 int blocks_per_request, int block_tokens, int width, int dim,
+                                 int64_t row_bytes,
+                                 uint16_t* __restrict__ k_cache, uint16_t* __restrict__ v_cache,
+                                 float* __restrict__ k_scales, float* __restrict__ v_scales) {
   const int64_t r = blockIdx.x;
   const int64_t p = pos[r];
   if (p < 0) return;
   const int32_t blk = block_tables[static_cast<int64_t>(req_ids[r]) * blocks_per_request +
                                    p / block_tokens];
   const int64_t phys = static_cast<int64_t>(blk) * block_tokens + p % block_tokens;
-  for (int e = threadIdx.x; e < width; e += blockDim.x) {
-    k_cache[phys * width + e] = k[r * k_row_stride + e];
-    v_cache[phys * width + e] = v[r * v_row_stride + e];
+  if constexpr (F == LatentFormat::kBf16) {
+    for (int e = threadIdx.x; e < width; e += blockDim.x) {
+      k_cache[phys * width + e] = k[r * k_row_stride + e];
+      v_cache[phys * width + e] = v[r * v_row_stride + e];
+    }
+    return;
+  }
+  // The quantized append: thread `t` owns element vector t (8 elements).
+  const int nvec = width / 8;
+  const int kvh_n = width / dim;
+  constexpr int kSubMax = 512;  // the per-head/per-block absmax slots (64 max here)
+  __shared__ float amax[2][kSubMax];
+  if (threadIdx.x < 2 * 64) {
+    amax[0][threadIdx.x] = 0.0f;
+    amax[1][threadIdx.x] = 0.0f;
+  }
+  __syncthreads();
+  float vals[2][8];
+  int sub[2];
+  bool have = false;
+  if (static_cast<int>(threadIdx.x) < nvec) {
+    have = true;
+    const int e0 = static_cast<int>(threadIdx.x) * 8;
+    sub[0] = F == LatentFormat::kFp8 ? e0 / dim : e0 / kLatentFp4Block;
+    float m0 = 0.f, m1 = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      vals[0][i] = bf16_bits_to_float(k[r * k_row_stride + e0 + i]);
+      vals[1][i] = bf16_bits_to_float(v[r * v_row_stride + e0 + i]);
+      m0 = fmaxf(m0, fabsf(vals[0][i]));
+      m1 = fmaxf(m1, fabsf(vals[1][i]));
+    }
+    atomicMax(reinterpret_cast<int*>(&amax[0][sub[0]]), __float_as_int(m0));
+    atomicMax(reinterpret_cast<int*>(&amax[1][sub[0]]), __float_as_int(m1));
+  }
+  __syncthreads();
+  uint8_t* krow = reinterpret_cast<uint8_t*>(k_cache) + phys * row_bytes;
+  uint8_t* vrow = reinterpret_cast<uint8_t*>(v_cache) + phys * row_bytes;
+  if constexpr (F == LatentFormat::kFp8) {
+    if (static_cast<int>(threadIdx.x) < kvh_n) {  // publish the row scales, keep the inverses
+      const auto sk = latent_fp8_row_scale(amax[0][threadIdx.x]);
+      const auto sv = latent_fp8_row_scale(amax[1][threadIdx.x]);
+      k_scales[phys * kvh_n + threadIdx.x] = sk.scale;
+      v_scales[phys * kvh_n + threadIdx.x] = sv.scale;
+      amax[0][threadIdx.x] = sk.inv;
+      amax[1][threadIdx.x] = sv.inv;
+    }
+    __syncthreads();
+    if (!have) return;
+    const int e0 = static_cast<int>(threadIdx.x) * 8;
+    const int h = e0 / dim;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      krow[e0 + i] = latent_fp8_encode(vals[0][i], amax[0][h]);
+      vrow[e0 + i] = latent_fp8_encode(vals[1][i], amax[1][h]);
+    }
+  } else {  // kFp4: the NVFP4 row — an fp32 row scale (absmax/(6*448)), one
+            // e4m3 byte per 16 elements, e2m1 codes against the block scale.
+    const int nsub = width / kLatentFp4Block;
+    __shared__ float rinv[2];
+    __shared__ float rsc[2];
+    if (threadIdx.x == 0) {
+      float t0 = 0.f, t1 = 0.f;
+      for (int i = 0; i < nsub; ++i) {
+        t0 = fmaxf(t0, amax[0][i]);
+        t1 = fmaxf(t1, amax[1][i]);
+      }
+      const auto sk = latent_fp4_row_scale(t0);
+      const auto sv = latent_fp4_row_scale(t1);
+      rsc[0] = sk.scale;
+      rsc[1] = sv.scale;
+      rinv[0] = sk.inv;
+      rinv[1] = sv.inv;
+    }
+    __syncthreads();
+    // The whole row shares one fp32 row scale; it lands in every head slot
+    // so the attention's per-head scale read works unchanged.
+    if (static_cast<int>(threadIdx.x) < kvh_n) {
+      k_scales[phys * kvh_n + threadIdx.x] = rsc[0];
+      v_scales[phys * kvh_n + threadIdx.x] = rsc[1];
+    }
+    if (!have) return;
+    const int e0 = static_cast<int>(threadIdx.x) * 8;
+    const int64_t scale_area = row_bytes - width / kLatentFp4Block;
+    krow[scale_area + sub[0]] = latent_fp4_block_scale_code(amax[0][sub[0]], rinv[0]);
+    vrow[scale_area + sub[0]] = latent_fp4_block_scale_code(amax[1][sub[0]], rinv[1]);
+    // The row scale from shared memory: the scale plane's slot was written
+    // by threads 0..kvh_n-1 above with no barrier since (a global read here
+    // raced it and could see the slot's previous occupant).
+    const float kbi = latent_fp4_block_inv(latent_fp4_block_scale(krow[scale_area + sub[0]], rsc[0]));
+    const float vbi = latent_fp4_block_inv(latent_fp4_block_scale(vrow[scale_area + sub[0]], rsc[1]));
+    uint32_t kc = 0, vc = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      kc |= static_cast<uint32_t>(latent_fp4_encode(vals[0][2 * i], kbi)) << (8 * i);
+      kc |= static_cast<uint32_t>(latent_fp4_encode(vals[0][2 * i + 1], kbi)) << (8 * i + 4);
+      vc |= static_cast<uint32_t>(latent_fp4_encode(vals[1][2 * i], vbi)) << (8 * i);
+      vc |= static_cast<uint32_t>(latent_fp4_encode(vals[1][2 * i + 1], vbi)) << (8 * i + 4);
+    }
+    *reinterpret_cast<uint32_t*>(krow + e0 / 2) = kc;
+    *reinterpret_cast<uint32_t*>(vrow + e0 / 2) = vc;
   }
 }
 
@@ -470,7 +578,9 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
                                     const int32_t* __restrict__ block_tables,
                                     int blocks_per_request, float scale, float* __restrict__ m_ws,
                                     float* __restrict__ l_ws, float* __restrict__ c_ws,
-                                    int async_gather) {
+                                    int async_gather, const float* __restrict__ k_scales,
+                                    const float* __restrict__ v_scales, LatentFormat format,
+                                    int64_t row_bytes) {
   constexpr int kGroups = 32;
   constexpr int kDslice = D / kGroups;  // 8 at D=256
   constexpr int kRowStride = D + 8;     // padded smem row (u16)
@@ -663,7 +773,7 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
     }
   };
 
-  if (async_gather) {
+  if (async_gather && format == LatentFormat::kBf16) {
     int n = min(kQsaTile, t_end - t_begin);
     int64_t* phys_cur = phys_rows;
     int64_t* phys_nxt = phys_next;
@@ -697,11 +807,18 @@ __global__ void attn_partial_kernel(const uint16_t* __restrict__ q, int64_t q_ro
       const int n = min(kQsaTile, t_end - t0);
       resolve(t0, n, phys_rows);
       __syncthreads();
-      const int total = n * kVecPerRow * 2;
-      for (int base = 0; base < total; base += kGatherBatch * static_cast<int>(blockDim.x)) {
-        uint4 buf[kGatherBatch];
-        load_tile(n, phys_rows, buf, base);
-        store_tile(n, buf, base);
+      if (format == LatentFormat::kBf16) {
+        const int total = n * kVecPerRow * 2;
+        for (int base = 0; base < total; base += kGatherBatch * static_cast<int>(blockDim.x)) {
+          uint4 buf[kGatherBatch];
+          load_tile(n, phys_rows, buf, base);
+          store_tile(n, buf, base);
+        }
+      } else {  // the quantized cache: decode the tile (the bf16 loads would
+                // read codes; the smem tile's stride is the same D+8 rows)
+        qsa_io::gather_tile<D>(reinterpret_cast<const uint8_t*>(k_cache),
+                               reinterpret_cast<const uint8_t*>(v_cache), k_scales, v_scales,
+                               format, row_bytes, kv_heads, phys_rows, n, kvh, kt, vt);
       }
       __syncthreads();
       scores_phase(n);
@@ -771,13 +888,28 @@ void qsa_kv_append(const uint16_t* k, int64_t k_row_stride, const uint16_t* v, i
                    const int32_t* req_ids, const int64_t* pos, int rows,
                    const int32_t* block_tables, int blocks_per_request, int block_tokens,
                    int kv_heads, int dim, uint16_t* k_cache, uint16_t* v_cache,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, float* k_scales, float* v_scales,
+                   LatentFormat format, int64_t row_bytes) {
   if (rows <= 0) return;
   if (!k || !v || !req_ids || !pos || !block_tables || !k_cache || !v_cache)
     throw std::invalid_argument("qsa_kv_append: null pointer");
-  kv_append_kernel<<<static_cast<unsigned>(rows), 256, 0, stream>>>(
-      k, k_row_stride, v, v_row_stride, req_ids, pos, block_tables, blocks_per_request,
-      block_tokens, kv_heads * dim, k_cache, v_cache);
+  const int width = kv_heads * dim;
+  const int64_t rb = row_bytes > 0 ? row_bytes : qsa_io::row_bytes(format, width);
+  if (format != LatentFormat::kBf16 && (!k_scales || !v_scales))
+    throw std::invalid_argument("qsa_kv_append: a quantized cache needs its scale planes");
+  const int threads =
+      format == LatentFormat::kBf16 ? 256 : std::max(32, std::min(1024, width / 8));
+  const auto launch = [&](auto fmt) {
+    kv_append_kernel<decltype(fmt)::value><<<static_cast<unsigned>(rows), threads, 0, stream>>>(
+        k, k_row_stride, v, v_row_stride, req_ids, pos, block_tables, blocks_per_request,
+        block_tokens, width, dim, rb, k_cache, v_cache, k_scales, v_scales);
+  };
+  if (format == LatentFormat::kFp8)
+    launch(std::integral_constant<LatentFormat, LatentFormat::kFp8>{});
+  else if (format == LatentFormat::kFp4)
+    launch(std::integral_constant<LatentFormat, LatentFormat::kFp4>{});
+  else
+    launch(std::integral_constant<LatentFormat, LatentFormat::kBf16>{});
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -876,10 +1008,13 @@ void qsa_attn_partial(const uint16_t* q, int64_t q_row_stride, const uint16_t* k
                       int topk_stride, const int32_t* counts, int rows, int n_split,
                       int local_heads, int kv_heads, int dim, int block_tokens,
                       const int32_t* block_tables, int blocks_per_request, float scale,
-                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream) {
+                      float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                      const float* k_scales, const float* v_scales, LatentFormat format,
+                      int64_t row_bytes) {
   qsa_attn_partial_gather(q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, rows,
                           n_split, local_heads, kv_heads, dim, block_tokens, block_tables,
-                          blocks_per_request, scale, m_ws, l_ws, c_ws, stream, -1, 0, 0);
+                          blocks_per_request, scale, m_ws, l_ws, c_ws, stream, -1, 0, 0,
+                          k_scales, v_scales, format, row_bytes);
 }
 
 void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
@@ -888,7 +1023,9 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
                              int local_heads, int kv_heads, int dim, int block_tokens,
                              const int32_t* block_tables, int blocks_per_request, float scale,
                              float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
-                             int async_gather, int heads_per_block, int heads_per_warp) {
+                             int async_gather, int heads_per_block, int heads_per_warp,
+                             const float* k_scales, const float* v_scales, LatentFormat format,
+                             int64_t row_bytes) {
   if (rows <= 0) return;
   if (!q || !k_cache || !v_cache || !req_ids || !topk || !counts || !block_tables || !m_ws ||
       !l_ws || !c_ws)
@@ -909,6 +1046,10 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
     return (v && v[0] == '0') ? 0 : 1;
   }();
   if (async_gather < 0) async_gather = env_async;
+  const int64_t rb = row_bytes > 0
+                         ? row_bytes
+                         : qsa_io::row_bytes(format, static_cast<int64_t>(kv_heads) * dim);
+  if (format != LatentFormat::kBf16) async_gather = 0;  // the cp.async path is the bf16 layout's
   int hpb = heads_per_block;
   if (hpb <= 0) {
     hpb = 8;
@@ -930,7 +1071,8 @@ void qsa_attn_partial_gather(const uint16_t* q, int64_t q_row_stride, const uint
     constexpr int H = decltype(hpw_tag)::value;
     attn_partial_kernel<D, H><<<grid, threads, smem, stream>>>(
         q, q_row_stride, k_cache, v_cache, req_ids, topk, topk_stride, counts, n_split, local_heads,
-        kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws, l_ws, c_ws, async_gather);
+        kv_heads, block_tokens, block_tables, blocks_per_request, scale, m_ws, l_ws, c_ws, async_gather,
+        k_scales, v_scales, format, rb);
   };
   const auto by_hpw = [&](auto dim_tag) {
     switch (hpw) {

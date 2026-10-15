@@ -25,7 +25,9 @@
 #include "common/test.hpp"
 #include "kda_test_helpers.hpp"
 #include "kernels/dsa.hpp"
+#include "kernels/latent_format.hpp"
 #include "kernels/qsa.hpp"
+#include "kernels/qsa_kv_io.cuh"
 #include "kernels/rope_scaling.hpp"
 #include "models/qwen/qsa_reference.hpp"
 
@@ -971,7 +973,9 @@ DGPP_TEST(qsa_listed_attention_and_gate_match_the_reference) {
                              ptr<uint16_t>(vc), ptr<int32_t>(sf.dreq), ptr<int32_t>(dtopk), g.max_selected(),
                              ptr<int32_t>(dcounts), rows, n_split, g.local_heads, g.kv_heads, g.dim, g.block_tokens,
                              ptr<int32_t>(sf.f.dtable), g.blocks_per_request, 1.0f / 16.0f, mptr<float>(m_ws),
-                             mptr<float>(l_ws), mptr<float>(c_ws), st);
+                             mptr<float>(l_ws), mptr<float>(c_ws), st,
+                             static_cast<const float*>(nullptr), static_cast<const float*>(nullptr),
+                             dgpp::LatentFormat::kBf16, static_cast<int64_t>(0));
       dgpp::dsa_attn_combine(ptr<float>(m_ws), ptr<float>(l_ws), ptr<float>(c_ws), rows, n_split, g.local_heads, g.dim,
                              mptr<float>(c_out), st);
       dgpp::qsa_gate_out(ptr<float>(c_out), ptr<uint16_t>(dqg) + g.dim, q_row_stride, q_head_stride, mptr<uint16_t>(out),
@@ -1079,7 +1083,9 @@ DGPP_TEST(qsa_prefill_partials_preserve_arithmetic_and_graph_replay) {
            ptr<int32_t>(dtopk), stride, ptr<int32_t>(dcounts), rows, splits, heads, kv_heads, dim,
            block_tokens, ptr<int32_t>(dtable), blocks, 1.0f / 16,
            mptr<float>(candidate ? m1 : m0), mptr<float>(candidate ? l1 : l0),
-           mptr<float>(candidate ? c1 : c0), stream);
+           mptr<float>(candidate ? c1 : c0), stream,
+           static_cast<const float*>(nullptr), static_cast<const float*>(nullptr),
+           dgpp::LatentFormat::kBf16, static_cast<int64_t>(0));
       };
       launch(false);
       launch(true);
@@ -1210,5 +1216,254 @@ DGPP_TEST(qsa_warp_prefill_matches_the_partial_kernels) {
   }
   std::printf("[ .. ] warp vs partial+combine: worst per-(row, head) rel l2 %.3g\n", worst_overall);
 }
+
+// ---- R-1: the quantized K/V caches (engine.kv_dtype fp8/fp4 on qwen4_exp) ----
+// The append kernel's stored rows bitwise the host codec's
+// (latent_quantize_row_host: fp8 per kv head, fp4 over the token's whole
+// row), the device decode (qsa_io::decode_head, the gathers' codec)
+// bitwise latent_dequantize_row_host, and every attention kernel over the
+// quantized planes bitwise the same kernel over the host-dequantized bf16
+// cache — the warp prefill included, its partial last tile zero-filled
+// like the bf16 cp.async path (smem poisoned with NaNs first).
+
+namespace {
+
+__global__ void r1_decode_rows_kernel(const uint8_t* plane, const float* scales, dgpp::LatentFormat f,
+                                      int64_t rb, int kv_heads, int dim, uint16_t* out) {
+  const int64_t t = blockIdx.x;
+  const int width = kv_heads * dim;
+  for (int v = static_cast<int>(threadIdx.x); v < width / 8; v += static_cast<int>(blockDim.x)) {
+    const int64_t elem = static_cast<int64_t>(v) * 8;
+    dgpp::qsa_io::decode_head(out + t * width + elem, plane + t * rb, elem, dim,
+                              static_cast<int64_t>(width) / 2, scales ? scales + t * kv_heads : nullptr, f);
+  }
+}
+
+// Fills every SM's shared memory with bf16 NaNs (0xFFFF) so a kernel that
+// reads smem it never wrote sees poison, not a lucky zero.
+__global__ void r1_poison_smem_kernel(int words) {
+  extern __shared__ uint16_t sm[];
+  for (int i = static_cast<int>(threadIdx.x); i < words; i += static_cast<int>(blockDim.x)) sm[i] = 0xFFFFu;
+  __syncthreads();
+  if (sm[threadIdx.x % words] == 0x1234u) sm[0] = 0;  // keep the stores
+}
+
+void r1_poison_smem(cudaStream_t stream) {
+  int dev = 0, smem = 0, sms = 0;
+  DGPP_CUDA_OK(cudaGetDevice(&dev));
+  DGPP_CUDA_OK(cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  DGPP_CUDA_OK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  DGPP_CUDA_OK(cudaFuncSetAttribute(r1_poison_smem_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  r1_poison_smem_kernel<<<sms * 4, 256, static_cast<size_t>(smem), stream>>>(smem / 2);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+// One request's cache: slots = blocks * block_tokens behind a permuted
+// table, `T` rows appended from position pos0 (mid-block).
+struct R1Cache {
+  dgpp::LatentFormat f;
+  int kv_heads, dim, block_tokens, blocks;
+  int64_t rb;
+  std::vector<int32_t> table;
+  DevBuf k, v, ks, vs, dtable;
+  std::vector<uint8_t> hk, hv;   // downloaded planes
+  std::vector<float> hks, hvs;
+  int width() const { return kv_heads * dim; }
+  int64_t slots() const { return static_cast<int64_t>(blocks) * block_tokens; }
+  int64_t phys(int64_t p) const {
+    return static_cast<int64_t>(table[static_cast<size_t>(p / block_tokens)]) * block_tokens + p % block_tokens;
+  }
+};
+
+R1Cache r1_fill(dgpp::LatentFormat f, int kv_heads, int dim, int block_tokens, int64_t pos0, int T,
+                const std::vector<uint16_t>& kin, const std::vector<uint16_t>& vin, cudaStream_t stream) {
+  R1Cache c{f, kv_heads, dim, block_tokens, static_cast<int>((pos0 + T) / block_tokens + 1)};
+  c.rb = dgpp::qsa_io::row_bytes(f, static_cast<int64_t>(kv_heads) * dim);
+  c.table.resize(static_cast<size_t>(c.blocks));
+  for (int i = 0; i < c.blocks; ++i) c.table[static_cast<size_t>(i)] = (i * 7 + 3) % c.blocks;
+  require(std::gcd(7, c.blocks) == 1 || c.blocks == 1, "r1: the table must be a permutation");
+  c.dtable = up(c.table);
+  c.k = DevBuf(static_cast<size_t>(c.slots() * c.rb));
+  c.v = DevBuf(static_cast<size_t>(c.slots() * c.rb));
+  c.ks = DevBuf(static_cast<size_t>(c.slots() * kv_heads * 4));
+  c.vs = DevBuf(static_cast<size_t>(c.slots() * kv_heads * 4));
+  DGPP_CUDA_OK(cudaMemsetAsync(c.k.p, 0, c.k.bytes, stream));
+  DGPP_CUDA_OK(cudaMemsetAsync(c.v.p, 0, c.v.bytes, stream));
+  DGPP_CUDA_OK(cudaMemsetAsync(c.ks.p, 0, c.ks.bytes, stream));
+  DGPP_CUDA_OK(cudaMemsetAsync(c.vs.p, 0, c.vs.bytes, stream));
+  std::vector<int32_t> req(static_cast<size_t>(T), 0);
+  std::vector<int64_t> pos(static_cast<size_t>(T));
+  for (int i = 0; i < T; ++i) pos[static_cast<size_t>(i)] = pos0 + i;
+  DevBuf dk = up(kin), dv = up(vin), dreq = up(req), dpos = up(pos);
+  dgpp::qsa_kv_append(ptr<uint16_t>(dk), c.width(), ptr<uint16_t>(dv), c.width(), ptr<int32_t>(dreq),
+                      ptr<int64_t>(dpos), T, ptr<int32_t>(c.dtable), c.blocks, block_tokens, kv_heads, dim,
+                      mptr<uint16_t>(c.k), mptr<uint16_t>(c.v), stream, mptr<float>(c.ks), mptr<float>(c.vs), f,
+                      c.rb);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  c.hk = down<uint8_t>(c.k, c.k.bytes);
+  c.hv = down<uint8_t>(c.v, c.v.bytes);
+  c.hks = down<float>(c.ks, static_cast<size_t>(c.slots() * kv_heads));
+  c.hvs = down<float>(c.vs, static_cast<size_t>(c.slots() * kv_heads));
+  return c;
+}
+
+// The host codec's stored row for one token: codes (rb bytes) + its
+// per-head row scales.
+void r1_host_quantize(const R1Cache& c, const uint16_t* row, std::vector<uint8_t>& out, std::vector<float>& sc) {
+  const int W = c.width();
+  out.assign(static_cast<size_t>(c.rb), 0);
+  sc.assign(static_cast<size_t>(c.kv_heads), 0.f);
+  if (c.f == dgpp::LatentFormat::kFp8) {
+    for (int h = 0; h < c.kv_heads; ++h)
+      dgpp::latent_quantize_row_host(c.f, row + h * c.dim, c.dim, out.data() + h * c.dim, &sc[static_cast<size_t>(h)]);
+  } else {
+    std::vector<uint8_t> tmp(dgpp::latent_row_bytes(c.f, W));
+    float s = 0.f;
+    dgpp::latent_quantize_row_host(c.f, row, W, tmp.data(), &s);
+    std::copy(tmp.begin(), tmp.begin() + c.rb, out.begin());
+    for (auto& x : sc) x = s;
+  }
+}
+
+void r1_host_dequantize(const R1Cache& c, const uint8_t* row, const float* sc, uint16_t* out) {
+  if (c.f == dgpp::LatentFormat::kFp8) {
+    for (int h = 0; h < c.kv_heads; ++h)
+      dgpp::latent_dequantize_row_host(c.f, row + h * c.dim, sc[h], c.dim, out + h * c.dim);
+  } else {
+    dgpp::latent_dequantize_row_host(c.f, row, sc[0], c.width(), out);
+  }
+}
+
+}  // namespace
+
+DGPP_TEST(qsa_quantized_kv_append_and_decode_round_trip_the_host_codec) {
+  cudaStream_t stream = test_stream();
+  int cases = 0;
+  for (const auto f : {dgpp::LatentFormat::kFp8, dgpp::LatentFormat::kFp4})
+    for (const int kv_heads : {1, 2})
+      for (const int dim : {128, 256, 512})
+        for (const int T : {300, 1200}) {
+          const int W = kv_heads * dim;
+          const int64_t pos0 = 37;  // rows start mid-block and cross block edges
+          auto k = random_bf16_normal(900 + W + T, static_cast<int64_t>(T) * W, 1.0f);
+          auto v = random_bf16_normal(950 + W + T, static_cast<int64_t>(T) * W, 0.5f);
+          for (int i = 0; i < W; ++i) k[static_cast<size_t>(5) * W + i] = 0;  // an all-zero row
+          k[static_cast<size_t>(7) * W + 3] = float_to_bf16_bits(300.f);       // an outlier
+          R1Cache c = r1_fill(f, kv_heads, dim, 64, pos0, T, k, v, stream);
+          const std::string tag = std::string(dgpp::latent_format_name(f)) + " kv=" + std::to_string(kv_heads) +
+                                  " dim=" + std::to_string(dim) + " T=" + std::to_string(T);
+          // Device decode of every slot.
+          DevBuf dk_dec(static_cast<size_t>(c.slots() * W * 2)), dv_dec(static_cast<size_t>(c.slots() * W * 2));
+          r1_decode_rows_kernel<<<static_cast<unsigned>(c.slots()), 128, 0, stream>>>(
+              ptr<uint8_t>(c.k), ptr<float>(c.ks), f, c.rb, kv_heads, dim, mptr<uint16_t>(dk_dec));
+          r1_decode_rows_kernel<<<static_cast<unsigned>(c.slots()), 128, 0, stream>>>(
+              ptr<uint8_t>(c.v), ptr<float>(c.vs), f, c.rb, kv_heads, dim, mptr<uint16_t>(dv_dec));
+          DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+          const auto kdec = down<uint16_t>(dk_dec, static_cast<size_t>(c.slots() * W));
+          const auto vdec = down<uint16_t>(dv_dec, static_cast<size_t>(c.slots() * W));
+          std::vector<uint8_t> want;
+          std::vector<float> wsc;
+          std::vector<uint16_t> deq(static_cast<size_t>(W));
+          for (int t = 0; t < T; ++t) {
+            const int64_t ph = c.phys(pos0 + t);
+            for (int which = 0; which < 2; ++which) {
+              const auto& src = which == 0 ? k : v;
+              const auto& plane = which == 0 ? c.hk : c.hv;
+              const auto& scales = which == 0 ? c.hks : c.hvs;
+              const auto& dec = which == 0 ? kdec : vdec;
+              const std::string at = tag + (which == 0 ? " K" : " V") + " token " + std::to_string(t);
+              r1_host_quantize(c, src.data() + static_cast<size_t>(t) * W, want, wsc);
+              require(std::memcmp(want.data(), plane.data() + ph * c.rb, static_cast<size_t>(c.rb)) == 0,
+                      at + ": stored codes differ from the host codec");
+              for (int h = 0; h < kv_heads; ++h)
+                require(std::memcmp(&wsc[static_cast<size_t>(h)], &scales[static_cast<size_t>(ph * kv_heads + h)], 4) == 0,
+                        at + ": row scale differs from the host codec");
+              r1_host_dequantize(c, plane.data() + ph * c.rb, scales.data() + ph * kv_heads, deq.data());
+              require(std::memcmp(deq.data(), dec.data() + ph * W, static_cast<size_t>(W) * 2) == 0,
+                      at + ": device decode differs from latent_dequantize_row_host");
+            }
+          }
+          ++cases;
+        }
+  std::printf("[ .. ] quantized append + decode bitwise the host codec over %d shapes\n", cases);
+}
+
+DGPP_TEST(qsa_quantized_attention_equals_the_kernels_over_the_dequantized_cache) {
+  constexpr int dim = 256;
+  const std::vector<int32_t> counts{0, 1, 7, 15, 16, 17, 33, 255, 300, 1000, 1199};
+  const int rows = static_cast<int>(counts.size());
+  const int T = 1200, block_tokens = 64;
+  const int64_t pos0 = 0;
+  cudaStream_t stream = test_stream();
+  for (const auto f : {dgpp::LatentFormat::kFp8, dgpp::LatentFormat::kFp4})
+    for (auto shape : {std::pair{12, 1}, std::pair{24, 2}, std::pair{4, 2}}) {
+      const int heads = shape.first, kv_heads = shape.second, W = kv_heads * dim, qstride = heads * dim + 8;
+      auto k = random_bf16_normal(1300 + W, static_cast<int64_t>(T) * W, 1.0f);
+      auto v = random_bf16_normal(1350 + W, static_cast<int64_t>(T) * W, 1.0f);
+      R1Cache c = r1_fill(f, kv_heads, dim, block_tokens, pos0, T, k, v, stream);
+      // The bf16 cache the quantized planes dequantize to (every slot; the
+      // never-written ones are zero codes with zero scales -> zeros).
+      std::vector<uint16_t> bk(static_cast<size_t>(c.slots() * W)), bv(bk.size());
+      for (int64_t s = 0; s < c.slots(); ++s) {
+        r1_host_dequantize(c, c.hk.data() + s * c.rb, c.hks.data() + s * kv_heads, bk.data() + s * W);
+        r1_host_dequantize(c, c.hv.data() + s * c.rb, c.hvs.data() + s * kv_heads, bv.data() + s * W);
+      }
+      DevBuf dbk = up(bk), dbv = up(bv);
+      auto q = random_bf16_normal(1400 + heads, static_cast<int64_t>(rows) * qstride, 1.0f);
+      std::vector<int32_t> req(static_cast<size_t>(rows), 0), topk(static_cast<size_t>(rows) * T, -1);
+      for (int r = 0; r < rows; ++r)
+        for (int i = 0; i < counts[static_cast<size_t>(r)]; ++i)
+          topk[static_cast<size_t>(r) * T + i] = (i * 13 + r) % T;
+      DevBuf dq = up(q), dreq = up(req), dtopk = up(topk), dcounts = up(counts);
+      const size_t part = static_cast<size_t>(rows) * heads;
+      const std::string tag = std::string(dgpp::latent_format_name(f)) + " heads=" + std::to_string(heads) +
+                              " kv=" + std::to_string(kv_heads);
+      using Fn = void (*)(const uint16_t*, int64_t, const uint16_t*, const uint16_t*, const int32_t*,
+                          const int32_t*, int, const int32_t*, int, int, int, int, int, int,
+                          const int32_t*, int, float, float*, float*, float*, cudaStream_t,
+                          const float*, const float*, dgpp::LatentFormat, int64_t);
+      for (const auto& [name, fn] : {std::pair<const char*, Fn>{"partial", &dgpp::qsa_attn_partial},
+                                     std::pair<const char*, Fn>{"prefill_partial", &dgpp::qsa_attn_prefill_partial}})
+        for (const int splits : {1, 3}) {
+          std::vector<float> outs[2];
+          for (int quant = 0; quant < 2; ++quant) {
+            DevBuf m(part * splits * 4), l(part * splits * 4), cw(part * splits * dim * 4), o(part * dim * 4);
+            fn(ptr<uint16_t>(dq), qstride, quant ? ptr<uint16_t>(c.k) : ptr<uint16_t>(dbk),
+               quant ? ptr<uint16_t>(c.v) : ptr<uint16_t>(dbv), ptr<int32_t>(dreq), ptr<int32_t>(dtopk), T,
+               ptr<int32_t>(dcounts), rows, splits, heads, kv_heads, dim, block_tokens, ptr<int32_t>(c.dtable),
+               c.blocks, 1.0f / 16, mptr<float>(m), mptr<float>(l), mptr<float>(cw), stream,
+               quant ? ptr<float>(c.ks) : nullptr, quant ? ptr<float>(c.vs) : nullptr,
+               quant ? f : dgpp::LatentFormat::kBf16, quant ? c.rb : 0);
+            dgpp::dsa_attn_combine(ptr<float>(m), ptr<float>(l), ptr<float>(cw), rows, splits, heads, dim,
+                                   mptr<float>(o), stream);
+            DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+            outs[quant] = down<float>(o, part * dim);
+          }
+          require(std::memcmp(outs[0].data(), outs[1].data(), outs[0].size() * 4) == 0,
+                  tag + " " + name + " splits=" + std::to_string(splits) +
+                      ": quantized attention differs from the kernel over the dequantized cache");
+        }
+      if (dgpp::qsa_warp_supported(dim, heads, kv_heads)) {
+        std::vector<float> outs[2];
+        for (int quant = 0; quant < 2; ++quant) {
+          DevBuf o(part * dim * 4);
+          DGPP_CUDA_OK(cudaMemsetAsync(o.p, 0xff, o.bytes, stream));
+          r1_poison_smem(stream);
+          dgpp::qsa_attn_prefill_warp(ptr<uint16_t>(dq), qstride, quant ? ptr<uint16_t>(c.k) : ptr<uint16_t>(dbk),
+                                      quant ? ptr<uint16_t>(c.v) : ptr<uint16_t>(dbv), ptr<int32_t>(dreq),
+                                      ptr<int32_t>(dtopk), T, ptr<int32_t>(dcounts), rows, heads, kv_heads,
+                                      block_tokens, ptr<int32_t>(c.dtable), c.blocks, 1.0f / 16, mptr<float>(o),
+                                      stream, quant ? ptr<float>(c.ks) : nullptr, quant ? ptr<float>(c.vs) : nullptr,
+                                      quant ? f : dgpp::LatentFormat::kBf16, quant ? c.rb : 0);
+          DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+          outs[quant] = down<float>(o, part * dim);
+        }
+        for (float x : outs[1]) require(std::isfinite(x), tag + " warp: non-finite output");
+        require(std::memcmp(outs[0].data(), outs[1].data(), outs[0].size() * 4) == 0,
+                tag + " warp: quantized attention differs from the kernel over the dequantized cache");
+      }
+    }
+}
+
 
 int main() { return dgpp::test::run_all(); }
