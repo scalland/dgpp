@@ -642,6 +642,11 @@ struct AdmissionPolicy {
   // Serving supplies default latency targets; zero retains fixed budgeting.
   int decode_gap_target_ms = 0;
   int first_token_target_ms = 0;
+  // A4 decode interleave: with a chunked prefill in flight and decoders live,
+  // k decode passes run between prefill chunks. 0 keeps the default schedule
+  // (one decode pass per tick); k = 1 is that same schedule. Only whole
+  // chunks move between ticks, so each request's chunks keep their order.
+  int decode_steps_per_prefill = 0;
   PrefillLatencyTuning prefill_latency;
   bool prefill_budget_automatic = false;  // busy is a starting point, idle the adaptive ceiling
   // The prefix cache's entry policy (2026-09-28), rank-identical like the
@@ -666,6 +671,7 @@ struct AdmissionPolicy {
     return mode == o.mode && window_tokens == o.window_tokens && prefill_budget_tokens == o.prefill_budget_tokens &&
            prefill_idle_budget_tokens == o.prefill_idle_budget_tokens &&
            decode_gap_target_ms == o.decode_gap_target_ms && first_token_target_ms == o.first_token_target_ms &&
+           decode_steps_per_prefill == o.decode_steps_per_prefill &&
            prefill_latency == o.prefill_latency &&
            prefill_budget_automatic == o.prefill_budget_automatic &&
            prefill_early_admission == o.prefill_early_admission &&
@@ -1143,6 +1149,7 @@ class Scheduler {
   int64_t prefill_pass_budget_tokens_ = 0;  // before final-tail allocation trims
   int64_t prefill_adaptive_limit_tokens_ = 0;
   double prefill_decode_pass_ms_ = 0;  // meters: the learned decoders' pass at the last tick's load
+  int decode_run_ = 0;             // decode passes since the last prefill chunk (A4)
   int64_t grows_ = 0;              // growth events (meters)
   int64_t pool_sheds_ = 0;         // requests shed at exhaustion (meters)
   int64_t prompts_prefilled_ = 0;  // the throughput line's counters (meters)

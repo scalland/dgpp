@@ -132,6 +132,12 @@ Scheduler::Scheduler(SchedulerEngine* engine,
                                 "at least the busy budget and no larger than the engine's prefill limit");
   if (policy_.prefix_min_tokens < 0)
     throw std::invalid_argument("Scheduler: prefix_min_tokens must be nonnegative");
+  if (policy_.decode_steps_per_prefill != 0 && policy_.decode_steps_per_prefill != 1 &&
+      policy_.decode_steps_per_prefill != 2 && policy_.decode_steps_per_prefill != 4)
+    throw std::invalid_argument("Scheduler: decode steps per prefill chunk must be 0 (off), 1, 2 or 4");
+  if (policy_.decode_steps_per_prefill > 0)
+    DGPP_LOG_INFO("sched: decode interleave mode, k={} (decode passes per prefill chunk)",
+                  policy_.decode_steps_per_prefill);
   if (queue_limit_ < 0)
     throw std::invalid_argument(
         "Scheduler: queue_limit must be 0 (unbounded) or positive");
@@ -1431,6 +1437,8 @@ void Scheduler::retire(int arrival, Result::Status status,
                                   static_cast<double>(acceptance.attempts[p]));
     if (!accept.empty()) line += ", accept" + accept;
   }
+  if (policy_.decode_steps_per_prefill > 0)
+    line += std::format(" [decode interleave k={}]", policy_.decode_steps_per_prefill);
   DGPP_LOG_INFO("{}", line);
   release_retired(r, res);
 }
@@ -1614,6 +1622,13 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
       : requests_.end();
   const bool prefill_in_flight = prefill != requests_.end();
   if (!any_active && !any_queued && !prefill_in_flight) return false;
+  // A4 decode interleave: while decoders are live and fewer than k decode
+  // passes have run since the last prefill chunk, this tick holds the chunk
+  // (and any admission) and runs a decode pass only. Whole chunks move; a
+  // request's chunks are never split or reordered.
+  const bool hold_prefill = policy_.decode_steps_per_prefill > 0 && prefill_in_flight && any_active &&
+                            decode_run_ < policy_.decode_steps_per_prefill;
+  bool yielded = false;       // a prefill chunk advanced this tick
 
   bool progressed = false;
   bool admitted_any = false;  // anything left the queue this tick
@@ -1658,7 +1673,7 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
   // stream of the weights however many they are.
   const bool group_advance = policy_.prefill_budget_tokens > 0 && engine_->prefill_group_advance() &&
                             (policy_.prefill_early_admission || engine_->prefill_budget_per_reader());
-  bool chunk_tick = prefill_in_flight;
+  bool chunk_tick = prefill_in_flight && !hold_prefill;
   if (group_advance) {
     int64_t readers = 0;
     int open_slots = static_cast<int>(std::count(slots_.begin(), slots_.end(), -1));
@@ -1677,7 +1692,7 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
       budget = std::min<int64_t>(engine_->prefill_chunk_limit() / align * align, fixed_budget * readers);
       if (adaptive_budget) budget = std::min(budget, *adaptive_budget);
     }
-    chunk_tick = readers > 0;
+    chunk_tick = readers > 0 && !hold_prefill;
   }
   // Reader allocation below trims final tails to their remaining work. Keep
   // the original quantum for feedback: eight tokens filling an eight-token
@@ -1740,6 +1755,7 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
     for (const int b : begins) inflight.push_back(b);
   }
   if (!inflight.empty()) {
+    yielded = true;
     if (inflight.size() > max_advances) {
       // Idle admissions may outnumber the smaller busy budget's chunks.
       // Rotate a bounded slice so every unfinished request gets a turn;
@@ -1862,7 +1878,7 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
       admitted_any = true;
       progressed = true;
     }
-  } else {
+  } else if (!hold_prefill) {
     // No prefill in flight: admit fitting queued requests in a loop before
     // the decode slice is built. The loop stops at the tick's prefill
     // budget, at a chunked start, or when nothing fitting remains.
@@ -1877,7 +1893,7 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
       if (budget == 0) break;
     }
   }
-  if (!admitted_any && any_queued) {
+  if (!admitted_any && any_queued && !hold_prefill) {
     // Deferral bookkeeping: log the head of the queue once per
     // deferral episode, with the numbers an operator needs. A request
     // waiting on the cold tier's restore is not deferred (issue #26).
@@ -1923,6 +1939,15 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
     rolling_snapshots();
     step_batch(step_arrivals);
     progressed = true;
+    if (policy_.decode_steps_per_prefill > 0) {
+      // The decode pass that shares a chunk's tick counts toward its k, and
+      // so does a pass beside a read-in that began this tick without a chunk.
+      const bool reading = std::any_of(requests_.begin(), requests_.end(),
+          [](const Request& r) { return r.state == State::kPrefilling; });
+      if (yielded) decode_run_ = 1;
+      else if (reading) decode_run_ = std::min(decode_run_ + 1, policy_.decode_steps_per_prefill);
+      else decode_run_ = 0;
+    }
   }
 
   if (!progressed) {
