@@ -41,6 +41,9 @@ constexpr int kStageElems = 2 * kTileTok * kRow;  // K then V
 #endif
 constexpr int kStages = DGPP_QSA_WARP_STAGES;
 constexpr size_t kSmem = size_t(kStages) * kStageElems * 2;  // bytes
+// fp8 codes staged raw (D4): 16 tokens x (K, V) x 256 code bytes, after the bf16 stages.
+constexpr int kRawBytes = 2 * kTileTok * kD;
+constexpr size_t kSmemFp8 = kSmem + size_t(kRawBytes);
 
 __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
   const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
@@ -109,6 +112,59 @@ __global__ __launch_bounds__(32) void qsa_attn_prefill_warp_kernel(
     uint16_t* kt = sm + buf * kStageElems;
     uint16_t* vt = kt + kTileTok * kRow;
     const int base = tile * kTileTok;
+    if (format == LatentFormat::kFp8) {
+      // fp8 codes (D4): the tile's raw code bytes cp.async into the raw region
+      // (lanes 0-15 copy each row's K chunk, lanes 16-31 its V chunk, one
+      // 16-byte chunk per lane per token), then the warp dequantizes them into
+      // the bf16 stage with the same arithmetic as qsa_io::decode_vec (fp8).
+      uint8_t* raw = reinterpret_cast<uint8_t*>(sm + kStages * kStageElems);
+      const int plane = lane >> 4, chunk = lane & 15;
+      int64_t my_off = 0, my_sidx = 0;  // lanes 0..15: the row's code byte / row scale index
+      if (lane < kTileTok && base + lane < cnt) {
+        const int tok = toks[base + lane];
+        const int64_t phys = static_cast<int64_t>(bt[tok / block_tokens]) * block_tokens + tok % block_tokens;
+        my_off = phys * row_bytes + static_cast<int64_t>(kvh) * kD;
+        my_sidx = phys * kv_heads + kvh;
+      }
+      const uint8_t* src_plane = plane ? vplane : kplane;
+      const float* sc_plane = plane ? v_scales : k_scales;
+#pragma unroll
+      for (int i = 0; i < kTileTok; ++i) {
+        const int64_t off = __shfl_sync(0xffffffffu, my_off, i);
+        if (base + i < cnt)
+          cp_async16(raw + plane * (kTileTok * kD) + i * kD + chunk * 16, src_plane + off + chunk * 16, true);
+      }
+      asm volatile("cp.async.commit_group;\n" ::);
+      asm volatile("cp.async.wait_group 0;\n" ::);
+      __syncwarp();  // the raw codes are complete before any lane reads them
+#pragma unroll
+      for (int i = 0; i < kTileTok; ++i) {
+        const int64_t sidx = __shfl_sync(0xffffffffu, my_sidx, i);
+        uint16_t* dst = sm + buf * kStageElems + plane * (kTileTok * kRow) + i * kRow + chunk * 16;
+        if (base + i < cnt) {
+          float s = __ldg(sc_plane + sidx);
+          if (!(s == s)) s = 0.0f;  // a corrupt scale slot decodes to zeros, never NaN
+          uint4 c4 = *reinterpret_cast<const uint4*>(raw + plane * (kTileTok * kD) + i * kD + chunk * 16);
+          const uint8_t* b = reinterpret_cast<const uint8_t*>(&c4);
+          float v[16];
+#pragma unroll
+          for (int j = 0; j < 16; ++j) {
+            const float f = fp8_e4m3_bits_to_float(b[j]);
+            v[j] = f == f ? f * s : 0.0f;  // 0x7F (NaN) -> 0
+          }
+          *reinterpret_cast<uint4*>(dst) =
+              make_uint4(pack_bf16(v[0], v[1]), pack_bf16(v[2], v[3]), pack_bf16(v[4], v[5]), pack_bf16(v[6], v[7]));
+          *reinterpret_cast<uint4*>(dst + 8) =
+              make_uint4(pack_bf16(v[8], v[9]), pack_bf16(v[10], v[11]), pack_bf16(v[12], v[13]), pack_bf16(v[14], v[15]));
+        } else {
+          // Past the list: zeros, as the bf16 path's zero-fill writes.
+          *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+          *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0u, 0u, 0u, 0u);
+        }
+      }
+      __syncwarp();
+      return;
+    }
     // Lanes 0..15 resolve the tile's 16 physical rows in one round of loads
     // (a serial token -> block-table chain per issue step starved the copies).
     if (format != LatentFormat::kBf16) {
@@ -278,7 +334,7 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
     throw std::invalid_argument("qsa_attn_prefill_warp: dim 256, <= 16 query heads per KV head");
   static const bool opted = [] {  // once per process, thread-safe (TP ranks may share one)
     DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      static_cast<int>(kSmem)));
+                                      static_cast<int>(kSmemFp8)));
     // All of L1 as shared memory: residency here is bounded by the 33.8 KB stages.
     DGPP_CUDA_OK(cudaFuncSetAttribute(qsa_attn_prefill_warp_kernel,
                                       cudaFuncAttributePreferredSharedMemoryCarveout, 100));
@@ -289,7 +345,9 @@ void qsa_attn_prefill_warp(const uint16_t* q, int64_t q_row_stride, const uint16
                          ? row_bytes
                          : qsa_io::row_bytes(format, static_cast<int64_t>(kv_heads) * kD);
   const dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(kv_heads));
-  qsa_attn_prefill_warp_kernel<<<grid, 32, kSmem, stream>>>(q, q_row_stride, k_cache, v_cache, req_ids, topk,
+  // fp8 adds the raw code region; the other formats keep their existing footprint.
+  const size_t smem = format == LatentFormat::kFp8 ? kSmemFp8 : kSmem;
+  qsa_attn_prefill_warp_kernel<<<grid, 32, smem, stream>>>(q, q_row_stride, k_cache, v_cache, req_ids, topk,
                                                               topk_stride, counts, local_heads, kv_heads,
                                                               block_tokens, block_tables, blocks_per_request,
                                                               scale, out, k_scales, v_scales, format, rb);
