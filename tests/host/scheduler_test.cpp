@@ -4739,3 +4739,74 @@ DGPP_TEST(scheduler_adaptive_idle_arrival_keeps_the_full_first_token_allowance) 
   require(!sched.has_pending() && sched.meters().pool_blocks_in_use == 0,
           "calibration and unfinished readers release resources");
 }
+
+DGPP_TEST(scheduler_decode_interleave_orders_whole_chunks_and_keeps_transcripts) {
+  struct Run {
+    std::vector<std::string> ops;
+    std::vector<int64_t> decoder, reader;
+  };
+  const auto run = [](int k) {
+    ChunkFakeEngine engine(100, 2);
+    std::vector<int32_t> decoder_script;
+    for (int i = 0; i < 40; ++i) decoder_script.push_back(10 + i);
+    engine.arm(0, decoder_script, 40);
+    engine.arm(1, {50, 51, 52, 53}, 4);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 4;
+    policy.decode_steps_per_prefill = k;
+    Scheduler sched(&engine, {}, 0, policy);
+    sched.submit(make_request("decoder", 2, 40));
+    sched.tick();
+    sched.submit(make_request("reader", 16, 4));
+    sched.run_to_completion();
+    return Run{engine.ops(), sched.find("decoder")->generated, sched.find("reader")->generated};
+  };
+  // Decode passes between consecutive chunks of the reader (its chunks are
+  // PF:1:4, four of them for a 16-token prompt at budget 4).
+  const auto gaps = [](const std::vector<std::string>& ops) {
+    std::vector<int> out;
+    int steps = 0;
+    bool seen = false;
+    for (const auto& op : ops) {
+      if (op.starts_with("PF:1:")) {
+        if (seen) out.push_back(steps);
+        seen = true;
+        steps = 0;
+      } else if (seen && op.starts_with("S:0:")) {
+        ++steps;
+      }
+    }
+    return out;
+  };
+
+  const Run off = run(0);
+  require(off.reader == std::vector<int64_t>({50, 51, 52, 53}), "reader transcript under default schedule");
+  require(std::count(off.ops.begin(), off.ops.end(), "PF:1:4") == 4, "reader prefilled in four whole chunks");
+  require(gaps(off.ops) == std::vector<int>({1, 1, 1}), "default schedule: one decode pass per chunk tick");
+  // k = 1 is the default schedule: the chunk's own tick supplies its pass.
+  require(run(1).ops == off.ops, "k = 1 reproduces the default op stream");
+
+  for (const int k : {2, 4}) {
+    const Run r = run(k);
+    require(gaps(r.ops) == std::vector<int>({k, k, k}),
+            "k decode passes run between consecutive prefill chunks");
+    require(std::count(r.ops.begin(), r.ops.end(), "PF:1:4") == 4,
+            "reader chunks are not split or reordered");
+    require(r.reader == off.reader && r.decoder == off.decoder,
+            "transcripts identical to the default schedule");
+  }
+
+  for (const int bad : {-1, 3, 8}) {
+    ChunkFakeEngine engine(100, 2);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefill_budget_tokens = 4;
+    policy.decode_steps_per_prefill = bad;
+    bool threw = false;
+    try {
+      Scheduler sched(&engine, {}, 0, policy);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    require(threw, "decode interleave accepts only 0, 1, 2 or 4");
+  }
+}
