@@ -419,6 +419,7 @@ std::string encode_journal_warm(const dgpp::sched::AdmissionPolicy& policy,
   if (policy.prefill_idle_budget_tokens > 0) out += ",\"pfidle\":" + std::to_string(policy.prefill_idle_budget_tokens);
   if (policy.decode_gap_target_ms > 0) out += ",\"gapms\":" + std::to_string(policy.decode_gap_target_ms);
   if (policy.first_token_target_ms > 0) out += ",\"ttftms\":" + std::to_string(policy.first_token_target_ms);
+  if (policy.decode_steps_per_prefill > 0) out += ",\"dspp\":" + std::to_string(policy.decode_steps_per_prefill);
   append_latency_tuning(out, policy.prefill_latency);
   if (policy.prefill_budget_automatic) out += ",\"pfauto\":1";
   if (policy.prefill_early_admission) out += ",\"pfearly\":1";
@@ -990,6 +991,7 @@ JournalRecord decode_journal_line(std::string_view line) {
       rec.admission.window_tokens = static_cast<int>(win.as_int());
       rec.admission.decode_gap_target_ms = optional_policy_integer(v, "gapms", 0, sched::kMaxLatencyTargetMs);
       rec.admission.first_token_target_ms = optional_policy_integer(v, "ttftms", 0, sched::kMaxLatencyTargetMs);
+      rec.admission.decode_steps_per_prefill = optional_policy_integer(v, "dspp", 0, 4);
       rec.admission.prefill_latency = read_latency_tuning(v);
       rec.admission.prefill_budget_automatic = optional_policy_integer(v, "pfauto", 0, 1) != 0;
       if (const auto* budget = v.find("pfbudget")) {
