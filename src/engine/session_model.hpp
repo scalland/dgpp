@@ -561,6 +561,11 @@ class SessionModel : public PrefillReporting {
   // The draft block.
   bool mtp_ = false;
   std::vector<int64_t> mtp_pos_;   // [R] the block's row counter (host mirror)
+  // The draft prefill's token staging: two pinned slots of [max_tokens_],
+  // each rewritten only after the copy that read it has completed (its event).
+  int64_t* h_mtp_tokens_ = nullptr;
+  cudaEvent_t mtp_tokens_done_[2] = {nullptr, nullptr};
+  int mtp_tokens_slot_ = 0;
   int64_t* d_mtp_pos_ = nullptr;   // device [R]
   int64_t* h_mtp_pos_ = nullptr;   // pinned upload mirror
   int64_t* d_next_ = nullptr;      // device [R]: the verify's next token, parked
@@ -673,6 +678,8 @@ void SessionModel<D>::init_session(const SessionParams& p) {
     DGPP_CUDA_OK(cudaMemset(d_next_, 0, R * sizeof(int64_t)));
     mtp_window_ = dev_alloc<uint16_t>(R * rows * static_cast<size_t>(draft_width_));
     DGPP_CUDA_OK(cudaMemset(mtp_window_, 0, R * rows * static_cast<size_t>(draft_width_) * 2));
+    h_mtp_tokens_ = pinned_alloc<int64_t>(2 * M);
+    for (auto& e : mtp_tokens_done_) DGPP_CUDA_OK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
   }
 }
 
@@ -695,7 +702,7 @@ inline void session_core_plan_bytes(int max_tokens, int max_requests, int hidden
   size_t pin = R * 8 + token_rows * 8 + rows * (4 + 8 + 8) + rows * V * 4 + rows * H * 2;
   if (mtp) {
     dev += R * 8 * 2 + R * rows * static_cast<size_t>(draft_width) * 2;
-    pin += R * 8;
+    pin += R * 8 + 2 * M * 8;
   }
   *device = dev;
   *pinned = pin;
@@ -723,6 +730,9 @@ SessionModel<D>::~SessionModel() {
   cudaFreeHost(h_tail_hidden_);
   cudaFree(d_mtp_pos_);
   cudaFreeHost(h_mtp_pos_);
+  cudaFreeHost(h_mtp_tokens_);
+  for (auto& e : mtp_tokens_done_)
+    if (e != nullptr) cudaEventDestroy(e);
   cudaFree(d_next_);
   cudaFree(mtp_window_);
   if (stream_) cudaStreamDestroy(stream_);
@@ -1843,8 +1853,17 @@ void SessionModel<D>::mtp_prefill_rows(int req, int64_t row0, int64_t row1, cons
   const int64_t n = row1 - row0;
   if (n <= 0) return;
   if (n > max_tokens_) throw std::invalid_argument("mtp_prefill_rows: chunk too long");
-  DGPP_CUDA_OK(cudaMemcpyAsync(d_tokens_, tokens, static_cast<size_t>(n) * 8, cudaMemcpyHostToDevice, stream_));
-  DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
+  // The token upload goes through a pinned slot: the copy is asynchronous
+  // and the slot is rewritten only after the copy that read it (two chunks
+  // back) has completed. Same-stream order keeps d_tokens_ safe without a
+  // host sync; the post-run sync below stays as the mirror fence.
+  const int slot = mtp_tokens_slot_;
+  mtp_tokens_slot_ ^= 1;
+  DGPP_CUDA_OK(cudaEventSynchronize(mtp_tokens_done_[slot]));
+  int64_t* staged = h_mtp_tokens_ + static_cast<size_t>(slot) * static_cast<size_t>(max_tokens_);
+  std::copy_n(tokens, static_cast<size_t>(n), staged);
+  DGPP_CUDA_OK(cudaMemcpyAsync(d_tokens_, staged, static_cast<size_t>(n) * 8, cudaMemcpyHostToDevice, stream_));
+  DGPP_CUDA_OK(cudaEventRecord(mtp_tokens_done_[slot], stream_));
   if constexpr (requires { derived().mtp_select_block(0); }) derived().mtp_select_block(0);
   if constexpr (requires { derived().mtp_run_rows(req, d_tokens_, row0, static_cast<int>(n), false, false, 0, 0, hidden_row); })
     derived().mtp_run_rows(req, d_tokens_, row0, static_cast<int>(n), false, false, 0, 0, hidden_row);
