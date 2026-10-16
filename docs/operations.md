@@ -606,6 +606,12 @@ streaming and launch work over smaller chunks; a looser decode-gap target
 cost of longer pauses for whoever is decoding. Choose by the service's
 latency tolerance.
 
+`engine.decode_steps_per_prefill` (integer, default 0) interleaves decode with a
+chunked prefill: with a prefill in flight and decoders live, the scheduler runs that many
+decode passes between prefill chunks. 0 keeps the default schedule (one decode pass per tick);
+allowed values are 0, 1, 2 and 4, and any other value fails startup. The value is logged at
+startup and carried in rank 0's warm record to every worker.
+
 Additional controller settings use the same names under `engine` and hyphenated
 CLI flags:
 

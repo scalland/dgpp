@@ -289,6 +289,7 @@ struct ClusterConfig {
     int prefill_idle_budget_tokens = 0;  // auto busy: up to 4096 for grouped prefill; explicit busy: same budget
     int decode_gap_target_ms = sched::kDefaultDecodeGapTargetMs;
     int first_token_target_ms = sched::kDefaultFirstTokenTargetMs;
+    int decode_steps_per_prefill = 0;  // 0 off; else decode passes per prefill chunk (1, 2 or 4)
     sched::PrefillLatencyTuning prefill_latency;
     // Omitted: resolve from the constructed engine's mixed-execution support.
     // Settings retain auto/on/off; the warm journal carries the resolved bool.

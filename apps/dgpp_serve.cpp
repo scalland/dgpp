@@ -1510,6 +1510,7 @@ int main(int argc, char** argv) {
   int prefill_idle_budget_tokens = 0;
   int decode_gap_target_ms = dgpp::sched::kDefaultDecodeGapTargetMs;
   int first_token_target_ms = dgpp::sched::kDefaultFirstTokenTargetMs;
+  int decode_steps_per_prefill = 0;  // engine.decode_steps_per_prefill: 0 off, else 1, 2 or 4
   dgpp::sched::PrefillLatencyTuning prefill_latency;
   std::optional<bool> prefill_early_admission_override;
   // The prefix cache's entry policy (2026-09-28): no entry below the floor,
@@ -1663,6 +1664,7 @@ int main(int argc, char** argv) {
     prefill_idle_budget_tokens = e.prefill_idle_budget_tokens;
     decode_gap_target_ms = e.decode_gap_target_ms;
     first_token_target_ms = e.first_token_target_ms;
+    decode_steps_per_prefill = e.decode_steps_per_prefill;
     prefill_latency = e.prefill_latency;
     prefill_early_admission_override = e.prefill_early_admission;
     prefix_min_tokens = e.prefix_min_tokens;
@@ -2871,6 +2873,7 @@ int main(int argc, char** argv) {
     knobs.admission.prefill_idle_budget_tokens = prefill_idle_budget_tokens;
     knobs.admission.decode_gap_target_ms = decode_gap_target_ms;
     knobs.admission.first_token_target_ms = first_token_target_ms;
+    knobs.admission.decode_steps_per_prefill = decode_steps_per_prefill;
     knobs.admission.prefill_latency = prefill_latency;
     knobs.admission.prefix_min_tokens = prefix_min_tokens;
     knobs.admission.prefix_head_snapshots = prefix_head_snapshots;
@@ -3022,6 +3025,9 @@ int main(int argc, char** argv) {
                         knobs.admission.prefill_idle_budget_tokens > 0 ? knobs.admission.prefill_idle_budget_tokens
                                                                        : knobs.admission.prefill_budget_tokens,
                         graph_engine->engine()->prefill_group_advance() ? "; in-flight prompts share one walk" : "");
+          DGPP_LOG_INFO("rank {}: decode steps per prefill chunk {} ({})", rank,
+                        knobs.admission.decode_steps_per_prefill,
+                        knobs.admission.decode_steps_per_prefill > 0 ? "decode interleave on" : "off");
           graph_engine->set_proposal_temperature_scale(static_cast<float>(mtp_draft_temperature));
           graph_engine->set_block_verify(mtp_verify == "block");
           graph_engine->set_prefill_group(prefill_group);
