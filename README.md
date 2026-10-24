@@ -1,5 +1,26 @@
 # DGPP
 
+> **The `scalland` branch** features the following changes for running the NVIDIA NVFP4 checkpoint of Qwen3.8-Flash-Next (`nvidia/Qwen3.8-Flash-Next-NVFP4`) on DGX Spark:
+>
+> - Automatic seat sizing: when `engine.max_concurrency` is omitted, the seat count is sized from available memory, capped at 31 (`scripts/dgpp-cluster`).
+> - Decode batches of up to 128 rows (raised from 64), with the picker bounds to match.
+> - Scheduler option `engine.decode_steps_per_prefill` to run k decode steps per prefill chunk.
+> - MTP prefill uploads its tokens through a pinned double buffer, removing one host sync per chunk.
+> - The fp8 E4M3 KV prefill stages raw codes with `cp.async` and dequantizes them in shared memory.
+> - Batch-size variance in greedy decoding is documented in `docs/batch-variance-greedy-decoding.md`.
+>
+> Status: measured on two DGX Spark nodes at TP=2 with MTP depth 2 and fp8 KV. Single-user decode at 253K tokens ran 3–5% below the earlier build, and greedy output differed between two identical runs. Treat this branch as experimental.
+>
+> ### Building on a DGX Spark
+>
+> ```bash
+> cmake --preset release
+> cmake --build --preset release -j 4
+> ```
+>
+> This creates `build-release/dgpp-serve`. It needs CUDA 13 and the verbs runtime on every node; see [docs/getting-started.md](docs/getting-started.md). The two-node Qwen NVFP4 template is [deploy/cluster_qwen-3.8-flash-next_nvfp4_w2.example.json](deploy/cluster_qwen-3.8-flash-next_nvfp4_w2.example.json).
+
+
 DGPP is a C++/CUDA inference engine for NVIDIA DGX Spark (GB10) systems.
 It serves GLM-5.3-Flash, full GLM-5.3, Qwen3.8-Flash-Next, GLM-4.7 and
 DeepSeek-V4.1-Flash through an OpenAI-compatible HTTP API, with tensor
