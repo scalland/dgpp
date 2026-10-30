@@ -83,6 +83,7 @@
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "engine/cache_planes.hpp"
+#include "engine/nvme_slab_file.hpp"
 #include "engine/pool_exhausted.hpp"
 #include "engine/prefix_arena.hpp"
 #include "kernels/segment_copy.hpp"
@@ -144,7 +145,7 @@ class NvmeTier {
       open_slab();
     } catch (...) {
       // A rejected existing cache can fail after taking the slab lock.
-      if (fd_ >= 0) ::close(fd_);
+      slab_.close();
       if (crc_fd_ >= 0) ::close(crc_fd_);
       throw;
     }
@@ -190,8 +191,8 @@ class NvmeTier {
       if (buf.h_segs) cudaFreeHost(buf.h_segs);
     }
     if (crc_fd_ >= 0) ::close(crc_fd_);
-    if (fd_ >= 0) {
-      ::close(fd_);
+    if (slab_.is_open()) {
+      slab_.close();
       // A slab that outlives the process stays, with its index and CRC
       // table beside it; otherwise nothing is left behind.
       if (!cfg_.persist) {
@@ -795,67 +796,15 @@ class NvmeTier {
   // truncated and its whole capacity claimed now (unwritten extents): a
   // full disk is a startup error, never a torn write later.
   void open_fd(bool keep_contents) {
-    if (fd_ >= 0 && !keep_contents) {
+    const size_t bytes = static_cast<size_t>(pages_) * page_bytes_;
+    if (slab_.is_open() && !keep_contents) {
       // A recreation on the descriptor already held: the contents go, the
       // lock stays — a duplicate deployment finds no gap to take it in.
-      if (::ftruncate(fd_, 0) != 0)
-        throw std::runtime_error("NvmeTier: cannot truncate " + cfg_.slab_path + ": " + std::strerror(errno));
-      size_slab();
+      slab_.recreate(bytes);
       return;
     }
-    if (fd_ >= 0) ::close(fd_);
-    const int flags = O_RDWR | O_CLOEXEC | (cfg_.require_existing ? 0 : O_CREAT);
-    fd_ = ::open(cfg_.slab_path.c_str(), flags | O_DIRECT, 0600);
-    direct_ = fd_ >= 0;
-    if (fd_ < 0 && errno == EINVAL) fd_ = ::open(cfg_.slab_path.c_str(), flags, 0600);
-    if (fd_ < 0)
-      throw std::runtime_error("NvmeTier: cannot create " + cfg_.slab_path + ": " + std::strerror(errno));
-    // One world per slab: a second process on the same binding (a duplicate
-    // deployment) would truncate and write under the first.
-    if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
-      const int err = errno;
-      ::close(fd_);
-      fd_ = -1;
-      throw std::runtime_error("NvmeTier: " + cfg_.slab_path + " is held by another process (" + std::strerror(err) +
-                               "): one world per slab — stop the other deployment or give this one another "
-                               "nvme_cache.path");
-    }
-    if (!direct_ && !cfg_.allow_buffered) {
-      ::close(fd_);
-      fd_ = -1;
-      throw std::runtime_error("NvmeTier: " + cfg_.slab_path +
-                               " refuses direct I/O (the filesystem buffers it, and the page cache would grow into "
-                               "the memory the model plans on): put nvme_cache.path on a local filesystem, or set "
-                               "nvme_cache.allow_buffered");
-    }
-    if (keep_contents) return;
-    // Opening with O_TRUNC would destroy another world's slab before the
-    // advisory lock can refuse us. Clear it only after acquiring ownership.
-    if (::ftruncate(fd_, 0) != 0) {
-      const int err = errno;
-      ::close(fd_);
-      fd_ = -1;
-      throw std::runtime_error("NvmeTier: cannot truncate " + cfg_.slab_path + ": " +
-                               std::strerror(err));
-    }
-    size_slab();
-  }
-  // The whole capacity claimed now (unwritten extents): a full disk is a
-  // startup error, never a torn write later.
-  void size_slab() {
-    const off_t bytes = static_cast<off_t>(static_cast<size_t>(pages_) * page_bytes_);
-    if (::posix_fallocate(fd_, 0, bytes) != 0) {
-      const int err = errno;
-      if (::ftruncate(fd_, bytes) != 0) {
-        ::close(fd_);
-        fd_ = -1;
-        throw std::runtime_error("NvmeTier: cannot size " + cfg_.slab_path + " to " + std::to_string(bytes) +
-                                 " bytes: " + std::strerror(err));
-      }
-      DGPP_LOG_WARN("rank {}: NVMe cache: the filesystem cannot preallocate {} ({}); the slab is sparse and a "
-                    "full disk would fail a spill instead",
-                    cfg_.rank, cfg_.slab_path, std::strerror(err));
-    }
+    slab_.open(cfg_.slab_path, cfg_.require_existing, cfg_.allow_buffered, keep_contents, cfg_.rank, bytes);
+    direct_ = slab_.direct();
   }
   // A fresh slab's files: no index, a zeroed CRC table (sparse).
   void fresh_files() {
@@ -1172,24 +1121,7 @@ class NvmeTier {
   }
   bool write_page(int64_t page, const void* buf, std::string* why) {
     if (!hook(true, page, why)) return false;
-    const uint8_t* p = static_cast<const uint8_t*>(buf);
-    size_t left = page_bytes_;
-    off_t off = static_cast<off_t>(static_cast<size_t>(page) * page_bytes_);
-    while (left > 0) {
-      const ssize_t n = ::pwrite(fd_, p, left, off);
-      if (n < 0) {
-        if (errno == EINTR) continue;
-        *why = "write of page " + std::to_string(page) + ": " + std::strerror(errno);
-        return false;
-      }
-      if (n == 0) {
-        *why = "short write of page " + std::to_string(page);
-        return false;
-      }
-      p += n;
-      off += n;
-      left -= static_cast<size_t>(n);
-    }
+    if (!slab_.write_at(page, page_bytes_, buf, why)) return false;
     crc_[static_cast<size_t>(page)] = crc32c(buf, page_bytes_);
     std::lock_guard<std::mutex> lock(mutex_);
     stats_.bytes_written += static_cast<int64_t>(page_bytes_);
@@ -1197,24 +1129,7 @@ class NvmeTier {
   }
   bool read_page(int64_t page, void* buf, std::string* why) {
     if (!hook(false, page, why)) return false;
-    uint8_t* p = static_cast<uint8_t*>(buf);
-    size_t left = page_bytes_;
-    off_t off = static_cast<off_t>(static_cast<size_t>(page) * page_bytes_);
-    while (left > 0) {
-      const ssize_t n = ::pread(fd_, p, left, off);
-      if (n < 0) {
-        if (errno == EINTR) continue;
-        *why = "read of page " + std::to_string(page) + ": " + std::strerror(errno);
-        return false;
-      }
-      if (n == 0) {
-        *why = "short read of page " + std::to_string(page);
-        return false;
-      }
-      p += n;
-      off += n;
-      left -= static_cast<size_t>(n);
-    }
+    if (!slab_.read_at(page, page_bytes_, buf, why)) return false;
     if (crc32c(buf, page_bytes_) != crc_[static_cast<size_t>(page)]) {
       *why = "checksum mismatch on page " + std::to_string(page);
       return false;
@@ -1235,7 +1150,7 @@ class NvmeTier {
   int64_t blob_pages_ = 0;
   int64_t pages_ = 0;
   int64_t per_chunk_ = 0;
-  int fd_ = -1;
+  NvmeSlabFile slab_;
   int crc_fd_ = -1;            // the CRC table beside the slab (persist)
   std::string crc_path_, index_path_;
   std::vector<uint8_t> candidate_;  // a previous run's index for this binding, until adopted or refused
