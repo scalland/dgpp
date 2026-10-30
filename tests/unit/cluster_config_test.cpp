@@ -871,6 +871,22 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
       "{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"allow_buffered\":true,\"op_timeout_s\":30}}", "t");
   require(bounded.nvme_cache.allow_buffered && bounded.nvme_cache.op_timeout_s == 30,
           "allow_buffered and op_timeout_s parse");
+  // The folder backend (disk-cache step 3): selected with persist off; the
+  // slab stays the default.
+  require(off.nvme_cache.backend == "slab" && off.nvme_cache.file_mib == 256, "the slab is the default backend");
+  const dgpp::serve::ClusterConfig folder = dgpp::serve::parse_cluster_config(
+      "{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"enabled\":true,\"capacity_gib\":8,\"persist\":false,"
+      "\"backend\":\"folder\",\"file_mib\":64}}",
+      "t");
+  require(folder.nvme_cache.backend == "folder" && folder.nvme_cache.file_mib == 64, "the folder backend parses");
+  require(refusal("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"enabled\":true,\"capacity_gib\":8,"
+                  "\"backend\":\"folder\"}}")
+                  .find("nvme_cache.backend") != std::string::npos,
+          "the folder backend refuses persist (no restart adoption yet)");
+  for (const char* bad : {"\"backend\":\"tape\"", "\"file_mib\":0", "\"file_mib\":5000"})
+    require(refusal(std::string("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{") + bad + "}}")
+                    .find("nvme_cache.") != std::string::npos,
+            std::string("refused by name: ") + bad);
   for (const char* bad : {"\"allow_buffered\":1", "\"op_timeout_s\":-1", "\"op_timeout_s\":90000", "\"op_timeout_s\":1.5"})
     require(refusal(std::string("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{") + bad + "}}")
                     .find("nvme_cache.") != std::string::npos,

@@ -476,6 +476,13 @@ std::string encode_journal_settings(const WorldSettings& s) {
     out += ",\"nvmereuse\":";
     append_json_string(&out, s.nvme_cache_reuse_binding);
   }
+  // The folder backend (disk-cache step 3): written only when selected, so
+  // the slab's record is byte for byte the earlier format.
+  if (s.nvme_cache && s.nvme_cache_backend == "folder") {
+    out += ",\"nvmebackend\":";
+    append_json_string(&out, s.nvme_cache_backend);
+    out += std::format(",\"nvmefile\":{}", s.nvme_cache_file_mib);
+  }
   out += ",\"ngt\":";
   append_json_string(&out, s.ngram_table);
   out += ",\"dw\":";
@@ -795,6 +802,15 @@ JournalRecord decode_journal_line(std::string_view line) {
           !s.nvme_cache || !s.nvme_cache_persist)
         throw std::runtime_error("journal: settings record with a bad NVMe cache reuse binding");
       s.nvme_cache_reuse_binding = std::string(reuse->as_string());
+    }
+    if (const auto* backend = v.find("nvmebackend")) {
+      if (!backend->is_string() || std::string(backend->as_string()) != "folder" || !s.nvme_cache ||
+          s.nvme_cache_persist)
+        throw std::runtime_error("journal: settings record with a bad NVMe cache backend");
+      s.nvme_cache_backend = "folder";
+      s.nvme_cache_file_mib = num("nvmefile").as_int();
+      if (s.nvme_cache_file_mib < 1 || s.nvme_cache_file_mib > 4096)
+        throw std::runtime_error("journal: settings record with a bad NVMe cache file size");
     }
     // Records before 2026-09-10 carry no table residency: resident.
     if (const dgpp::minijson::Value* ngt = v.find("ngt")) s.ngram_table = std::string(ngt->as_string());

@@ -153,6 +153,12 @@ changes matching, which stays by exact token prefix.
 - Startup names any other binding's slabs it finds in the directory, with
   their size. They belong to no running world and can be removed.
 
+## The folder backend
+
+`nvme_cache.backend: folder` keeps each entry as its own folder, `<path>/folders/rank<N>/<session>/<entry>/`, split into files of at most `file_mib`, with a CRC-32C per page beside each file. Entries never share files, so sessions that hold the same document keep separate copies. A write goes to a temp folder and is renamed into place when complete. A checksum mismatch on restore fails that restore, and the request prefills cold.
+
+Limits in this version: TP=1 only; `persist` must be false, so the folder tier starts empty each run and has no restart adoption; the files use buffered I/O, so the slab's direct-I/O rule does not apply yet, and the backend should not be enabled in a deployment until that lands.
+
 ## Sizing, metrics and tuning
 
 `capacity_gib` must hold one entry at the request context limit plus its

@@ -422,6 +422,12 @@ struct ClusterConfig {
     // An op without progress for this long fails, so a request waiting on
     // its restore admits cold instead of never (0: never).
     int64_t op_timeout_s = 120;
+    // "slab" (one file per rank, persistent) or "folder" (one folder per
+    // entry, disk-cache step 3): the folder backend starts empty each run
+    // (persist must be false), serves TP=1 only, and its files hold at most
+    // file_mib each.
+    std::string backend = "slab";
+    int64_t file_mib = 256;
   } nvme_cache;
   struct Paths {
     std::string log_dir = "~/dgpp/log";

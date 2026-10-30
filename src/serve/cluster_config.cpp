@@ -548,10 +548,18 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
             fail(what, "'" + nk + "' must be an existing binding (16 lowercase hexadecimal digits)");
         } else if (p.key == "allow_buffered") n.allow_buffered = boolean(p.value, nk, what);
         else if (p.key == "op_timeout_s") n.op_timeout_s = integer(p.value, nk, what, 0, 86400);
+        else if (p.key == "backend") {
+          n.backend = text(p.value, nk, what);
+          if (n.backend != "slab" && n.backend != "folder") fail(what, "'" + nk + "' must be 'slab' or 'folder'");
+        } else if (p.key == "file_mib") n.file_mib = integer(p.value, nk, what, 1, 4096);
         else fail(what, "unknown key '" + nk + "'");
       }
       if (n.enabled && n.capacity_gib <= 0.0)
         fail(what, "'nvme_cache.capacity_gib' must be positive when the cache is enabled");
+      if (n.enabled && n.backend == "folder") {
+        if (n.persist) fail(what, "'nvme_cache.backend' folder requires 'nvme_cache.persist' false (no restart adoption yet)");
+        if (!n.reuse_binding.empty()) fail(what, "'nvme_cache.backend' folder cannot reuse a binding");
+      }
       if (!n.reuse_binding.empty() && (!n.enabled || !n.persist))
         fail(what, "'nvme_cache.reuse_binding' requires enabled and persist to be true");
     } else if (k == "paths") {

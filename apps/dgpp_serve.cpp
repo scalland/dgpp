@@ -1932,6 +1932,8 @@ int main(int argc, char** argv) {
   std::string nvme_cache_reuse_binding;
   bool nvme_cache_allow_buffered = false;
   int64_t nvme_cache_op_timeout_s = 120;
+  std::string nvme_cache_backend = "slab";  // "folder": disk-cache step 3 (TP=1, persist off)
+  int64_t nvme_cache_file_mib = 256;
   std::optional<float> temperature, top_p, min_p, repetition_penalty;
   std::optional<float> frequency_penalty, presence_penalty;
   std::optional<int> top_k;
@@ -2082,6 +2084,8 @@ int main(int argc, char** argv) {
     nvme_cache_reuse_binding = c.nvme_cache.reuse_binding;
     nvme_cache_allow_buffered = c.nvme_cache.allow_buffered;
     nvme_cache_op_timeout_s = c.nvme_cache.op_timeout_s;
+    nvme_cache_backend = c.nvme_cache.backend;
+    nvme_cache_file_mib = c.nvme_cache.file_mib;
     admission_mode = e.admission;
     admission_window = e.admission_window;
     model_alias = e.model_alias;
@@ -2489,7 +2493,9 @@ int main(int argc, char** argv) {
                                  nvme_cache_max_ops, nvme_cache_reserve_gib, nvme_cache_persist ? 1 : 0,
                                  nvme_cache_op_timeout_s)
                    : std::string("off")) +
-        (nvme_cache_reuse_binding.empty() ? std::string() : " nvme_reuse=" + nvme_cache_reuse_binding);
+        (nvme_cache_reuse_binding.empty() ? std::string() : " nvme_reuse=" + nvme_cache_reuse_binding) +
+        (nvme_cache && nvme_cache_backend == "folder" ? std::format(" nvme_backend=folder:{}", nvme_cache_file_mib)
+                                                      : std::string());
   };
   // Dory1.0-4B is a one-rank family (the reference refuses
   // tensor_parallel_size != 1; docs/dory_plan.md §2): refuse a world > 1
@@ -2640,6 +2646,8 @@ int main(int argc, char** argv) {
         ws.nvme_cache_persist = nvme_cache_persist;
         ws.nvme_cache_reuse_binding = nvme_cache_reuse_binding;
         ws.nvme_cache_op_timeout_s = nvme_cache_op_timeout_s;
+        ws.nvme_cache_backend = nvme_cache ? nvme_cache_backend : "slab";
+        ws.nvme_cache_file_mib = nvme_cache_file_mib;
         journal->broadcast(dgpp::serve::encode_journal_settings(ws));
         DGPP_LOG_INFO("journal: settings pushed to {} peer(s): {}", world - 1,
                       canonical());
@@ -2763,6 +2771,8 @@ int main(int argc, char** argv) {
           nvme_cache_reserve_gib = ws.nvme_cache_reserve_gib;
           nvme_cache_persist = ws.nvme_cache_persist;
           nvme_cache_op_timeout_s = ws.nvme_cache_op_timeout_s;
+          nvme_cache_backend = ws.nvme_cache_backend;
+          nvme_cache_file_mib = ws.nvme_cache_file_mib;
         }
         const std::string now = canonical();
         if (own != now)
@@ -3537,6 +3547,10 @@ int main(int argc, char** argv) {
                   DGPP_VERSION, config_digest, ckpt, family->cache_block_bytes(world, mtp && graph_world),
                   snapshot_bytes, nvme_cache_gib, block_tokens, world, nvme_cache_reuse_binding)
             : std::string();
+    if (nvme_cache && nvme_cache_backend == "folder" && world > 1) {
+      DGPP_LOG_ERROR("rank {}: nvme_cache.backend folder serves TP=1 only (this deployment has {} ranks)", rank, world);
+      return 1;
+    }
     if (nvme_cache) {
       nvme_plan = dgpp::serve::plan_nvme_cache(nvme_cache_path, nvme_cache_gib, rank,
                                                family->cache_block_bytes(world, mtp && graph_world),
@@ -3581,6 +3595,9 @@ int main(int argc, char** argv) {
       en.require_existing = !nvme_cache_reuse_binding.empty();
       en.allow_buffered = nvme_cache_allow_buffered;
       en.op_timeout_s = static_cast<int>(nvme_cache_op_timeout_s);
+      en.folder = nvme_cache_backend == "folder";
+      en.folder_root = nvme_plan.directory + "/folders";
+      en.folder_file_bytes = static_cast<size_t>(nvme_cache_file_mib) << 20;
       eng->disk_enable(en);
       const dgpp::sched::SchedulerEngine::DiskInfo info = eng->disk_info();
       // The pre-flight sized the slab from the family's static estimate of a

@@ -240,6 +240,8 @@ struct WorldSettings {
   bool nvme_cache_persist = true;      // the slab outlives the process
   std::string nvme_cache_reuse_binding;  // explicit existing binding, shared by the world
   int64_t nvme_cache_op_timeout_s = 120;  // an op without progress this long fails
+  std::string nvme_cache_backend = "slab";  // "folder": one folder per entry (TP=1, no persist)
+  int64_t nvme_cache_file_mib = 256;        // the folder backend's most bytes per file
   bool operator==(const WorldSettings&) const = default;
 };
 std::string encode_journal_settings(const WorldSettings& s);
