@@ -273,6 +273,7 @@ dgpp_set_common(dgpp_text)
 
 add_library(dgpp_sched STATIC
   src/sched/disk_cache.cpp
+  src/sched/folder_disk_cache.cpp
   src/sched/prefix_cache.cpp
   src/sched/scheduler.cpp)
 target_link_libraries(dgpp_sched PUBLIC dgpp_text dgpp_core)
@@ -970,6 +971,7 @@ endif()
 enable_testing()
 add_executable(unit_tests
   tests/unit/disk_cache_test.cpp
+  tests/unit/folder_disk_cache_test.cpp
   tests/unit/image_inputs_test.cpp
   tests/unit/file_inputs_test.cpp
   tests/unit/log_test.cpp
