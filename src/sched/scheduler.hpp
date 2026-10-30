@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "sched/disk_cache.hpp"
+#include "sched/folder_disk_cache.hpp"
 #include "sched/prefix_cache.hpp"
 #include "sched/prefill_latency.hpp"
 #include "common/prefill_progress.hpp"
@@ -416,6 +417,11 @@ class SchedulerEngine {
     int max_ops = 4;          // spills and restores started but not committed
     bool persist = false;     // the slab outlives the process (its index is kept beside it)
     int op_timeout_s = 0;     // an op without progress this long fails (0: never)
+    // The folder backend: entries are folders of bytes, indexed by the
+    // scheduler's FolderDiskCache within capacity_bytes. No pages, no restart
+    // adoption (the tier starts empty).
+    bool folder = false;
+    int64_t capacity_bytes = 0;
   };
   virtual DiskInfo disk_info() const { return {}; }
   // Opens the tier: the slab file (created, sized to the capacity), the
@@ -451,6 +457,12 @@ class SchedulerEngine {
     // a positive value sleeps that many milliseconds first, a negative one
     // fails the I/O.
     std::function<int(bool write, int64_t page)> io_hook;
+    // The folder backend (sched/folder_disk_cache.hpp): each entry is a
+    // folder under folder_root/rank<N>/ with files of at most
+    // folder_file_bytes. Mutually exclusive with persist.
+    bool folder = false;
+    std::string folder_root;
+    size_t folder_file_bytes = size_t{256} << 20;
   };
   virtual void disk_enable(const DiskEnable& enable) {
     (void)enable;
@@ -463,6 +475,7 @@ class SchedulerEngine {
     std::vector<uint64_t> identities;
     uint64_t partial_identity = 0;
     int64_t mtp_position = 0;
+    int64_t bytes = 0;  // folder backend: the entry's bytes (its blocks and blob pages)
   };
   virtual DiskBlocks disk_entry_blocks(int slot) const {
     (void)slot;
@@ -482,10 +495,18 @@ class SchedulerEngine {
     std::vector<int64_t> ids;
     int64_t ids_page = -1;
     int ids_pages = 0;
+    // The folder backend: the entry's folder (session/entry) instead of pages.
+    std::string key;
   };
   virtual void disk_spill_begin(const DiskSpill& spill) {
     (void)spill;
     throw std::logic_error("SchedulerEngine: this engine has no cold tier");
+  }
+  // The folder backend: removes an evicted entry's folder (the index named
+  // it when it evicted the entry for room). Runs on the engine thread.
+  virtual void disk_remove_folder(const std::string& key) {
+    (void)key;
+    throw std::logic_error("SchedulerEngine: this engine has no folder backend");
   }
   // Reads an entry back into arena slot `slot`: acquires one fresh pool
   // block per page (the scheduler made them free), adopts the slot's
@@ -500,6 +521,9 @@ class SchedulerEngine {
     int64_t blob_page = -1;
     std::vector<int64_t> pages;
     int64_t partial_page = -1;
+    // The folder backend: the entry's folder and its bytes (blocks and blob).
+    std::string key;
+    int64_t bytes = 0;
   };
   virtual DiskBlocks disk_restore_begin(const DiskRestore& restore) {
     (void)restore;
@@ -837,7 +861,7 @@ class Scheduler {
   };
   void apply_disk_commits(const std::vector<DiskCommit>& commits);
   std::vector<SchedulerEngine::DiskCompletion> poll_disk_completions();
-  bool disk_enabled() const { return disk_.enabled(); }
+  bool disk_enabled() const { return disk_on(); }
   int64_t disk_ops_pending() const { return static_cast<int64_t>(disk_ops_.size()); }
   const DiskCache& disk_cache() const { return disk_; }
 
@@ -1176,6 +1200,9 @@ class Scheduler {
   // queued for a spill (their index and hash, so a reused index is not
   // mistaken for the entry that asked).
   DiskCache disk_;
+  // The folder backend's index (disk_info_.folder): the same decisions over
+  // entries that own their bytes. disk_ stays empty then.
+  FolderDiskCache folder_;
   SchedulerEngine::DiskInfo disk_info_;
   uint64_t next_disk_op_ = 1;
   struct DiskOp {
@@ -1196,6 +1223,28 @@ class Scheduler {
   };
   std::vector<DiskWant> disk_wanted_;
   bool restore_in_flight() const;
+  // The cold tier's index in use, and the reads the scheduler makes of an
+  // entry whichever index holds it.
+  bool folder_on() const { return disk_info_.folder; }
+  bool disk_on() const { return folder_on() ? folder_.enabled() : disk_.enabled(); }
+  struct DiskView {
+    std::vector<int64_t> ids;
+    PrefixCache::Images images;
+    int64_t position = 0;
+    int64_t next_token = -1;
+    int64_t mtp_position = 0;
+    std::string key;
+    bool restoring = false;
+    uint64_t op = 0;
+  };
+  DiskView disk_view(int disk_entry) const;
+  int64_t disk_position(int disk_entry) const;
+  int64_t disk_mtp_position(int disk_entry) const;
+  bool disk_restoring(int disk_entry) const;
+  uint64_t disk_op(int disk_entry) const;
+  void disk_touch(int disk_entry);
+  void cancel_disk_restore(int disk_entry);
+  bool start_folder_spill(int entry, const std::string& id);
 };
 
 // Streaming lifecycle events for the service (SSE). Fired inline on the

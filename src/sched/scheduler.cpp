@@ -162,14 +162,24 @@ Scheduler::Scheduler(SchedulerEngine* engine,
     if (disk_info_.pages <= 0 || disk_info_.page_bytes == 0 || disk_info_.blob_pages <= 0)
       throw std::invalid_argument("Scheduler: the engine's cold tier reports an empty slab");
     if (disk_info_.max_ops < 1) throw std::invalid_argument("Scheduler: the cold tier's op bound must be >= 1");
-    DiskCache::Config dc;
-    dc.pages = disk_info_.pages;
-    dc.page_bytes = disk_info_.page_bytes;
-    dc.blob_pages = disk_info_.blob_pages;
-    dc.block_tokens = std::max<int64_t>(0, prefix_info_.block_tokens);
-    dc.min_tokens = std::max<int64_t>(0, disk_info_.min_tokens);
-    dc.pin_max_pct = policy_.prefix_pin_max_pct;
-    disk_ = DiskCache(dc);
+    if (folder_on()) {
+      if (disk_info_.persist)
+        throw std::invalid_argument("Scheduler: the folder backend has no restart adoption yet; "
+                                    "nvme_cache.persist must be off");
+      FolderDiskCache::Config fc;
+      fc.capacity_bytes = disk_info_.capacity_bytes;
+      fc.pin_max_pct = policy_.prefix_pin_max_pct;
+      folder_ = FolderDiskCache(fc);
+    } else {
+      DiskCache::Config dc;
+      dc.pages = disk_info_.pages;
+      dc.page_bytes = disk_info_.page_bytes;
+      dc.blob_pages = disk_info_.blob_pages;
+      dc.block_tokens = std::max<int64_t>(0, prefix_info_.block_tokens);
+      dc.min_tokens = std::max<int64_t>(0, disk_info_.min_tokens);
+      dc.pin_max_pct = policy_.prefix_pin_max_pct;
+      disk_ = DiskCache(dc);
+    }
     // A previous run's index the world adopted: its entries, with their
     // ids read back from the slab, become resident before the first tick
     // — the same bytes on every rank, so the same index.
@@ -328,9 +338,10 @@ Scheduler::PrefixPlan Scheduler::plan_prefix(const Request& r) const {
   // The cold tier (issue #26): a disk entry deeper than what memory offers
   // is worth a restore first; one at the same cut is the memory entry's
   // own copy (or a duplicate the memory index would refuse).
-  if (disk_.enabled()) {
-    const int d = disk_.lookup(r.spec.prompt, r.cuts, r.cut_hashes, r.cache_images);
-    if (d >= 0 && disk_.entry(d).position > plan.attach_position) plan.disk_entry = d;
+  if (disk_on()) {
+    const int d = folder_on() ? folder_.lookup(r.spec.prompt, r.cuts, r.cut_hashes, r.cache_images)
+                              : disk_.lookup(r.spec.prompt, r.cuts, r.cut_hashes, r.cache_images);
+    if (d >= 0 && disk_position(d) > plan.attach_position) plan.disk_entry = d;
   }
   return plan;
 }
@@ -720,7 +731,7 @@ void Scheduler::admit(int arrival) {
       // 2026-09-05: "PrefixArena: slot 25 is empty" — the victim's slot came
       // back as the snapshot slot, and the prefill attached to nothing).
       cache_.attach(plan.attach_entry, ticks_);
-      if (const int d = cache_.entry(plan.attach_entry).disk; d >= 0) disk_.touch(d, ticks_);
+      if (const int d = cache_.entry(plan.attach_entry).disk; d >= 0) disk_touch(d);
       pp.attach_slot = cache_.entry(plan.attach_entry).slot;
       pp.attach_position = plan.attach_position;
     }
@@ -796,7 +807,7 @@ void Scheduler::begin_prefill(int arrival, int64_t budget) {
       const PrefixPlan plan = plan_prefix(r);
       if (plan.attach_entry >= 0) {
         cache_.attach(plan.attach_entry, ticks_);
-        if (const int d = cache_.entry(plan.attach_entry).disk; d >= 0) disk_.touch(d, ticks_);
+        if (const int d = cache_.entry(plan.attach_entry).disk; d >= 0) disk_touch(d);
         r.attach_entry = plan.attach_entry;
         r.attach_position = plan.attach_position;
         pp.attach_slot = cache_.entry(plan.attach_entry).slot;
@@ -1607,7 +1618,7 @@ bool Scheduler::quantum(std::optional<int64_t> adaptive_budget) {
   // The cold tier (issue #26): the tier's next slice of device work on the
   // model stream, then the queued spills, up to the op bound, at this same
   // fixed position on every rank.
-  if (disk_.enabled()) engine_->disk_pump();
+  if (disk_on()) engine_->disk_pump();
   start_spills();
   start_restores();
 
@@ -2035,8 +2046,26 @@ Scheduler::Meters Scheduler::meters() const {
   m.prefix_image_bytes = static_cast<int64_t>(cache_.image_bytes());
   m.prefix_blocks_pinned = cache_.blocks_pinned(prefix_info_.block_tokens);
   m.prefix_pinned = cache_.pinned_entries();
-  m.disk_enabled = disk_.enabled();
-  if (disk_.enabled()) {
+  m.disk_enabled = disk_on();
+  if (folder_on() && folder_.enabled()) {
+    const FolderDiskCache::Stats& fs = folder_.stats();
+    const int64_t page = static_cast<int64_t>(disk_info_.page_bytes);
+    m.disk_pages_total = page > 0 ? folder_.capacity_bytes() / page : 0;
+    m.disk_pages_used = page > 0 ? folder_.bytes_used() / page : 0;
+    m.disk_page_bytes = page;
+    m.disk_entries = folder_.live_entries();
+    m.disk_spills = fs.spills;
+    m.disk_spilled = fs.spilled;
+    m.disk_spill_failed = fs.spill_failed;
+    m.disk_spill_skipped = fs.spill_skipped;
+    m.disk_restores = fs.restores;
+    m.disk_restored = fs.restored;
+    m.disk_restore_failed = fs.restore_failed;
+    m.disk_evictions = fs.evictions;
+    m.disk_pending = static_cast<int64_t>(disk_ops_.size());
+    m.disk_tokens_restored = fs.tokens_restored;
+    m.disk_pinned = folder_.pinned_entries();
+  } else if (disk_.enabled()) {
     const DiskCache::Stats& ds = disk_.stats();
     m.disk_pages_total = disk_.pages_total();
     m.disk_pages_used = disk_.pages_used();
@@ -2196,7 +2225,10 @@ int Scheduler::evict_memory_entry() {
   int disk = -1;
   const int slot = cache_.evict_lru(&disk);
   if (slot < 0) return -1;
-  if (disk >= 0) disk_.on_memory_evicted(disk);
+  if (disk >= 0) {
+    if (folder_on()) folder_.on_memory_evicted(disk);
+    else disk_.on_memory_evicted(disk);
+  }
   return slot;
 }
 
@@ -2212,10 +2244,61 @@ bool Scheduler::restore_in_flight() const {
   return false;
 }
 
+int64_t Scheduler::disk_position(int d) const {
+  return folder_on() ? folder_.entry(d).position : disk_.entry(d).position;
+}
+
+int64_t Scheduler::disk_mtp_position(int d) const {
+  return folder_on() ? folder_.entry(d).mtp_position : disk_.entry(d).mtp_position;
+}
+
+bool Scheduler::disk_restoring(int d) const {
+  return folder_on() ? folder_.entry(d).state == FolderDiskCache::State::kRestoring
+                     : disk_.entry(d).state == DiskCache::State::kRestoring;
+}
+
+uint64_t Scheduler::disk_op(int d) const { return folder_on() ? folder_.entry(d).op : disk_.entry(d).op; }
+
+Scheduler::DiskView Scheduler::disk_view(int d) const {
+  DiskView v;
+  if (folder_on()) {
+    const FolderDiskCache::Entry& e = folder_.entry(d);
+    v.ids = e.ids;
+    v.images = e.images;
+    v.position = e.position;
+    v.next_token = e.next_token;
+    v.mtp_position = e.mtp_position;
+    v.key = e.key;
+    v.restoring = e.state == FolderDiskCache::State::kRestoring;
+    v.op = e.op;
+  } else {
+    const DiskCache::Entry& e = disk_.entry(d);
+    v.ids = e.ids;
+    v.images = e.images;
+    v.position = e.position;
+    v.next_token = e.next_token;
+    v.mtp_position = e.mtp_position;
+    v.key = e.key;
+    v.restoring = e.state == DiskCache::State::kRestoring;
+    v.op = e.op;
+  }
+  return v;
+}
+
+void Scheduler::disk_touch(int d) {
+  if (folder_on()) folder_.touch(d, ticks_);
+  else disk_.touch(d, ticks_);
+}
+
+void Scheduler::cancel_disk_restore(int d) {
+  if (folder_on()) folder_.cancel_restore(d);
+  else disk_.cancel_restore(d);
+}
+
 void Scheduler::want_spill(int entry, const std::string& id) {
-  if (!disk_.enabled()) return;
+  if (!disk_on()) return;
   const PrefixCache::Entry& m = cache_.entry(entry);
-  if (m.disk >= 0 || m.position < disk_.config().min_tokens) return;
+  if (m.disk >= 0 || m.position < disk_info_.min_tokens) return;
   disk_wanted_.push_back(DiskWant{entry, m.hash, id});
   // Started here, not at the next tick's top: a busy entry is never
   // evicted, and an entry that waited a tick could be taken by the same
@@ -2226,7 +2309,7 @@ void Scheduler::want_spill(int entry, const std::string& id) {
 }
 
 void Scheduler::start_spills() {
-  if (!disk_.enabled()) return;
+  if (!disk_on()) return;
   while (!disk_wanted_.empty() && static_cast<int>(disk_ops_.size()) < disk_info_.max_ops) {
     const DiskWant want = disk_wanted_.front();
     disk_wanted_.erase(disk_wanted_.begin());
@@ -2239,7 +2322,7 @@ void Scheduler::start_spills() {
 }
 
 void Scheduler::start_restores() {
-  if (!disk_.enabled()) return;
+  if (!disk_on()) return;
   // Every admission path — the one-shot of next_admissible, the chunked
   // begin, the group — reads the queue after this, so a request whose
   // deepest usable state is on disk is already waiting on its restore (or
@@ -2253,9 +2336,8 @@ void Scheduler::start_restores() {
     if (r.state != State::kQueued || r.restore_op != 0 || !cache_on(r)) continue;
     const PrefixPlan plan = plan_prefix(r);
     if (plan.disk_entry < 0) continue;
-    const DiskCache::Entry& de = disk_.entry(plan.disk_entry);
-    if (de.state == DiskCache::State::kRestoring) {
-      r.restore_op = de.op;
+    if (disk_restoring(plan.disk_entry)) {
+      r.restore_op = disk_op(plan.disk_entry);
       continue;
     }
     // Another entry's restore, or the slots and blocks held by spills in
@@ -2276,7 +2358,53 @@ void Scheduler::start_restores() {
   }
 }
 
+bool Scheduler::start_folder_spill(int entry, const std::string& id) {
+  const PrefixCache::Entry& m = cache_.entry(entry);
+  if (m.slot < 0) return false;
+  const uint64_t op = next_disk_op_;
+  const SchedulerEngine::DiskBlocks blocks = engine_->disk_entry_blocks(m.slot);
+  const FolderDiskCache::SpillPlan plan =
+      folder_.begin_spill(m.ids.data(), m.position, m.next_token, m.images, blocks.mtp_position, blocks.bytes, op,
+                          ticks_, entry, m.key);
+  for (const FolderDiskCache::Evicted& v : plan.evicted) {
+    if (v.memory >= 0) drop_disk_link(v.memory, v.entry);
+    // The victim's folder goes now: nothing reads it (a restoring entry is never evicted).
+    engine_->disk_remove_folder(v.session + "/" + v.name);
+    cache_.note(12, static_cast<uint64_t>(v.position), 0);
+    emit_prefix(id, "disk_evict", v.position, -1);
+  }
+  if (!plan.ok) {
+    if (plan.duplicate)
+      DGPP_LOG_DEBUG("sched: request '{}' entry at {} tokens is on the NVMe cache already", id, m.position);
+    else
+      DGPP_LOG_INFO("sched: request '{}' entry at {} tokens not spilled — the NVMe cache holds no room for it "
+                    "({} of {} bytes in use)",
+                    id, m.position, folder_.bytes_used(), folder_.capacity_bytes());
+    return false;
+  }
+  ++next_disk_op_;
+  SchedulerEngine::DiskSpill req;
+  req.op = op;
+  req.slot = m.slot;
+  req.key = plan.session + "/" + plan.name;
+  engine_->disk_spill_begin(req);
+  cache_.set_busy(entry, true);
+  DiskOp o;
+  o.op = op;
+  o.restore = false;
+  o.disk_entry = plan.entry;
+  o.memory_entry = entry;
+  o.slot = m.slot;
+  o.position = m.position;
+  o.id = id;
+  disk_ops_.push_back(std::move(o));
+  cache_.note(7, op, static_cast<uint64_t>(m.position));
+  emit_prefix(id, "spill", m.position, m.slot);
+  return true;
+}
+
 bool Scheduler::start_spill(int entry, const std::string& id) {
+  if (folder_on()) return start_folder_spill(entry, id);
   const PrefixCache::Entry& m = cache_.entry(entry);
   if (m.slot < 0) return false;
   const uint64_t op = next_disk_op_;
@@ -2333,8 +2461,8 @@ void Scheduler::persist_disk_index() {
 
 bool Scheduler::start_restore(int disk_entry, Request& r) {
   if (restore_in_flight()) return false;
-  const int64_t position = disk_.entry(disk_entry).position;
-  const int64_t mtp_position = disk_.entry(disk_entry).mtp_position;
+  const int64_t position = disk_position(disk_entry);
+  const int64_t mtp_position = disk_mtp_position(disk_entry);
   const int64_t bt = prefix_info_.block_tokens;
   const int64_t n_full = bt > 0 ? position / bt : 0;
   const int64_t need = n_full + (bt > 0 && position % bt != 0 ? 1 : 0);
@@ -2352,15 +2480,21 @@ bool Scheduler::start_restore(int disk_entry, Request& r) {
     return false;
   }
   const uint64_t op = next_disk_op_++;
-  const DiskCache::RestorePlan plan = disk_.begin_restore(disk_entry, op);
   SchedulerEngine::DiskRestore req;
   req.op = op;
   req.slot = slot;
   req.position = position;
   req.mtp_position = mtp_position;
-  req.blob_page = plan.blob_page;
-  req.pages = plan.pages;
-  req.partial_page = plan.partial_page;
+  if (folder_on()) {
+    const FolderDiskCache::RestorePlan plan = folder_.begin_restore(disk_entry, op);
+    req.key = plan.session + "/" + plan.name;
+    req.bytes = plan.bytes;
+  } else {
+    const DiskCache::RestorePlan plan = disk_.begin_restore(disk_entry, op);
+    req.blob_page = plan.blob_page;
+    req.pages = plan.pages;
+    req.partial_page = plan.partial_page;
+  }
   DiskOp o;
   o.op = op;
   o.restore = true;
@@ -2375,7 +2509,7 @@ bool Scheduler::start_restore(int disk_entry, Request& r) {
     // every rank, from the same journaled state): the disk entry stands as
     // it was, the slot returns, the request admits without the restore —
     // the convention every snapshot site follows (engine/pool_exhausted.hpp).
-    disk_.cancel_restore(disk_entry);
+    cancel_disk_restore(disk_entry);
     cache_.give_back_slot(slot);
     ++cache_.stats().skipped_no_block;
     DGPP_LOG_WARN("sched: request '{}' restore of {} tokens skipped: {}", r.spec.id, position, e.what());
@@ -2383,7 +2517,7 @@ bool Scheduler::start_restore(int disk_entry, Request& r) {
   } catch (...) {
     // Anything else is a contract violation: the entry and the slot are
     // put back, the error is the caller's (fatal, operator class).
-    disk_.cancel_restore(disk_entry);
+    cancel_disk_restore(disk_entry);
     cache_.give_back_slot(slot);
     throw;
   }
@@ -2410,17 +2544,22 @@ void Scheduler::apply_disk_commits(const std::vector<DiskCommit>& commits) {
       // the spill copied.
       cache_.set_busy(o.memory_entry, false);
       if (c.ok) {
-        disk_.commit_spill(o.disk_entry);
-        // The entry's content on this rank's slab, bound into the index so
-        // an adoption after a crash keeps it only while its pages still
-        // hold these bytes.
-        disk_.set_content(o.disk_entry, engine_->disk_pages_digest(disk_.entry_pages(o.disk_entry),
-                                                                     static_cast<uint64_t>(o.position)));
+        if (folder_on()) {
+          folder_.commit_spill(o.disk_entry);
+        } else {
+          disk_.commit_spill(o.disk_entry);
+          // The entry's content on this rank's slab, bound into the index so
+          // an adoption after a crash keeps it only while its pages still
+          // hold these bytes.
+          disk_.set_content(o.disk_entry, engine_->disk_pages_digest(disk_.entry_pages(o.disk_entry),
+                                                                       static_cast<uint64_t>(o.position)));
+        }
         cache_.set_disk(o.memory_entry, o.disk_entry);
         cache_.note(8, o.op, 1);
         emit_prefix(o.id, "spilled", o.position, o.slot);
       } else {
-        disk_.abort_spill(o.disk_entry);
+        if (folder_on()) folder_.abort_spill(o.disk_entry);
+        else disk_.abort_spill(o.disk_entry);
         cache_.note(8, o.op, 0);
         emit_prefix(o.id, "spill_fail", o.position, o.slot);
         DGPP_LOG_WARN("sched: the NVMe cache spill of request '{}' entry at {} tokens failed on a rank; "
@@ -2432,24 +2571,27 @@ void Scheduler::apply_disk_commits(const std::vector<DiskCommit>& commits) {
     for (Request& r : requests_)
       if (r.restore_op == o.op) r.restore_op = 0;
     if (c.ok) {
-      const DiskCache::Entry& de = disk_.entry(o.disk_entry);
+      const DiskView de = disk_view(o.disk_entry);
       const int e = cache_.insert(de.ids.data(), de.position, o.slot, ticks_, de.images, de.next_token, de.key);
       if (e < 0) {
         // The memory index holds an identical entry already (a cold prefill
         // took it while the restore ran): the read copy is surplus.
         free_arena_slot(o.slot);
-        disk_.commit_restore(o.disk_entry, -1, {}, 0, ticks_);
+        if (folder_on()) folder_.commit_restore(o.disk_entry, -1, ticks_);
+        else disk_.commit_restore(o.disk_entry, -1, {}, 0, ticks_);
         cache_.note(10, o.op, 2);
         emit_prefix(o.id, "restored", o.position, -1);
       } else {
         cache_.set_disk(e, o.disk_entry);
-        disk_.commit_restore(o.disk_entry, e, o.restored.identities, o.restored.partial_identity, ticks_);
+        if (folder_on()) folder_.commit_restore(o.disk_entry, e, ticks_);
+        else disk_.commit_restore(o.disk_entry, e, o.restored.identities, o.restored.partial_identity, ticks_);
         cache_.note(10, o.op, 1);
         emit_prefix(o.id, "restored", o.position, o.slot);
       }
     } else {
       free_arena_slot(o.slot);
-      disk_.abort_restore(o.disk_entry);
+      if (folder_on()) folder_.abort_restore(o.disk_entry);
+      else disk_.abort_restore(o.disk_entry);
       cache_.note(10, o.op, 0);
       emit_prefix(o.id, "restore_fail", o.position, o.slot);
       DGPP_LOG_WARN("sched: the NVMe cache restore for request '{}' ({} tokens) failed on a rank; the entry "
@@ -2461,7 +2603,7 @@ void Scheduler::apply_disk_commits(const std::vector<DiskCommit>& commits) {
 }
 
 std::vector<SchedulerEngine::DiskCompletion> Scheduler::poll_disk_completions() {
-  if (!disk_.enabled()) return {};
+  if (!disk_on()) return {};
   return engine_->disk_poll();
 }
 

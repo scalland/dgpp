@@ -276,6 +276,14 @@ class FakeEngine : public SchedulerEngine {
   }
   void fail_next_disk_op() { disk_fail_next_ = true; }
   void set_disk_max_ops(int n) { disk_max_ops_ = n; }
+  // The folder backend: entries are folders of whole pages within
+  // capacity_bytes; the fake keeps their names (a remove deletes one).
+  void set_disk_folder(int64_t capacity_bytes, int64_t blob_pages = 1, int latency = 1) {
+    folder_ = true;
+    folder_capacity_ = capacity_bytes;
+    disk_blob_pages_ = blob_pages;
+    disk_latency_ = latency;
+  }
   int64_t disk_ops_begun() const { return disk_ops_begun_; }
   dgpp::sched::SchedulerEngine::DiskInfo disk_info() const override {
     dgpp::sched::SchedulerEngine::DiskInfo i;
@@ -286,6 +294,13 @@ class FakeEngine : public SchedulerEngine {
     i.min_tokens = disk_min_tokens_;
     i.persist = disk_persist_;
     i.max_ops = disk_max_ops_;
+    if (folder_) {
+      i.enabled = true;
+      i.folder = true;
+      i.capacity_bytes = folder_capacity_;
+      i.pages = folder_capacity_ / 4096;
+      i.persist = false;
+    }
     return i;
   }
   // Across a "restart" (nvme_cache.persist): the ids runs the spills wrote
@@ -343,11 +358,16 @@ class FakeEngine : public SchedulerEngine {
     for (int64_t i = 0; i < position / block_tokens_; ++i) b.identities.push_back((gen << 32) | static_cast<uint64_t>(i));
     b.partial_identity = position % block_tokens_ != 0 ? ((gen << 32) | 0xffffu) : 0;
     b.mtp_position = position;
+    b.bytes = (static_cast<int64_t>(b.identities.size()) + (b.partial_identity != 0 ? 1 : 0) + disk_blob_pages_) * 4096;
     return b;
   }
   void disk_spill_begin(const dgpp::sched::SchedulerEngine::DiskSpill& sp) override {
     require(pinned_.count(sp.slot) != 0, "fake: spill of an empty arena slot");
     ops_.push_back("DS:" + std::to_string(sp.op) + ":" + std::to_string(sp.slot));
+    if (folder_) {
+      require(!sp.key.empty() && folder_files_.count(sp.key) == 0, "fake: a folder spill names a new entry");
+      folder_files_.insert(sp.key);
+    }
     if (!sp.ids.empty()) disk_store_[sp.ids_page] = sp.ids;
     for (int64_t q = 0; q < disk_blob_pages_ + sp.ids_pages; ++q) ++fake_crc_[sp.blob_page + q];
     for (const int64_t p : sp.pages)
@@ -360,7 +380,9 @@ class FakeEngine : public SchedulerEngine {
   dgpp::sched::SchedulerEngine::DiskBlocks disk_restore_begin(
       const dgpp::sched::SchedulerEngine::DiskRestore& rs) override {
     require(pinned_.count(rs.slot) == 0, "fake: restore into an occupied arena slot");
-    const int64_t need = static_cast<int64_t>(rs.pages.size()) + (rs.partial_page >= 0 ? 1 : 0);
+    if (folder_) require(folder_files_.count(rs.key) != 0, "fake: restore of a folder that is not there");
+    const int64_t need = folder_ ? (rs.position + block_tokens_ - 1) / block_tokens_
+                                 : static_cast<int64_t>(rs.pages.size()) + (rs.partial_page >= 0 ? 1 : 0);
     require(pool_blocks_in_use() + need <= total_blocks_, "fake: restore without free blocks");
     // Every restored block is the entry's own (the real tier acquires
     // fresh blocks); the pin counts them all.
@@ -373,6 +395,11 @@ class FakeEngine : public SchedulerEngine {
     disk_fail_next_ = false;
     ++disk_ops_begun_;
     return disk_entry_blocks(rs.slot);
+  }
+  void disk_remove_folder(const std::string& key) override {
+    const bool there = folder_files_.erase(key) == 1;
+    require(folder_ && there, "fake: removing a folder that is not there");
+    ops_.push_back("RM:" + key);
   }
   std::vector<dgpp::sched::SchedulerEngine::DiskCompletion> disk_poll() override {
     std::vector<dgpp::sched::SchedulerEngine::DiskCompletion> out;
@@ -391,6 +418,9 @@ class FakeEngine : public SchedulerEngine {
     int left;
     bool ok;
   };
+  bool folder_ = false;
+  int64_t folder_capacity_ = 0;
+  std::set<std::string> folder_files_;
   int64_t disk_pages_ = 0, disk_blob_pages_ = 1, disk_min_tokens_ = 0;
   int disk_latency_ = 1;
   bool disk_persist_ = false;
@@ -3596,6 +3626,61 @@ DGPP_TEST(scheduler_nvmeCache_spillsAnEvictedEntryAndRestoresItForALaterRequest)
           "the restore precedes the attach: " + ops);
   require(ids_joined(sched.results()[2].generated) == "6,7,8", "c's ids");
   require(m.disk_pages_used <= m.disk_pages_total, "within capacity");
+}
+
+DGPP_TEST(scheduler_folderBackend_spillsWholeEntriesAndRestoresThemForALaterRequest) {
+  // GIVEN a one-slot arena and a folder tier with room for two entries of
+  // four pages each (a 12-token entry: three blocks and the blob's page).
+  FakeEngine engine(/*slots=*/2, /*total_blocks=*/100, /*block_tokens=*/4);
+  engine.set_prefix_arena(/*slots=*/1, /*align=*/4);
+  engine.set_disk_folder(/*capacity_bytes=*/2 * 4 * 4096);
+  engine.arm(0, {1, 2, 3}, 3);
+  engine.arm(0, {4, 5}, 2);
+  engine.arm(0, {6, 7, 8}, 3);
+  Scheduler sched(&engine, {kEos});
+  require(sched.disk_enabled(), "the folder tier is on");
+  // a: the cold prefill's entry spills as one folder and commits.
+  sched.submit(make_cached_request("a", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  Scheduler::Meters m = sched.meters();
+  require(m.disk_spills == 1 && m.disk_spilled == 1 && m.disk_entries == 1,
+          "a's folder spilled and committed");
+  // b: a's memory entry goes; both folders fit, so nothing is deleted.
+  sched.submit(make_cached_request("b", counted_prompt(21, 300), {5, 13}, 2));
+  settle(sched, engine);
+  m = sched.meters();
+  require(m.prefix_evictions == 1 && m.disk_entries == 2 && m.disk_spilled == 2 && m.disk_evictions == 0,
+          "both folders kept; a's memory entry gone");
+  // c: a's prompt again restores a's folder, then attaches at 12.
+  sched.submit(make_cached_request("c", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  m = sched.meters();
+  require(m.disk_restores == 1 && m.disk_restored == 1 && m.disk_restore_failed == 0,
+          "one folder restore, committed");
+  require(m.prefix_hits == 1 && m.prefix_tokens_saved == 12 && m.disk_tokens_restored == 12,
+          "c attached to the restored folder at 12");
+  require(ids_joined(sched.results()[2].generated) == "6,7,8", "c's ids");
+}
+
+DGPP_TEST(scheduler_folderBackend_evictionDeletesTheVictimsFolder) {
+  // GIVEN a folder tier with room for one entry: the second spill must
+  // evict the first and the engine must delete the first's folder.
+  FakeEngine engine(/*slots=*/2, /*total_blocks=*/100, /*block_tokens=*/4);
+  engine.set_prefix_arena(/*slots=*/1, /*align=*/4);
+  engine.set_disk_folder(/*capacity_bytes=*/4 * 4096);
+  engine.arm(0, {1, 2, 3}, 3);
+  engine.arm(0, {4, 5}, 2);
+  Scheduler sched(&engine, {kEos});
+  sched.submit(make_cached_request("a", counted_prompt(21), {5, 13}, 3));
+  settle(sched, engine);
+  require(sched.meters().disk_entries == 1, "a's folder is on the tier");
+  sched.submit(make_cached_request("b", counted_prompt(21, 300), {5, 13}, 2));
+  settle(sched, engine);
+  const Scheduler::Meters m = sched.meters();
+  require(m.disk_evictions == 1 && m.disk_entries == 1 && m.disk_spilled == 2,
+          "b's spill evicted a's folder for room");
+  require(engine.op_stream().find("RM:") != std::string::npos,
+          "the engine deleted the victim's folder: " + engine.op_stream());
 }
 
 // The cold tier under random streams (the fuzz): random geometry, prompts

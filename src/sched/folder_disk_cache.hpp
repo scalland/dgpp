@@ -65,12 +65,14 @@ class FolderDiskCache {
     int64_t evictions = 0;      // entries evicted for room
     int64_t bytes_written = 0;  // committed spills' bytes
     int64_t bytes_read = 0;     // restores' bytes
+    int64_t tokens_restored = 0;  // prompt tokens the committed restores brought back
   };
   // A spill's plan: the entry's folder, and the entries evicted for room
   // (their folders are the caller's to delete).
   struct Evicted {
     int entry = -1;
     std::string session, name;
+    int64_t position = 0;
     int memory = -1;  // the memory entry that held it too, or -1
   };
   struct SpillPlan {

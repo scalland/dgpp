@@ -51,6 +51,13 @@
 // or whose ids are unreadable, is pruned from the candidate — a pruned
 // candidate differs from the other ranks' and the world starts fresh,
 // never with an entry whose checksums pass over someone else's bytes.
+//
+// The folder backend (cfg.folder, disk-cache step 2b) replaces the slab with
+// NvmeFolderStore: each entry is one folder of bytes, written and read as a
+// stream in slice order (its full blocks, the partial block, then the blob's
+// pages), so the worker keeps a single sequential writer or reader per op.
+// The index is the scheduler's FolderDiskCache; this backend starts empty
+// and has no restart adoption yet.
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -83,6 +90,7 @@
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
 #include "engine/cache_planes.hpp"
+#include "engine/nvme_folder_store.hpp"
 #include "engine/nvme_slab_file.hpp"
 #include "engine/pool_exhausted.hpp"
 #include "engine/prefix_arena.hpp"
@@ -113,6 +121,10 @@ class NvmeTier {
       throw std::invalid_argument("NvmeTier: the chunk must be a positive 4 KiB multiple");
     if (cfg_.require_existing && (!cfg_.persist || cfg_.binding.empty()))
       throw std::invalid_argument("NvmeTier: explicit reuse requires persistence and a binding");
+    if (cfg_.folder && cfg_.persist)
+      throw std::invalid_argument("NvmeTier: the folder backend has no restart adoption yet; persist must be off");
+    if (cfg_.folder && cfg_.folder_root.empty())
+      throw std::invalid_argument("NvmeTier: the folder backend names no root");
     planes_ = model_->cache_planes();
     size_t off = 0;
     for (const CachePlane& p : planes_) {
@@ -142,7 +154,8 @@ class NvmeTier {
     // open_slab() can refuse a duplicate before this object's destructor runs.
     aligned_page_.reset(aligned_page);
     try {
-      open_slab();
+      if (cfg_.folder) open_folder();
+      else open_slab();
     } catch (...) {
       // A rejected existing cache can fail after taking the slab lock.
       slab_.close();
@@ -302,6 +315,8 @@ class NvmeTier {
     i.max_ops = cfg_.max_ops;
     i.persist = cfg_.persist;
     i.op_timeout_s = cfg_.op_timeout_s;
+    i.folder = cfg_.folder;
+    i.capacity_bytes = static_cast<int64_t>(cfg_.capacity_bytes);
     return i;
   }
 
@@ -313,10 +328,60 @@ class NvmeTier {
     for (const int32_t b : meta.full_blocks) out.identities.push_back(model_->cache_block_identity(b));
     out.partial_identity = meta.partial_block >= 0 ? model_->cache_block_identity(meta.partial_block) : 0;
     out.mtp_position = meta.mtp_position;
+    if (cfg_.folder) {
+      const int64_t records = static_cast<int64_t>(meta.full_blocks.size()) + (meta.partial_block >= 0 ? 1 : 0);
+      out.bytes = (records + blob_pages_) * static_cast<int64_t>(page_bytes_);
+    }
     return out;
   }
 
+  // The folder backend's stream: an entry is its blocks in spill order (the
+  // full blocks, then the partial), then the blob's pages, one page per
+  // stream position. The worker moves the stream in slice order.
+  void folder_spill_begin(const sched::SchedulerEngine::DiskSpill& spill) {
+    if (!arena_->filled(spill.slot)) throw std::logic_error("NvmeTier: spilling an empty arena slot");
+    if (spill.key.empty()) throw std::invalid_argument("NvmeTier: a folder spill names no entry");
+    const auto& meta = arena_->meta(spill.slot);
+    Job job;
+    job.op = spill.op;
+    job.restore = false;
+    job.slot = spill.slot;
+    job.key = spill.key;
+    for (const int32_t b : meta.full_blocks) job.blocks.emplace_back(b, static_cast<int64_t>(job.blocks.size()));
+    if (meta.partial_block >= 0)
+      job.blocks.emplace_back(meta.partial_block, static_cast<int64_t>(job.blocks.size()));
+    job.blob_page = static_cast<int64_t>(job.blocks.size());
+    jobs_.push_back(std::move(job));
+  }
+
+  // A folder restore's layout over the same stream: the full blocks at
+  // positions 0.., the partial next, the blob after them. The bytes must be
+  // the entry's: a mismatch is a scheduler/tier divergence, not a miss.
+  sched::SchedulerEngine::DiskRestore folder_restore_layout(const sched::SchedulerEngine::DiskRestore& given) const {
+    if (given.key.empty()) throw std::invalid_argument("NvmeTier: a folder restore names no entry");
+    const int64_t bt = model_->kv_block_tokens();
+    const int64_t n_full = bt > 0 ? given.position / bt : 0;
+    const int64_t partial = bt > 0 && given.position % bt != 0 ? 1 : 0;
+    const int64_t records = n_full + partial;
+    if (given.bytes != (records + blob_pages_) * static_cast<int64_t>(page_bytes_))
+      throw std::invalid_argument("NvmeTier: the restore's bytes do not match its entry's blocks and blob");
+    sched::SchedulerEngine::DiskRestore out = given;
+    out.pages.clear();
+    for (int64_t i = 0; i < n_full; ++i) out.pages.push_back(i);
+    out.partial_page = partial != 0 ? n_full : -1;
+    out.blob_page = records;
+    return out;
+  }
+
+  // The folder backend's eviction: the index named the entry for room, and
+  // nothing reads it now (an entry being restored is never evicted).
+  void remove_folder(const std::string& key) {
+    if (!folder_) throw std::logic_error("NvmeTier: no folder backend");
+    folder_->remove(key);
+  }
+
   void spill_begin(const sched::SchedulerEngine::DiskSpill& spill) {
+    if (cfg_.folder) return folder_spill_begin(spill);
     if (!arena_->filled(spill.slot)) throw std::logic_error("NvmeTier: spilling an empty arena slot");
     const auto& meta = arena_->meta(spill.slot);
     if (spill.pages.size() != meta.full_blocks.size())
@@ -345,8 +410,9 @@ class NvmeTier {
     jobs_.push_back(std::move(job));
   }
 
-  sched::SchedulerEngine::DiskBlocks restore_begin(const sched::SchedulerEngine::DiskRestore& restore) {
-    if (restore.position <= 0) throw std::invalid_argument("NvmeTier: restore at position 0");
+  sched::SchedulerEngine::DiskBlocks restore_begin(const sched::SchedulerEngine::DiskRestore& given) {
+    if (given.position <= 0) throw std::invalid_argument("NvmeTier: restore at position 0");
+    const sched::SchedulerEngine::DiskRestore restore = cfg_.folder ? folder_restore_layout(given) : given;
     // The file worker is one thread: while it is inside the I/O of an op
     // the timeout abandoned, nothing can be read from the slab. A restore
     // asked for now is refused the way a full pool refuses one (the
@@ -363,7 +429,7 @@ class NvmeTier {
       throw std::invalid_argument("NvmeTier: the restore's partial page does not match the position");
     // The pages first: a plan outside the slab is the scheduler's error and
     // must not leave pool blocks taken.
-    check_pages(restore.blob_page, restore.pages, restore.partial_page);
+    if (!cfg_.folder) check_pages(restore.blob_page, restore.pages, restore.partial_page);
     typename Model::SessionSnapshotMeta meta;
     meta.position = restore.position;
     meta.mtp_position = restore.mtp_position;
@@ -382,6 +448,7 @@ class NvmeTier {
     job.restore = true;
     job.slot = restore.slot;
     job.blob_page = restore.blob_page;
+    job.key = restore.key;
     sched::SchedulerEngine::DiskBlocks out;
     for (int64_t i = 0; i < n_full; ++i) {
       const int32_t b = take();
@@ -549,6 +616,8 @@ class NvmeTier {
     std::vector<int64_t> ids;  // spill: the entry's token ids, written behind the blob
     int64_t ids_page = -1;
     int64_t ids_pages = 0;
+    std::string key;           // folder backend: the entry's folder (session/entry)
+    int64_t next_io = 0;       // folder backend: the slice the worker takes next, in order
     int64_t block_slices = 0;  // ceil(blocks / per_chunk)
     int64_t blob_slices = 0;
     int64_t slices = 0;        // block slices + blob slices (+ ids slices on a spill)
@@ -619,6 +688,21 @@ class NvmeTier {
       pages.push_back(page);
     }
     check_pages(job.blob_page, pages, -1);
+  }
+
+  // The folder backend's store, under this rank's directory. It starts
+  // empty: nothing names its entries across a restart yet.
+  void open_folder() {
+    const std::string root = cfg_.folder_root + "/rank" + std::to_string(cfg_.rank);
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    NvmeFolderStore::Options o;
+    o.root = root;
+    o.capacity_bytes = static_cast<int64_t>(cfg_.capacity_bytes);
+    o.page_bytes = page_bytes_;
+    o.file_bytes = std::max(page_bytes_, cfg_.folder_file_bytes / page_bytes_ * page_bytes_);
+    o.io_threads = 4;
+    folder_ = std::make_unique<NvmeFolderStore>(o);
   }
 
   void open_slab() {
@@ -984,12 +1068,82 @@ class NvmeTier {
     buf.state = Buffer::kDevice;
   }
 
+  // ---- the folder backend's stream -----------------------------------------
+  // Whether the worker may take a buffer now (the mutex held). The folder
+  // stream is written and read in order, so only the buffer whose slice is
+  // next goes; a buffer of an op that is over goes back at once.
+  bool takeable(const Buffer& b) const {
+    if (b.state != Buffer::kWorker) return false;
+    if (!cfg_.folder || !active_ || b.job_seq != active_->seq) return true;
+    return b.slice == active_->next_io;
+  }
+  // The stream the worker carries for job `seq`, opened at its first slice.
+  bool folder_open(uint64_t seq, bool restore, const std::string& key, int64_t total_bytes, std::string* why) {
+    if (folder_seq_ == seq) {
+      if (!folder_ok_) *why = folder_why_;
+      return folder_ok_;
+    }
+    folder_seq_ = seq;
+    folder_writer_.reset();
+    folder_reader_.reset();
+    folder_ok_ = false;
+    if (restore) {
+      auto reader = std::make_unique<NvmeFolderStore::Reader>(*folder_, key, why);
+      if (!reader->ok()) {
+        folder_why_ = *why;
+        return false;
+      }
+      folder_reader_ = std::move(reader);
+    } else {
+      auto writer = std::make_unique<NvmeFolderStore::Writer>(*folder_, key, static_cast<size_t>(total_bytes), why);
+      if (!writer->ok()) {
+        folder_why_ = *why;
+        return false;
+      }
+      folder_writer_ = std::move(writer);
+    }
+    folder_ok_ = true;
+    return true;
+  }
+  bool folder_write(int64_t page, const void* record, std::string* why) {
+    if (!hook(true, page, why)) return false;
+    if (!folder_writer_ || !folder_writer_->is_open() ||
+        folder_writer_->written() != static_cast<size_t>(page) * page_bytes_) {
+      *why = "the folder entry's pages arrived out of order";
+      return false;
+    }
+    if (!folder_writer_->append(record, page_bytes_, why)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.bytes_written += static_cast<int64_t>(page_bytes_);
+    return true;
+  }
+  bool folder_read(int64_t page, void* record, std::string* why) {
+    if (!hook(false, page, why)) return false;
+    if (!folder_reader_ || folder_reader_->read_bytes() != static_cast<size_t>(page) * page_bytes_) {
+      *why = "the folder entry's pages were read out of order";
+      return false;
+    }
+    if (!folder_reader_->read(record, page_bytes_, why)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.bytes_read += static_cast<int64_t>(page_bytes_);
+    return true;
+  }
+  // The entry is whole: its folder takes its name (the rename is the commit).
+  bool folder_commit(std::string* why) {
+    const bool ok = folder_writer_->commit(why);
+    folder_writer_.reset();
+    return ok;
+  }
+
   // ---- the file worker: pinned staging <-> the slab, the files beside it --
   void worker() {
     for (;;) {
       Buffer* buf = nullptr;
       bool restore = false;
       uint64_t seq = 0;
+      std::string key;          // folder backend: the entry the stream is
+      int64_t total_bytes = 0;  // folder backend: a spill's entry bytes
+      int64_t slice = -1;       // the buffer's slice, for the stream's cursor
       std::vector<int64_t> pages;  // the slice's pages, taken under the lock: the job may end before the I/O does
       std::vector<uint8_t> index;
       std::vector<uint64_t> digests;
@@ -999,11 +1153,11 @@ class NvmeTier {
         cv_.wait(lock, [&] {
           if (stop_ || has_pending_index_) return true;
           for (Buffer& b : buffers_)
-            if (b.state == Buffer::kWorker) return true;
+            if (takeable(b)) return true;
           return false;
         });
         for (Buffer& b : buffers_)
-          if (b.state == Buffer::kWorker && buf == nullptr) buf = &b;
+          if (takeable(b) && buf == nullptr) buf = &b;
         if (has_pending_index_ && (buf == nullptr || stop_)) {
           index.swap(pending_index_);
           digests.swap(pending_digests_);
@@ -1026,6 +1180,9 @@ class NvmeTier {
           const Job& job = *active_;
           restore = job.restore;
           seq = job.seq;
+          key = job.key;
+          total_bytes = restore ? 0 : (static_cast<int64_t>(job.blocks.size()) + blob_pages_) * static_cast<int64_t>(page_bytes_);
+          slice = buf->slice;
           const Slice sl = slice_of(job, buf->slice);
           for (int64_t j = 0; j < sl.count; ++j)
             pages.push_back(sl.kind == Slice::kBlock ? job.blocks[static_cast<size_t>(sl.first + j)].second
@@ -1040,15 +1197,29 @@ class NvmeTier {
       std::string why;
       bool ok = true;
       std::vector<int64_t> written;
+      if (cfg_.folder) ok = folder_open(seq, restore, key, total_bytes, &why);
       for (size_t j = 0; j < pages.size() && ok; ++j) {
         uint8_t* record = static_cast<uint8_t*>(buf->pinned) + j * page_bytes_;
-        ok = restore ? read_page(pages[j], record, &why) : write_page(pages[j], record, &why);
+        if (cfg_.folder)
+          ok = restore ? folder_read(pages[j], record, &why) : folder_write(pages[j], record, &why);
+        else
+          ok = restore ? read_page(pages[j], record, &why) : write_page(pages[j], record, &why);
         if (ok && !restore) written.push_back(pages[j]);
       }
       // The pages' CRCs reach the file before the slice counts as
       // written, so a commit never names a page whose check is not on
       // disk (a crash between leaves the entry unreadable, never wrong).
       if (ok && !restore && crc_fd_ >= 0) ok = write_crc_entries(written, &why);
+      // A spill's last slice completes the entry: it commits before the
+      // buffer frees, so its outcome is the op's.
+      if (ok && cfg_.folder && !restore && folder_writer_ &&
+          folder_writer_->written() == static_cast<size_t>(total_bytes))
+        ok = folder_commit(&why);
+      if (!ok && cfg_.folder) {
+        // The stream ends with the op: a writer's temp folder goes, a reader closes.
+        folder_writer_.reset();
+        folder_reader_.reset();
+      }
       std::lock_guard<std::mutex> lock(mutex_);
       // The job may have ended (abandoned) while the I/O ran: its buffer
       // is free again and its outcome nobody's.
@@ -1058,6 +1229,7 @@ class NvmeTier {
         continue;
       }
       if (!ok && active_->why.empty()) active_->why = why;
+      if (ok && cfg_.folder) active_->next_io = slice + 1;
       // A finished read is the pump's to scatter; a finished write frees
       // the buffer; a failure frees it either way.
       buf->state = ok && restore ? Buffer::kReady : Buffer::kFree;
@@ -1151,6 +1323,15 @@ class NvmeTier {
   int64_t pages_ = 0;
   int64_t per_chunk_ = 0;
   NvmeSlabFile slab_;
+  // The folder backend (cfg.folder): the store, and the stream the worker
+  // carries for the job it serves (a writer on a spill, a reader on a
+  // restore). folder_ is declared first, so the stream closes before it.
+  std::unique_ptr<NvmeFolderStore> folder_;
+  std::unique_ptr<NvmeFolderStore::Writer> folder_writer_;
+  std::unique_ptr<NvmeFolderStore::Reader> folder_reader_;
+  uint64_t folder_seq_ = 0;  // the job the stream belongs to
+  bool folder_ok_ = false;   // the stream opened
+  std::string folder_why_;   // why it did not
   int crc_fd_ = -1;            // the CRC table beside the slab (persist)
   std::string crc_path_, index_path_;
   std::vector<uint8_t> candidate_;  // a previous run's index for this binding, until adopted or refused

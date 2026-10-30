@@ -440,6 +440,10 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     if (!tier_) throw std::logic_error("generation engine: no cold tier");
     return tier_->restore_begin(restore);
   }
+  void disk_remove_folder(const std::string& key) override {
+    if (!tier_) throw std::logic_error("generation engine: no cold tier");
+    tier_->remove_folder(key);
+  }
   void disk_pump() override {
     if (tier_) tier_->pump();
   }

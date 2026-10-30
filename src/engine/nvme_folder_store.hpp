@@ -97,6 +97,8 @@ class NvmeFolderStore {
     Writer& operator=(const Writer&) = delete;
 
     bool ok() const { return ok_; }
+    // Started and neither committed nor aborted: appends are accepted.
+    bool is_open() const { return ok_ && !done_; }
     size_t written() const { return written_; }
 
     // Appends the next `n` bytes: a positive whole number of pages, never more

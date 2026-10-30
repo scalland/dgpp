@@ -147,6 +147,7 @@ FolderDiskCache::SpillPlan FolderDiskCache::begin_spill(const int64_t* ids, int6
     victim.entry = candidate;
     victim.session = entries_[static_cast<size_t>(candidate)].session;
     victim.name = entries_[static_cast<size_t>(candidate)].name;
+    victim.position = entries_[static_cast<size_t>(candidate)].position;
     int memory = -1;
     if (evict_lru(&memory) != candidate) throw std::logic_error("FolderDiskCache: the eviction chose another victim");
     victim.memory = memory;
@@ -214,6 +215,7 @@ void FolderDiskCache::commit_restore(int entry, int memory_entry, uint64_t now) 
   e.last_use = now;
   e.memory = memory_entry;
   ++stats_.restored;
+  stats_.tokens_restored += e.position;
 }
 
 void FolderDiskCache::cancel_restore(int entry) {

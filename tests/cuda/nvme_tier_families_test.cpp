@@ -55,7 +55,7 @@ std::vector<int64_t> tokens(int vocab, int n, uint64_t seed) {
 }
 
 template <class Model>
-void check_tier(Model& m, int vocab, const std::string& family, const std::string& slab_dir) {
+void check_tier(Model& m, int vocab, const std::string& family, const std::string& slab_dir, bool folder = false) {
   const int64_t bt = m.kv_block_tokens();
   require(bt > 0 && bt <= 100, family + ": a paged pool with blocks of at most 100 tokens");
   const int64_t cut = bt + 4;  // one full block and a four-token partial
@@ -80,6 +80,11 @@ void check_tier(Model& m, int vocab, const std::string& family, const std::strin
   en.chunk_bytes = size_t{4} << 20;
   en.rank = 0;
   en.allow_buffered = true;
+  // The folder backend: the same entry as one folder of 64 KiB files, so the
+  // stream crosses file boundaries and the worker's in-order slices are tested.
+  en.folder = folder;
+  en.folder_root = slab_dir + "/folders";
+  en.folder_file_bytes = size_t{64} << 10;
   dgpp::NvmeTier<Model> tier(&m, &arena, en);
   require(tier.block_bytes() == dgpp::cache_block_bytes(m.cache_planes()), family + ": the record is the planes' bytes");
   const auto wait = [&](uint64_t op) {
@@ -102,6 +107,7 @@ void check_tier(Model& m, int vocab, const std::string& family, const std::strin
   spill.ids.assign(A.begin(), A.begin() + cut);
   spill.ids_page = tier.blob_pages() + 2;
   spill.ids_pages = 1;
+  spill.key = "session-test/entry-test";
   tier.spill_begin(spill);
   require(wait(1), family + ": the spill completed");
   dgpp::sched::SchedulerEngine::DiskRestore rs;
@@ -112,6 +118,8 @@ void check_tier(Model& m, int vocab, const std::string& family, const std::strin
   rs.blob_page = 0;
   rs.pages = {tier.blob_pages()};
   rs.partial_page = tier.blob_pages() + 1;
+  rs.key = spill.key;
+  rs.bytes = (2 + tier.blob_pages()) * static_cast<int64_t>(tier.page_bytes());  // a full block, the partial, the blob
   const dgpp::sched::SchedulerEngine::DiskBlocks fresh = tier.restore_begin(rs);
   require(fresh.identities.size() == 1 && fresh.identities[0] != ids.identities[0] &&
               fresh.partial_identity != ids.partial_identity,
@@ -153,7 +161,8 @@ void check_tier(Model& m, int vocab, const std::string& family, const std::strin
   require(m.kv_blocks_in_use() == blocks_before, family + ": the release returned the restored blocks");
   arena.release(0);
   require(m.kv_blocks_in_use() == 0, family + ": every block released");
-  std::printf("[ OK ] %s: NVMe tier spill/restore bitwise, attach and step bitwise\n", family.c_str());
+  std::printf("[ OK ] %s%s: NVMe tier spill/restore bitwise, attach and step bitwise\n", family.c_str(),
+              folder ? " (folder backend)" : "");
 }
 
 }  // namespace
@@ -175,7 +184,10 @@ int main() {
         require(dgpp::cache_block_bytes(m.cache_planes()) == dgpp::DoryModel::kv_block_bytes_static(cfg, policy),
                 "Dory: planned block bytes match every allocated K/V plane");
         if (policy == dgpp::DoryKvPolicy::PerLoop)
+        {
           check_tier(m, cfg.vocab_size, "Dory", base + "/dory-slab");
+          check_tier(m, cfg.vocab_size, "Dory", base + "/dory-folder", /*folder=*/true);
+        }
       }
       dgpp::DoryModel::clear_recurrent_loops();
     }
@@ -186,6 +198,7 @@ int main() {
       dgpp::MimoModel m(cfg, dir, /*max_tokens=*/128, /*max_cache_tokens=*/512, dgpp::MimoResidency::Resident,
                         nullptr, 0, 1, /*max_requests=*/2, /*mtp=*/false);
       check_tier(m, cfg.vocab_size, "MiMo", base + "/mimo-slab");
+      check_tier(m, cfg.vocab_size, "MiMo", base + "/mimo-folder", /*folder=*/true);
     }
     {
       const std::string dir = base + "/flint";
@@ -194,6 +207,7 @@ int main() {
       dgpp::FlintModel m(cfg, dir, /*max_tokens=*/128, /*max_cache_tokens=*/512, dgpp::FlintResidency::Resident,
                          nullptr, 0, 1, /*max_requests=*/2, /*mtp=*/false);
       check_tier(m, cfg.vocab_size, "Flint", base + "/flint-slab");
+      check_tier(m, cfg.vocab_size, "Flint", base + "/flint-folder", /*folder=*/true);
     }
     {
       const std::string dir = base + "/qwen35";
@@ -202,6 +216,7 @@ int main() {
       dgpp::Qwen35Model m(cfg, dir, /*max_tokens=*/128, /*max_cache_tokens=*/512, dgpp::LoaderResidency::Resident,
                           nullptr, 0, 1, /*max_requests=*/2, /*decode_rows=*/8, /*mtp=*/false);
       check_tier(m, cfg.vocab_size, "Qwen3.5", base + "/qwen35-slab");
+      check_tier(m, cfg.vocab_size, "Qwen3.5", base + "/qwen35-folder", /*folder=*/true);
     }
     fs::remove_all(base);
     return 0;
