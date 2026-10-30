@@ -1204,6 +1204,10 @@ add_executable(nvme_cache_test tests/host/nvme_cache_test.cpp)
 target_link_libraries(nvme_cache_test PRIVATE dgpp_serve)
 dgpp_set_common(nvme_cache_test)
 add_test(NAME nvme_cache_test COMMAND nvme_cache_test)
+add_executable(nvme_folder_store_test tests/host/nvme_folder_store_test.cpp)
+target_link_libraries(nvme_folder_store_test PRIVATE dgpp_serve)
+dgpp_set_common(nvme_folder_store_test)
+add_test(NAME nvme_folder_store_test COMMAND nvme_folder_store_test)
 
 # M6 Stage 4 service gate: the REAL HTTP/SSE service over a fake engine
 # + fake frontend — the OpenAI surface, host-only, always runs.
