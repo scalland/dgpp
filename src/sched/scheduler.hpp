@@ -166,7 +166,7 @@ class SchedulerEngine {
   };
   // Last launched decode graph, retained while idle; counters since startup.
   struct DecodeBatchStats {
-    static constexpr int kMaxSlots = 16;
+    static constexpr int kMaxSlots = 32;
     int slots = 0, active = 0, rows_per_request = 0;
     uint64_t replays = 0, rows = 0, padded_rows = 0;
     uint64_t replays_by_slots[kMaxSlots + 1] = {};

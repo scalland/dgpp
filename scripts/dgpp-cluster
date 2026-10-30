@@ -61,6 +61,10 @@ def expand(p):
     return os.path.expanduser(p)
 
 
+AUTO_MEMORY_FRACTION = 0.96
+AUTO_SEAT_CAP = 31
+
+
 class Cluster:
     def __init__(self, args, namespace=None):
         if namespace is None:
