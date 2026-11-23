@@ -5,11 +5,14 @@
 //     decode, repeat runs) are bitwise;
 //   * device-vs-host oracle comparisons are tolerance-based where libm or
 //     FMA contraction can differ (compress, attention);
-//   * the top-k selection is exact by construction: the host oracle mirrors
-//     the kernel's contraction-proof logit arithmetic (separate mul/add in
-//     the documented order plus the warp butterfly reduction), so pool
-//     positions and expanded token rows are compared bitwise over the fuzz
-//     corpus — the M3 exit criterion.
+//   * the top-k selection is exact by construction where the host can
+//     mirror the scores (the prefill select's chain over its captured dots:
+//     separate mul/add in the documented order plus the warp butterfly), so
+//     pool positions and expanded token rows are compared bitwise over the
+//     fuzz corpus — the M3 exit criterion. The decode select scores on the
+//     tensor cores, whose accumulation order is the hardware's: its scores
+//     are held to the exact logits within the fp32 sums' rounding, and its
+//     selection bitwise to the top of its own keys (DecodeSelScenario).
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -932,139 +935,6 @@ DGPP_TEST(dsa_select_prefill_bitwise_fuzz) {
 }
 
 // ---------------------------------------------------------------------------
-// Fused decode select: same bitwise oracle, logits computed inline from the
-// fp8 cache; also repeat-run determinism.
-// ---------------------------------------------------------------------------
-DGPP_TEST(dsa_select_decode_fused_bitwise) {
-  const DsaConfig cfg{};
-  const DsaGeometry g = DsaGeometry::from_config(cfg);
-  const int select_k = g.select_k, kpool = cfg.index_kpool;
-  const int max_selected = g.max_selected;
-  const int heads = cfg.index_n_heads, dim = cfg.index_head_dim;
-  const int n_pools = 6000;  // > select_k: real sparse selection
-  const int64_t pos = 4 * n_pools + 2;  // visible = n_pools, tail 2
-
-  // q_fp8 with sane magnitudes and matching scales; random fp8 cache.
-  std::vector<uint16_t> qb = random_bf16_bits(61, heads * dim, -2, 1);
-  std::vector<uint8_t> q8(size_t(heads) * dim);
-  std::vector<float> q_scale(size_t(heads), 0.0f);
-  dsa_ref::fwht128_quant_fp8<float>(qb.data(), heads, dim, q8.data(),
-                                    q_scale.data());
-  std::vector<float> w_raw(heads, 0.0f);
-  for (auto& v : w_raw) v = random_f32(62, &v - w_raw.data()) * 0.01f;
-  std::vector<float> w(heads, 0.0f);
-  const float logit_scale =
-      float(std::pow(128.0, -0.5) * std::pow(32.0, -0.5));
-  for (int h = 0; h < heads; ++h)
-    w[h] = (w_raw[h] * q_scale[h]) * logit_scale;
-
-  std::vector<uint8_t> k8(size_t(n_pools) * dim);
-  std::vector<float> ks(n_pools, 0.0f);
-  // Random fp8 bytes, remapping the two NaN encodings (0x7F/0xFF) to max
-  // finite: real cache rows are always finite (the saturating encoder never
-  // mints NaN), and the select spec assumes finite logits.
-  for (auto& v : k8) {
-    v = uint8_t(hash32(63 + (&v - k8.data())) & 0xFF);
-    if ((v & 0x7Fu) == 0x7Fu) v ^= 0x01u;
-  }
-  for (auto& v : ks) v = std::fabs(random_f32(64, &v - ks.data())) * 0.05f;
-
-  DevBuf dq8(q8.size()), dks_cache(ks.size() * 4), dw(w.size() * 4),
-      dki(k8.size()), dpos(8), dri(4), dbt(4), dtopk(size_t(max_selected) * 4),
-      dcnt(4), dws(dsa_select_workspace_bytes(1, n_pools)), dctr(8);
-  dq8.upload(q8.data(), q8.size());
-  dw.upload(w.data(), w.size() * 4);
-  dki.upload(k8.data(), k8.size());
-  dks_cache.upload(ks.data(), ks.size() * 4);
-  std::vector<int64_t> posv = {pos};
-  std::vector<int32_t> req0 = {0}, bt0 = {0};
-  dpos.upload(posv.data(), 8);
-  dri.upload(req0.data(), 4);
-  dbt.upload(bt0.data(), 4);
-  int32_t zero32 = 0;
-  dctr.upload(&zero32, 4);
-
-  dsa_select_decode(dq8.p, static_cast<const float*>(dw.p),
-                    static_cast<const int32_t*>(dri.p),
-                    static_cast<const int64_t*>(dpos.p), 1,
-                    static_cast<const int32_t*>(dbt.p), 1, dki.p,
-                    static_cast<const float*>(dks_cache.p), n_pools, heads,
-                    dim, select_k, kpool, max_selected,
-                    static_cast<int32_t*>(dtopk.p),
-                    static_cast<int32_t*>(dcnt.p), dws.p, n_pools,
-                    static_cast<int32_t*>(dctr.p), 48, 0);
-
-  // Host mirror: identical inline dot arithmetic.
-  std::vector<float> logits(n_pools, 0.0f);
-  for (int j = 0; j < n_pools; ++j) {
-    float contrib[32];
-    for (int h = 0; h < 32; ++h) {
-      float partial = 0.0f;
-      for (int d = 0; d < 128; ++d)
-        partial = partial +
-                  fp8_e4m3_bits_to_float(q8[size_t(h) * 128 + d]) *
-                      fp8_e4m3_bits_to_float(k8[size_t(j) * 128 + d]);
-      contrib[h] = (w[h] * ks[j]) * partial;
-    }
-    logits[size_t(j)] = butterfly_sum_32(contrib);
-  }
-  std::vector<int32_t> pool_ids(select_k, 0);
-  const int n_sel =
-      dsa_ref::select_pools(logits.data(), n_pools, select_k, pool_ids.data());
-  std::vector<int32_t> want(size_t(max_selected), -1);
-  dsa_ref::expand_append_tail(pool_ids.data(), n_sel, pos, kpool, max_selected,
-                              want.data());
-
-  std::vector<int32_t> got(size_t(max_selected), -12345);
-  int32_t got_cnt = -1;
-  dtopk.download(got.data(), got.size() * 4);
-  dcnt.download(&got_cnt, 4);
-  if (got_cnt != int(n_sel * kpool + (pos + 1) % kpool))
-    throw std::runtime_error("decode select count");
-  if (std::memcmp(got.data(), want.data(), max_selected * 4) != 0) {
-    // Diagnostics: which pools are selected by one side but not the other,
-    // and their host-mirror logits (a boundary flip shows ulp-close logits;
-    // a kernel bug shows a clearly-better pool missing).
-    std::vector<int32_t> gset, wset;
-    for (int i = 0; i < max_selected; ++i) {
-      if (got[size_t(i)] >= 0) gset.push_back(got[size_t(i)] / kpool);
-      if (want[size_t(i)] >= 0) wset.push_back(want[size_t(i)] / kpool);
-    }
-    std::sort(gset.begin(), gset.end());
-    std::sort(wset.begin(), wset.end());
-    std::string detail;
-    for (int p : gset)
-      if (!std::binary_search(wset.begin(), wset.end(), p))
-        detail += " device-only pool " + std::to_string(p) + " logit " +
-                  std::to_string(logits[size_t(p)]) + ";";
-    for (int p : wset)
-      if (!std::binary_search(gset.begin(), gset.end(), p))
-        detail += " host-only pool " + std::to_string(p) + " logit " +
-                  std::to_string(logits[size_t(p)]) + ";";
-    std::vector<float> sorted = logits;
-    std::sort(sorted.begin(), sorted.end(), std::greater<float>());
-    detail += " 512th logit=" + std::to_string(sorted[511]) + " 513th=" +
-              std::to_string(sorted[512]);
-    throw std::runtime_error("decode select tokens mismatch: " + detail);
-  }
-
-  // Determinism: a second run must be identical.
-  std::vector<int32_t> got2(size_t(max_selected), -12345);
-  dsa_select_decode(dq8.p, static_cast<const float*>(dw.p),
-                    static_cast<const int32_t*>(dri.p),
-                    static_cast<const int64_t*>(dpos.p), 1,
-                    static_cast<const int32_t*>(dbt.p), 1, dki.p,
-                    static_cast<const float*>(dks_cache.p), n_pools, heads,
-                    dim, select_k, kpool, max_selected,
-                    static_cast<int32_t*>(dtopk.p),
-                    static_cast<int32_t*>(dcnt.p), dws.p, n_pools,
-                    static_cast<int32_t*>(dctr.p), 48, 0);
-  dtopk.download(got2.data(), got2.size() * 4);
-  require_bitwise("decode select repeat", got2.data(), got.data(),
-                  got.size() * 4);
-}
-
-// ---------------------------------------------------------------------------
 // Absorbed attention chain vs the host oracle (tolerance: online-softmax
 // rescaling vs one-shot).
 // ---------------------------------------------------------------------------
@@ -1538,6 +1408,101 @@ DGPP_TEST(dsa_listed_attention_matches_split_kernel_and_reference) {
   }
 }
 
+// A row's partials do not depend on the rows beside it, at every row count
+// from one to eight (2026-11-15). At sixteen local heads a row is one slab
+// of a block: an even count runs two rows a block, an odd count pairs each
+// row's splits in a block instead (the kernel's layout note), and a slab is
+// the same arithmetic either way. Every row of every count is held bit for
+// bit to that row in the eight-row launch — m, l and c of every split — at
+// the decode's 32 splits (64 tokens a split: every tile asked for ahead) and
+// at 2 (1,024 tokens: two address rounds), counts from 3 to 2,048 so splits
+// are empty, short and whole; the 512 + 64 fp8 cache rows (one block an SM)
+// and a 512-wide bf16 cache (two).
+DGPP_TEST(dsa_listed_attention_rows_do_not_depend_on_the_rows_beside_them) {
+  struct Form { LatentFormat fmt; int rope; };
+  for (const Form form : {Form{LatentFormat::kFp8, 64}, Form{LatentFormat::kBf16, 0}}) {
+    constexpr int kv = 512, lh = 16, bt_tokens = 128, n_blocks = 40, max_rows = 8, max_selected = 2048;
+    const int sd = kv + form.rope;
+    const int64_t total = int64_t(n_blocks) * bt_tokens;
+    const size_t row_bytes = latent_row_bytes(form.fmt, kv) + size_t(form.rope) * 2;
+    std::vector<uint8_t> cache(size_t(total) * row_bytes);
+    std::vector<float> scales(static_cast<size_t>(total));
+    for (int64_t t = 0; t < total; ++t) {
+      uint8_t* row = cache.data() + size_t(t) * row_bytes;
+      if (form.fmt == LatentFormat::kFp8) {
+        for (int e = 0; e < kv; ++e) {
+          uint8_t c = uint8_t(hash32(7001 + uint64_t(t) * 977 + uint64_t(e)) & 0xFF);
+          if ((c & 0x7Fu) == 0x7Fu) c ^= 0x01u;  // no NaN encodings
+          row[e] = c;
+        }
+      } else {
+        for (int e = 0; e < kv; ++e) {
+          const uint16_t v = float_to_bf16_bits(random_f32(7002, t * kv + e));
+          std::memcpy(row + e * 2, &v, 2);
+        }
+      }
+      for (int e = 0; e < form.rope; ++e) {
+        const uint16_t v = float_to_bf16_bits(random_f32(7003, t * 64 + e) * 0.5f);
+        std::memcpy(row + latent_row_bytes(form.fmt, kv) + e * 2, &v, 2);
+      }
+      scales[size_t(t)] = 0.002f + std::fabs(random_f32(7004, t)) * 0.004f;
+    }
+    auto q = random_bf16_bits(7005, int64_t(max_rows) * lh * sd, -2, 1);
+    const int row_counts[max_rows] = {2048, 2048, 700, 3, 2048, 65, 1300, 2048};
+    std::vector<int32_t> tokens(size_t(max_rows) * max_selected, -1), counts(row_counts, row_counts + max_rows),
+        req_ids(max_rows, 0), bt(n_blocks);
+    for (int b = 0; b < n_blocks; ++b) bt[size_t(b)] = (b * 7 + 3) % n_blocks;  // a permuted table
+    for (int r = 0; r < max_rows; ++r)
+      for (int i = 0; i < row_counts[r]; ++i)
+        tokens[size_t(r) * max_selected + i] = int32_t((int64_t(r) * 131 + int64_t(i) * 2503) % total);
+    DevBuf dcache(cache.size()), dscale(scales.size() * 4), dq(q.size() * 2), dtopk(tokens.size() * 4),
+        dcnt(counts.size() * 4), dri(req_ids.size() * 4), dbt(bt.size() * 4);
+    dcache.upload(cache.data(), cache.size());
+    dscale.upload(scales.data(), scales.size() * 4);
+    dq.upload(q.data(), q.size() * 2);
+    dtopk.upload(tokens.data(), tokens.size() * 4);
+    dcnt.upload(counts.data(), counts.size() * 4);
+    dri.upload(req_ids.data(), req_ids.size() * 4);
+    dbt.upload(bt.data(), bt.size() * 4);
+    for (const int n_split : {32, 2}) {
+      const size_t parts = size_t(max_rows) * n_split * lh;
+      DevBuf dm(parts * 4), dl(parts * 4), dc(parts * kv * 4);
+      std::vector<float> m8, l8, c8;
+      for (int rows = max_rows; rows >= 1; --rows) {
+        // Poisoned first: a partial a launch does not write would show.
+        DGPP_CUDA_OK(cudaMemset(dm.p, 0xEE, parts * 4));
+        DGPP_CUDA_OK(cudaMemset(dl.p, 0xEE, parts * 4));
+        DGPP_CUDA_OK(cudaMemset(dc.p, 0xEE, parts * kv * 4));
+        if (!dsa_attn_listed(dq.p, dcache.p, static_cast<const int32_t*>(dri.p), static_cast<const int32_t*>(dtopk.p),
+                             max_selected, static_cast<const int32_t*>(dcnt.p), rows, n_split, lh, kv, bt_tokens,
+                             static_cast<const int32_t*>(dbt.p), n_blocks, 0.05f, static_cast<float*>(dm.p),
+                             static_cast<float*>(dl.p), static_cast<float*>(dc.p), 0, form.fmt,
+                             static_cast<const float*>(dscale.p), form.rope))
+          throw std::runtime_error("rows beside: the listed kernel refused the geometry");
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        const size_t n = size_t(rows) * n_split * lh;
+        std::vector<float> m(n), l(n), c(n * kv);
+        dm.download(m.data(), n * 4);
+        dl.download(l.data(), n * 4);
+        dc.download(c.data(), n * kv * 4);
+        const std::string tag = std::string("rows beside (") + latent_format_name(form.fmt) + ", " +
+                                std::to_string(n_split) + " splits, " + std::to_string(rows) + " rows)";
+        if (rows == max_rows) {
+          m8 = m, l8 = l, c8 = c;
+          double mass = 0;
+          for (float v : l) mass += double(v);
+          if (!(mass > 0)) throw std::runtime_error(tag + ": the launch attended to nothing");
+          continue;
+        }
+        require_bitwise(tag + " m", m.data(), m8.data(), n * 4);
+        require_bitwise(tag + " l", l.data(), l8.data(), n * 4);
+        require_bitwise(tag + " c", c.data(), c8.data(), n * kv * 4);
+      }
+    }
+    std::printf("[ OK ] listed attention %s: every row of 1..7 rows bitwise its row of 8, at 32 and 2 splits\n",
+                latent_format_name(form.fmt));
+  }
+}
 
 // The listed kernel's split groups (2026-10-23, kAttnSplitGroup): eight
 // consecutive splits of a row merge in a thread-block cluster and publish
@@ -1635,25 +1600,44 @@ DGPP_TEST(dsa_dense_attention_matches_split_kernel_and_reference) {
 
 // ---------------------------------------------------------------------------
 // Decode-select scenarios shared by the MTP-row, grid-invariance,
-// long-context, and graph-replay tests. The host expectation mirrors the
-// kernel's contraction-proof arithmetic exactly (see the bitwise test above).
+// long-context, and graph-replay tests. The kernel scores on the tensor
+// cores (2026-11-15), whose accumulation order is the hardware's, so the
+// host cannot mirror a score bit for bit. The expectation is therefore the
+// selection's two definitions, each exact in its own terms:
+//   * a pool's score, read back from the key the kernel left in the
+//     workspace, is its exact (fp64) logit within the fp32 sums' rounding
+//     (1e-5 of the row's range), and the key carries the pool's own id;
+//   * the selection is the select_k smallest of the kernel's OWN keys (they
+//     are distinct: the id is their low bits), expanded as the reference
+//     expands a selection — bit for bit.
 // ---------------------------------------------------------------------------
 
 struct DecodeSelScenario {
+  int kpool = 4;  // tokens a pool: 4 (GLM-5.3-Flash), 1 (the full model: 2,048 pools selected)
   int rows = 0;
   int64_t n_pools = 0;  // complete pools resident in the cache
   std::vector<uint8_t> q8, k8;
   std::vector<float> w, ks;
   std::vector<int64_t> pos;
   std::vector<int32_t> req_ids;
-  const DsaGeometry g = DsaGeometry::from_config(DsaConfig{});
+  const DsaGeometry g;
   int heads = 32, dim = 128;
+  std::vector<uint64_t> keys;  // [rows][n_pools]: the last run's keys (expect() reads them)
+  bool relu = false;           // each head's dot clamped at zero (the full model's indexer)
+  static constexpr int kKeyIdBits = 21;  // the key's pool id (topk_select.cuh's kIdxBits)
+
+  static DsaGeometry geometry(int tokens_a_pool) {
+    DsaConfig c{};
+    c.index_kpool = tokens_a_pool;
+    return DsaGeometry::from_config(c);
+  }
+  explicit DecodeSelScenario(int tokens_a_pool = 4) : kpool(tokens_a_pool), g(geometry(tokens_a_pool)) {}
 
   void init(uint64_t seed, const std::vector<int64_t>& positions) {
     pos = positions;
     rows = int(pos.size());
     n_pools = 8;
-    for (int64_t p : pos) n_pools = std::max(n_pools, (p + 1) / 4 + 8);
+    for (int64_t p : pos) n_pools = std::max(n_pools, (p + 1) / kpool + 8);
 
     std::vector<uint16_t> qb =
         random_bf16_bits(seed, int64_t(rows) * heads * dim, -2, 1);
@@ -1685,65 +1669,128 @@ struct DecodeSelScenario {
     const int max_selected = g.max_selected;
     DevBuf dq8(q8.size()), dw(w.size() * 4), dki(k8.size()),
         dks_c(ks.size() * 4), dpos(pos.size() * 8), dri(req_ids.size() * 4),
-        dbt(4), dtopk(size_t(max_selected) * rows * 4), dcnt(rows * 4),
+        dtopk(size_t(max_selected) * rows * 4), dcnt(rows * 4),
         dws(dsa_select_workspace_bytes(rows, n_pools)), dctr(8);
+    // A table row a request id, every one the same block: rows given
+    // different ids are different requests over the same index.
+    int32_t max_req = 0;
+    for (const int32_t id : req_ids) max_req = std::max(max_req, id);
+    const std::vector<int32_t> table(size_t(max_req) + 1, 0);
+    DevBuf dbt(table.size() * 4);
     dq8.upload(q8.data(), q8.size());
     dw.upload(w.data(), w.size() * 4);
     dki.upload(k8.data(), k8.size());
     dks_c.upload(ks.data(), ks.size() * 4);
     dpos.upload(pos.data(), pos.size() * 8);
     dri.upload(req_ids.data(), req_ids.size() * 4);
-    int32_t bt0 = 0, ctr0 = 0;
-    dbt.upload(&bt0, 4);
+    int32_t ctr0 = 0;
+    dbt.upload(table.data(), table.size() * 4);
     dctr.upload(&ctr0, 4);
     dsa_select_decode(dq8.p, static_cast<const float*>(dw.p),
                       static_cast<const int32_t*>(dri.p),
                       static_cast<const int64_t*>(dpos.p), rows,
                       static_cast<const int32_t*>(dbt.p), 1, dki.p,
                       static_cast<const float*>(dks_c.p), int(n_pools), heads,
-                      dim, g.select_k, 4, max_selected,
+                      dim, g.select_k, kpool, max_selected,
                       static_cast<int32_t*>(dtopk.p),
                       static_cast<int32_t*>(dcnt.p), dws.p, n_pools,
-                      static_cast<int32_t*>(dctr.p), grid_blocks, stream);
+                      static_cast<int32_t*>(dctr.p), grid_blocks, stream, relu);
     topk.assign(size_t(max_selected) * rows, -12345);
     counts.assign(rows, -1);
     cudaDeviceSynchronize();
     dtopk.download(topk.data(), topk.size() * 4);
     dcnt.download(counts.data(), counts.size() * 4);
+    keys.assign(size_t(rows) * size_t(n_pools), 0);  // row r's keys at r * ws_max_pools
+    dws.download(keys.data(), keys.size() * 8);
   }
 
-  // Host mirror of the kernel's logits + the pinned selection + expansion.
+  // A key's score: the key is ~sortable(score) above the pool id.
+  static float key_score(uint64_t key) {
+    const uint32_t sortable = ~uint32_t(key >> kKeyIdBits);
+    const uint32_t bits = sortable & 0x80000000u ? sortable ^ 0x80000000u : ~sortable;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  }
+
+  // The expectation (see the header above): checks the last run's keys
+  // against the exact logits, then selects and expands from those keys.
   void expect(std::vector<int32_t>& topk, std::vector<int32_t>& counts) const {
     const int max_selected = g.max_selected;
     topk.assign(size_t(max_selected) * rows, -1);
     counts.assign(rows, 0);
-    std::vector<float> logits(size_t(n_pools), 0.0f);
+    std::vector<double> logits(size_t(n_pools), 0.0);
     std::vector<int32_t> pool_ids(g.select_k, 0);
     for (int r = 0; r < rows; ++r) {
-      const int64_t visible = (pos[size_t(r)] + 1) / 4;
-      for (int64_t j = 0; j < visible; ++j) {
-        float contrib[32];
-        for (int h = 0; h < 32; ++h) {
-          float partial = 0.0f;
-          for (int d = 0; d < 128; ++d)
-            partial =
-                partial +
-                fp8_e4m3_bits_to_float(
-                    q8[size_t(r) * heads * dim + size_t(h) * 128 + d]) *
-                    fp8_e4m3_bits_to_float(k8[size_t(j) * dim + d]);
-          contrib[h] = (w[size_t(r) * heads + h] * ks[size_t(j)]) * partial;
+      const int64_t visible = (pos[size_t(r)] + 1) / kpool;
+      int n_sel = 0;
+      if (visible <= g.select_k) {
+        for (int64_t j = 0; j < visible; ++j) pool_ids[size_t(n_sel++)] = int32_t(j);
+      } else {
+        if (keys.size() != size_t(rows) * size_t(n_pools))
+          throw std::runtime_error("decode select scenario: expect() needs the keys of a run");
+        const uint64_t* krow = keys.data() + size_t(r) * size_t(n_pools);
+        double lo = 0.0, hi = 0.0;
+        for (int64_t j = 0; j < visible; ++j) {
+          double total = 0.0;
+          for (int h = 0; h < heads; ++h) {
+            double partial = 0.0;
+            for (int d = 0; d < dim; ++d)
+              partial += double(fp8_e4m3_bits_to_float(q8[(size_t(r) * heads + size_t(h)) * dim + d])) *
+                         double(fp8_e4m3_bits_to_float(k8[size_t(j) * dim + d]));
+            total += double(w[size_t(r) * heads + h]) * (relu ? std::max(partial, 0.0) : partial);
+          }
+          logits[size_t(j)] = total * double(ks[size_t(j)]);
+          lo = j == 0 ? logits[0] : std::min(lo, logits[size_t(j)]);
+          hi = j == 0 ? logits[0] : std::max(hi, logits[size_t(j)]);
         }
-        logits[size_t(j)] = butterfly_sum_32(contrib);
+        const double tol = 1e-5 * (hi - lo);
+        for (int64_t j = 0; j < visible; ++j) {
+          if (int64_t(krow[j] & ((1ull << kKeyIdBits) - 1)) != j)
+            throw std::runtime_error("decode select scenario: row " + std::to_string(r) + " pool " +
+                                     std::to_string(j) + " carries another pool's id in its key");
+          const double dev = double(key_score(krow[j]));
+          if (!(std::fabs(dev - logits[size_t(j)]) <= tol))
+            throw std::runtime_error("decode select scenario: row " + std::to_string(r) + " pool " +
+                                     std::to_string(j) + " scored " + std::to_string(dev) + " against the exact " +
+                                     std::to_string(logits[size_t(j)]) + " (tolerance " + std::to_string(tol) + ")");
+        }
+        std::vector<uint64_t> order(krow, krow + visible);
+        std::nth_element(order.begin(), order.begin() + (g.select_k - 1), order.end());
+        for (int i = 0; i < g.select_k; ++i) pool_ids[size_t(i)] = int32_t(order[size_t(i)] & ((1ull << kKeyIdBits) - 1));
+        std::sort(pool_ids.begin(), pool_ids.end());
+        n_sel = g.select_k;
       }
-      const int n_sel = dsa_ref::select_pools(logits.data(), visible,
-                                              g.select_k, pool_ids.data());
       counts[size_t(r)] =
           dsa_ref::expand_append_tail(pool_ids.data(), n_sel, pos[size_t(r)],
-                                      4, max_selected,
+                                      kpool, max_selected,
                                       &topk[size_t(r) * max_selected]);
     }
   }
 };
+
+// The fused decode select over the fp8 cache, and repeat-run determinism.
+DGPP_TEST(dsa_select_decode_fused_bitwise) {
+  // 6000 visible pools (> select_k: a real sparse selection), a tail of two
+  // tokens: the scores against the exact logits and the selection bitwise
+  // from the kernel's own keys (DecodeSelScenario::expect, below), and a
+  // second run bit for bit the first, keys included.
+  DecodeSelScenario sc;
+  const int n_pools = 6000;
+  sc.init(61, {int64_t(sc.kpool) * n_pools + 2});
+  std::vector<int32_t> got, counts, want, want_counts;
+  sc.run(48, got, counts);
+  sc.expect(want, want_counts);
+  if (counts[0] != want_counts[0] || counts[0] != sc.g.select_k * sc.kpool + 3 % sc.kpool)
+    throw std::runtime_error("decode select count");
+  if (std::memcmp(got.data(), want.data(), got.size() * 4) != 0)
+    throw std::runtime_error("decode select tokens are not the top of the kernel's own keys");
+  const std::vector<uint64_t> keys = sc.keys;
+  std::vector<int32_t> got2, counts2;
+  sc.run(48, got2, counts2);
+  require_bitwise("decode select repeat", got2.data(), got.data(), got.size() * 4);
+  require_bitwise("decode select repeat keys", sc.keys.data(), keys.data(), size_t(n_pools) * 8);
+}
 
 // MTP-shaped multi-row decode: 4 rows at consecutive positions (differing
 // visible counts), plus short-context rows where most blocks get empty
@@ -1784,6 +1831,33 @@ DGPP_TEST(dsa_select_decode_mtp_rows_and_short_context) {
     throw std::runtime_error("pos=0 decode select");
 }
 
+// The full model's geometry (2026-11-14): a pool is a token and 2,048 are
+// selected, so the selection's ids leave the ordered gather eight a thread
+// (until then they were rank-sorted, a sort sized for 512 pools). Rows
+// below select_k, at it (every pool selected), one past it and far past
+// it, each bitwise the host mirror.
+DGPP_TEST(dsa_select_decode_per_token_geometry) {
+  DecodeSelScenario sc(1);
+  sc.init(91, {33, 2046, 2047, 2048, 2100, 9000, 40000});
+  if (sc.g.select_k != 2048) throw std::runtime_error("per-token geometry: select_k");
+  std::vector<int32_t> got, counts, want, want_counts;
+  long long anomalies[6] = {};
+  dsa_select_anomalies(anomalies, true, 0);  // an earlier test's record is not this one's
+  sc.run(96, got, counts);
+  sc.expect(want, want_counts);
+  for (int r = 0; r < sc.rows; ++r) {
+    if (counts[size_t(r)] != want_counts[size_t(r)])
+      throw std::runtime_error("per-token geometry count r=" + std::to_string(r));
+    const int32_t* a = &got[size_t(r) * sc.g.max_selected];
+    if (std::memcmp(a, &want[size_t(r) * sc.g.max_selected], sc.g.max_selected * 4) != 0)
+      throw std::runtime_error("per-token geometry tokens r=" + std::to_string(r));
+    for (int i = 1; i < counts[size_t(r)]; ++i)
+      if (a[i] <= a[i - 1]) throw std::runtime_error("per-token geometry order r=" + std::to_string(r));
+  }
+  if (dsa_select_anomalies(anomalies, true, 0) != 0)
+    throw std::runtime_error("per-token geometry: a selection anomaly");
+}
+
 // Rows past the fused kernel's eight run as the launcher's row groups
 // (8 + 4 and 8 + 8, 2026-09-13: the decode batch's cap lifted to 16) —
 // each row bitwise the host mirror, as at eight and below.
@@ -1807,9 +1881,9 @@ DGPP_TEST(dsa_select_decode_row_groups) {
 }
 
 // The 64-head indexer at the DeepSeek-V4-Flash release shape (2026-10-01):
-// 64 heads x 128, relu, select_k 512, one entry per pool (kpool 1) — the
-// kernel's kHG = 2 instantiation, which scores 16-entry tiles on the tensor
-// cores (e4m3 codes widened exactly to f16, mma f16 -> f32) and needs the
+// 64 heads x 128, relu, select_k 512, one entry per pool (kpool 1): eight
+// head tiles a 16-entry tile on the tensor cores (e4m3 codes widened
+// exactly to f16, mma f16 -> f32), and the shape that needs the
 // per-symbol dynamic shared-memory opt-in (a missing one is `invalid
 // argument` at the launch, which the tiny fixture's select_k 16 never
 // reached). Rows 1, 4 and 6, contexts below, at and far above select_k,
@@ -1873,6 +1947,30 @@ DGPP_TEST(dsa_select_decode_64_heads_release_shape) {
         if (again != got) throw std::runtime_error("64-head select: two launches differ");
       }
     }
+    // The rows as requests of their own (a table row each, the same two
+    // blocks): no rows share a staged tile, and the picks are the same.
+    if (rows > 1) {
+      std::vector<int32_t> own(static_cast<size_t>(rows)), tables(size_t(rows) * 2);
+      for (int r = 0; r < rows; ++r) {
+        own[size_t(r)] = r;
+        tables[size_t(r) * 2] = table[0];
+        tables[size_t(r) * 2 + 1] = table[1];
+      }
+      DevBuf dri2(own.size() * 4), dbt2(tables.size() * 4);
+      dri2.upload(own.data(), own.size() * 4);
+      dbt2.upload(tables.data(), tables.size() * 4);
+      dsa_select_decode(dq8.p, static_cast<const float*>(dw.p), static_cast<const int32_t*>(dri2.p),
+                        static_cast<const int64_t*>(dpos.p), rows, static_cast<const int32_t*>(dbt2.p), 2, dki.p,
+                        static_cast<const float*>(dks.p), pools_per_block, heads, dim, select_k, 1, select_k,
+                        static_cast<int32_t*>(dtopk.p), static_cast<int32_t*>(dcnt.p), dws.p, n_pools,
+                        static_cast<int32_t*>(dctr.p), 0, 0, /*relu=*/true);
+      cudaDeviceSynchronize();
+      std::vector<int32_t> alone(got.size(), 0), alone_counts(counts.size(), 0);
+      dtopk.download(alone.data(), alone.size() * 4);
+      dcnt.download(alone_counts.data(), alone_counts.size() * 4);
+      if (alone != got || alone_counts != counts)
+        throw std::runtime_error("64-head select: the rows as requests of their own pick differently");
+    }
 
     std::vector<double> logits(static_cast<size_t>(n_pools));
     for (int r = 0; r < rows; ++r) {
@@ -1923,16 +2021,148 @@ DGPP_TEST(dsa_select_decode_64_heads_release_shape) {
   }
 }
 
-// The selection must not depend on the grid: 7 blocks vs 48 blocks produce
-// identical rows (uneven stripes at grid=7 exercise the stripe bounds).
+// Neither the selection nor a single key may depend on the grid: 7 blocks
+// vs 48 blocks produce identical rows and identical keys (uneven stripes at
+// grid=7 exercise the stripe bounds, and put every entry in another tile,
+// at another place in its tile: a score is its entry's alone).
 DGPP_TEST(dsa_select_decode_grid_invariance) {
-  DecodeSelScenario sc;
-  sc.init(84, {40003});
-  std::vector<int32_t> a, ca, b, cb;
-  sc.run(48, a, ca);
-  sc.run(7, b, cb);
-  if (ca != cb || a != b)
-    throw std::runtime_error("decode select depends on grid size");
+  for (const int kpool : {4, 1}) {
+    DecodeSelScenario sc(kpool);
+    sc.init(84, {int64_t(kpool) * 10000 + kpool - 1});
+    std::vector<int32_t> a, ca, b, cb;
+    sc.run(48, a, ca);
+    const std::vector<uint64_t> keys = sc.keys;
+    sc.run(7, b, cb);
+    if (ca != cb || a != b)
+      throw std::runtime_error("decode select depends on grid size");
+    require_bitwise("decode select keys at another grid", sc.keys.data(), keys.data(), size_t(10000) * 8);
+  }
+}
+
+// A decode step scores an entry to the bits a prefill tile does: the 32-head
+// form is the prefill select's fused scoring (dsa_prefill_score_keys) over
+// the blocked cache, so the two leave the same keys for the same queries,
+// weights, cache rows and scales — with and without the relu, at both pool
+// geometries, a short row and one whose last tile is partial.
+DGPP_TEST(dsa_select_decode_keys_are_the_prefill_select_keys) {
+  for (const bool relu : {false, true})
+    for (const int kpool : {4, 1}) {
+      DecodeSelScenario sc(kpool);
+      sc.relu = relu;
+      sc.init(87, {int64_t(kpool) * 9000 + kpool - 1, int64_t(kpool) * 30007, int64_t(kpool) * 2049});
+      std::vector<int32_t> topk, counts;
+      sc.run(0, topk, counts);
+      DevBuf dq(sc.q8.size()), dk(sc.k8.size()), dw(sc.w.size() * 4), dks(sc.ks.size() * 4), dpos(sc.pos.size() * 8),
+          dkeys(size_t(sc.rows) * size_t(sc.n_pools) * 8);
+      dq.upload(sc.q8.data(), sc.q8.size());
+      dk.upload(sc.k8.data(), sc.k8.size());
+      dw.upload(sc.w.data(), sc.w.size() * 4);
+      dks.upload(sc.ks.data(), sc.ks.size() * 4);
+      dpos.upload(sc.pos.data(), sc.pos.size() * 8);
+      DGPP_CUDA_OK(cudaMemset(dkeys.p, 0, size_t(sc.rows) * size_t(sc.n_pools) * 8));
+      dsa_prefill_score_keys(static_cast<const uint8_t*>(dq.p), static_cast<const uint8_t*>(dk.p),
+                             static_cast<const float*>(dw.p), static_cast<const float*>(dks.p),
+                             static_cast<const int64_t*>(dpos.p), sc.rows, sc.n_pools, sc.n_pools, sc.g.select_k, kpool,
+                             static_cast<uint64_t*>(dkeys.p), 0, relu);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<uint64_t> prefill(size_t(sc.rows) * size_t(sc.n_pools));
+      dkeys.download(prefill.data(), prefill.size() * 8);
+      for (int r = 0; r < sc.rows; ++r) {
+        const int64_t visible = (sc.pos[size_t(r)] + 1) / kpool;
+        if (visible <= sc.g.select_k) throw std::runtime_error("decode keys vs prefill keys: a row with nothing to score");
+        require_bitwise("decode keys vs the prefill select's, row " + std::to_string(r) + (relu ? " (relu)" : "") +
+                            " kpool " + std::to_string(kpool),
+                        &sc.keys[size_t(r) * size_t(sc.n_pools)], &prefill[size_t(r) * size_t(sc.n_pools)],
+                        size_t(visible) * 8);
+      }
+    }
+}
+
+// Nor on the rows beside it: a row's keys and its selection in a launch of
+// one row, of three and of eight (each row count is another grid: the
+// stripes are the default blocks over the rows).
+DGPP_TEST(dsa_select_decode_row_does_not_depend_on_the_rows_beside_it) {
+  for (const int kpool : {4, 1}) {
+    const std::vector<int64_t> all = {int64_t(kpool) * 9000 + kpool - 1, int64_t(kpool) * 5000, int64_t(kpool) * 12000 + 1,
+                                      int64_t(kpool) * 2500, int64_t(kpool) * 9000, 77, int64_t(kpool) * 30000,
+                                      int64_t(kpool) * 2049};
+    DecodeSelScenario s8(kpool);
+    s8.init(86, all);
+    std::vector<int32_t> t8, c8;
+    s8.run(0, t8, c8);
+    for (const int rows : {1, 3}) {
+      DecodeSelScenario sn(kpool);
+      sn.init(86, std::vector<int64_t>(all.begin(), all.begin() + rows));
+      // The same queries, weights and cache as the eight-row launch's first rows.
+      sn.q8.assign(s8.q8.begin(), s8.q8.begin() + size_t(rows) * sn.heads * sn.dim);
+      sn.w.assign(s8.w.begin(), s8.w.begin() + size_t(rows) * sn.heads);
+      sn.k8 = s8.k8;
+      sn.ks = s8.ks;
+      sn.n_pools = s8.n_pools;
+      std::vector<int32_t> tn, cn;
+      sn.run(0, tn, cn);
+      for (int r = 0; r < rows; ++r) {
+        const std::string tag = "decode select row " + std::to_string(r) + " of " + std::to_string(rows) + " rows";
+        if (cn[size_t(r)] != c8[size_t(r)]) throw std::runtime_error(tag + ": count");
+        require_bitwise(tag, &tn[size_t(r) * sn.g.max_selected], &t8[size_t(r) * s8.g.max_selected],
+                        size_t(sn.g.max_selected) * 4);
+        const int64_t visible = (all[size_t(r)] + 1) / kpool;
+        if (visible > sn.g.select_k)
+          require_bitwise(tag + " keys", &sn.keys[size_t(r) * size_t(sn.n_pools)],
+                          &s8.keys[size_t(r) * size_t(s8.n_pools)], size_t(visible) * 8);
+      }
+    }
+  }
+}
+
+// Consecutive rows of one request share their blocks' staged tiles
+// (2026-11-16): each tile of the index is read once and every row of the
+// group scores against it. A row's keys and selection must not depend on
+// that: the same eight rows as one request (two groups of four), as runs
+// of three, one, two and two, as a request a row (no sharing: the launch
+// before the change) and as a five and a three (a group of four, then the
+// fifth row alone) — bit for bit the same lists, counts and keys. The
+// rows are a decode step's (three positions a token apart), a context
+// short enough to select every pool inside a group, a padding row inside
+// a group, and contexts of different lengths in one group (the group's
+// stripes span the longest, and a shorter row publishes only its own).
+DGPP_TEST(dsa_select_decode_rows_of_a_request_share_their_tiles) {
+  for (const int kpool : {4, 1}) {
+    const int64_t k = kpool;
+    const std::vector<int64_t> all = {k * 9000 + k - 1, k * 9000 + k, k * 9000 + k + 1, 77,
+                                      k * 30000,        k * 2049,     -1,               k * 12000 + 1};
+    const std::vector<std::vector<int32_t>> groupings = {
+        {0, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 1, 2, 2, 3, 3}, {0, 1, 2, 3, 4, 5, 6, 7}, {5, 5, 5, 5, 5, 2, 2, 2}};
+    for (const bool relu : {false, true}) {
+      std::vector<int32_t> t0, c0;
+      std::vector<uint64_t> k0;
+      for (size_t gi = 0; gi < groupings.size(); ++gi) {
+        DecodeSelScenario s(kpool);
+        s.init(87, all);
+        s.relu = relu;
+        s.req_ids = groupings[gi];
+        std::vector<int32_t> t, c;
+        s.run(0, t, c);
+        if (gi == 0) {
+          t0 = t, c0 = c, k0 = s.keys;
+          int scored = 0;
+          for (const int64_t p : all) scored += (p + 1) / kpool > s.g.select_k;
+          if (scored < 6) throw std::runtime_error("shared tiles: the scenario scores too few rows");
+          continue;
+        }
+        const std::string tag = "decode select, kpool " + std::to_string(kpool) + (relu ? ", relu" : "") + ", grouping " +
+                                std::to_string(gi);
+        require_bitwise(tag + " counts", c.data(), c0.data(), c.size() * 4);
+        require_bitwise(tag + " lists", t.data(), t0.data(), t.size() * 4);
+        for (size_t r = 0; r < all.size(); ++r) {
+          const int64_t visible = (all[r] + 1) / kpool;
+          if (visible > s.g.select_k)
+            require_bitwise(tag + " keys of row " + std::to_string(r), &s.keys[r * size_t(s.n_pools)],
+                            &k0[r * size_t(s.n_pools)], size_t(visible) * 8);
+        }
+      }
+    }
+  }
 }
 
 // Long-context decode: 100k visible pools — stripes exceed the 2048-pool
@@ -2569,6 +2799,11 @@ DGPP_TEST(dsa_select_decode_graph_replay) {
   sb.w = sc.w;
   sb.k8 = sc.k8;
   sb.ks = sc.ks;
+  // The replay's keys (row 0 of the workspace) are the expectation's: sb's
+  // pools are the first of sc's, where the replay wrote them.
+  std::vector<uint64_t> replay_keys(static_cast<size_t>(sc.n_pools));
+  dws.download(replay_keys.data(), replay_keys.size() * 8);
+  sb.keys.assign(replay_keys.begin(), replay_keys.begin() + sb.n_pools);
   std::vector<int32_t> want_b, want_cnt_b;
   sb.expect(want_b, want_cnt_b);
   if (cnt_b != want_cnt_b[0] ||
@@ -3558,6 +3793,63 @@ DGPP_TEST(dsa_layer_prefill_dot_budget_preserves_selection_and_output) {
   }
 }
 
+// A prefill chunk's listed tiles attend from the staged copy of each
+// tile's distinct cache rows (2026-11-16) at the geometries the listed
+// tensor-core kernel takes over a quantized cache: sixteen heads at kv_lora
+// 256 (Flash's form) and at 512 + the 64-wide rope tail (the full model's).
+// The layer's output with the staged form is bit for bit its output
+// without, over two chunks (the second starts inside the context, its
+// tiles listing the first chunk's rows), and the staged launches were
+// taken (the staging's own record).
+DGPP_TEST(dsa_layer_prefill_staged_tiles_are_the_unstaged_output) {
+  cudaStream_t s = dgpp::kda_test::test_stream();
+  const int T = 276, first = 160, cache = 1024;
+  DsaConfig flash = small_cfg();
+  flash.num_heads = 16;
+  flash.kv_lora_rank = 256;
+  flash.latent_format = LatentFormat::kFp8;
+  DsaConfig full = full_cfg();
+  full.num_heads = 16;
+  full.kv_lora_rank = 512;
+  full.latent_format = LatentFormat::kFp8;
+  for (const DsaConfig& cfg : {flash, full}) {
+    TestWeights tw(cfg, 4300);
+    const auto hidden = random_bf16_bits(4301, int64_t(T) * cfg.hidden, -2, 1);
+    std::vector<uint16_t> expected;
+    for (const bool staged : {false, true}) {
+      const size_t budget = 8ull << 20;
+      LayerEnv env(cfg, T, cache, 1, 320, s, budget);
+      DsaStatePool pool;
+      pool.init(env.arena, cfg, 1, 320);
+      const size_t sb = DsaLayer::scratch_bytes(cfg, T, cache, 8, 32, budget);
+      DsaLayer layer(env.gemm, tw.layer_views, cfg, T, cache,
+                     env.arena.alloc_persistent(MemClass::DeviceHot, sb, 256), sb, env.ws.p, env.ws.bytes, 8, 32,
+                     budget);
+      if (!layer.staged_prefill())
+        throw std::runtime_error("staged prefill tiles: the layer has no staged form at this geometry");
+      layer.set_staged_prefill(staged);
+      DevBuf din(hidden.size() * 2), dout(hidden.size() * 2);
+      din.upload(hidden.data(), hidden.size() * 2);
+      unsigned long long st[4];
+      dsa_attn_stage_stats(st, /*clear=*/true, s);
+      layer.enqueue_prefill(din.p, pool, 0, 0, 0, first, dout.p, s);
+      layer.enqueue_prefill(static_cast<const uint16_t*>(din.p) + size_t(first) * cfg.hidden, pool, 0, 0, first, T - first,
+                            static_cast<uint16_t*>(dout.p) + size_t(first) * cfg.hidden, s);
+      DGPP_CUDA_OK(cudaStreamSynchronize(s));
+      dsa_attn_stage_stats(st, /*clear=*/false, s);
+      if (staged ? (st[0] < 2 || st[1] != 0) : st[0] != 0)
+        throw std::runtime_error("staged prefill tiles: " + std::to_string(st[0]) + " staged launch(es), " +
+                                 std::to_string(st[1]) + " past the copy, with the staged form " + (staged ? "on" : "off"));
+      std::vector<uint16_t> output(hidden.size());
+      dout.download(output.data(), output.size() * 2);
+      if (!staged)
+        expected = std::move(output);
+      else
+        require_bitwise("staged prefill tiles: the layer's output", output.data(), expected.data(), output.size() * 2);
+    }
+  }
+}
+
 DGPP_TEST(dsa_layer_fused_prefill_preserves_gemm_selection) {
   cudaStream_t s = dgpp::kda_test::test_stream();
   DsaConfig cfg = full_cfg();
@@ -4417,6 +4709,184 @@ DGPP_TEST(dsa_attention_quantized_cache_matches_dequantized_oracle) {
   attention_quantized_case(LatentFormat::kBf16, 6003);  // the path the others must equal
 }
 
+// The listed attention from the staged copy of a launch's distinct rows
+// (2026-11-16, dsa_attn_listed_staged) is the listed attention, bit for
+// bit: m, l and c of every split. The rows are one request's (request 1 of
+// two, through its own permuted table) and their lists drift a few tokens
+// a row as a prefill tile's do, with counts from none to 2,048, at the
+// prefill's 4 splits and at 32; every quantized format at a geometry the
+// listed kernel takes. The copy is large enough (every distinct row
+// staged, counted against the host's count) and too small (the kernel
+// reads the cache: the launch must not depend on what the staging left);
+// two launches in a row over different rows (the bitmap is zero at rest);
+// and lists with a token past the table, a negative one and one whose
+// block is unmapped, which both forms zero-fill and record.
+DGPP_TEST(dsa_listed_attention_from_the_staged_copy_is_the_listed_attention) {
+  struct Form { LatentFormat fmt; int kv; int rope; };
+  for (const Form form : {Form{LatentFormat::kFp8, 512, 64}, Form{LatentFormat::kFp8, 512, 0}, Form{LatentFormat::kFp4, 256, 0},
+                          Form{LatentFormat::kFp8Block, 512, 64}, Form{LatentFormat::kFp4Block, 512, 0}}) {
+    constexpr int lh = 16, bt_tokens = 128, n_blocks = 40, max_rows = 21, max_selected = 2048, req = 1;
+    const int kv = form.kv, sd = kv + form.rope;
+    const int64_t total = int64_t(n_blocks) * bt_tokens;
+    const size_t payload = latent_row_bytes(form.fmt, kv), row_bytes = payload + size_t(form.rope) * 2;
+    const std::vector<uint16_t> latent = latent_rows_with_outliers(7101, total, kv);
+    std::vector<uint8_t> cache(size_t(total) * row_bytes);
+    std::vector<float> scales(static_cast<size_t>(total));
+    for (int64_t t = 0; t < total; ++t) {
+      uint8_t* row = cache.data() + size_t(t) * row_bytes;
+      dgpp::latent_quantize_row_host(form.fmt, &latent[size_t(t) * kv], kv, row, &scales[size_t(t)]);
+      for (int e = 0; e < form.rope; ++e) {
+        const uint16_t v = float_to_bf16_bits(random_f32(7103, t * 64 + e) * 0.5f);
+        std::memcpy(row + payload + e * 2, &v, 2);
+      }
+    }
+    auto q = random_bf16_bits(7105, int64_t(max_rows) * lh * sd, -2, 1);
+    // Two requests' tables; the rows are request 1's. One of its blocks is unmapped.
+    std::vector<int32_t> bt(size_t(2) * n_blocks);
+    for (int b = 0; b < n_blocks; ++b) {
+      bt[size_t(b)] = b;
+      bt[size_t(n_blocks) + size_t(b)] = (b * 7 + 3) % n_blocks;
+    }
+    constexpr int kUnmapped = 11;
+    bt[size_t(n_blocks) + kUnmapped] = -1;
+    // The drifting lists, ascending: row 0's 2,048 tokens, each next row trading 23 of the row before's.
+    const int row_counts[max_rows] = {2048, 2048, 700, 3, 2048, 0, 1300, 2048, 2048, 65, 2048,
+                                      2048, 2048, 1,  2048, 2048, 2048, 513, 2048, 2048, 2048};
+    std::vector<int32_t> tokens(size_t(max_rows) * max_selected, -1), counts(row_counts, row_counts + max_rows),
+        req_ids(max_rows, req);
+    {
+      std::vector<char> in(static_cast<size_t>(total), 0);
+      std::vector<int32_t> cur;
+      uint64_t n = 0;
+      // (No row lists the unmapped block's tokens but the one placed below.)
+      for (int e = 0; e < bt_tokens; ++e) in[size_t(kUnmapped) * bt_tokens + e] = 1;
+      while (int(cur.size()) < max_selected) {
+        const int32_t t = int32_t(hash32(7107 + n++) % uint32_t(total));
+        if (!in[size_t(t)]) in[size_t(t)] = 1, cur.push_back(t);
+      }
+      for (int r = 0; r < max_rows; ++r) {
+        for (int d = 0; r > 0 && d < 23; ++d) {
+          const size_t out = hash32(7109 + uint64_t(r) * 1000 + d) % cur.size();
+          int32_t t;
+          do t = int32_t(hash32(7107 + n++) % uint32_t(total)); while (in[size_t(t)]);
+          in[size_t(cur[out])] = 0, in[size_t(t)] = 1, cur[out] = t;
+        }
+        std::vector<int32_t> pick(cur.begin(), cur.begin() + row_counts[r]);
+        std::sort(pick.begin(), pick.end());
+        std::copy(pick.begin(), pick.end(), tokens.begin() + size_t(r) * max_selected);
+      }
+      // The guarded entries: past the table, negative, and in the unmapped block.
+      tokens[size_t(1) * max_selected + 5] = int32_t(total + 77);
+      tokens[size_t(4) * max_selected + 900] = -9;
+      tokens[size_t(7) * max_selected + 31] = kUnmapped * bt_tokens + 17;
+    }
+    DevBuf dcache(cache.size()), dscale(scales.size() * 4), dq(q.size() * 2), dtopk(tokens.size() * 4),
+        dcnt(counts.size() * 4), dri(req_ids.size() * 4), dbt(bt.size() * 4);
+    dcache.upload(cache.data(), cache.size());
+    dscale.upload(scales.data(), scales.size() * 4);
+    dq.upload(q.data(), q.size() * 2);
+    dtopk.upload(tokens.data(), tokens.size() * 4);
+    dcnt.upload(counts.data(), counts.size() * 4);
+    dri.upload(req_ids.data(), req_ids.size() * 4);
+    dbt.upload(bt.data(), bt.size() * 4);
+    // The distinct tokens of rows [r0, r0 + rows) the staging numbers: those under the table's bound.
+    const auto distinct = [&](int r0, int rows) {
+      std::vector<char> seen(static_cast<size_t>(total), 0);
+      unsigned long long n = 0;
+      for (int r = r0; r < r0 + rows; ++r)
+        for (int i = 0; i < row_counts[r]; ++i) {
+          const int32_t t = tokens[size_t(r) * max_selected + i];
+          if (t >= 0 && t < total && !seen[size_t(t)]) seen[size_t(t)] = 1, ++n;
+        }
+      return n;
+    };
+    long long first[6];
+    dsa_attn_anomalies(first, /*clear=*/true, 0);
+    for (const int n_split : {4, 32}) {
+      const size_t parts = size_t(max_rows) * n_split * lh;
+      DevBuf dm(parts * 4), dl(parts * 4), dc(parts * kv * 4);
+      struct Launch { int r0, rows, slots; };
+      // Whole and too small a copy, then two launches in a row on one workspace over other rows.
+      for (const std::vector<Launch>& seq :
+           {std::vector<Launch>{{0, max_rows, 8192}}, std::vector<Launch>{{0, max_rows, 512}},
+            std::vector<Launch>{{0, 13, 4096}, {9, 12, 4096}, {2, 8, 4096}}}) {
+        const size_t ws_bytes = dsa_attn_stage_bytes(total, seq[0].slots, sd);
+        DevBuf dstage(ws_bytes);
+        // The bitmap zero at allocation, the rest poisoned: a launch reads only what it staged.
+        DGPP_CUDA_OK(cudaMemset(dstage.p, 0xA5, ws_bytes));
+        DGPP_CUDA_OK(cudaMemset(dstage.p, 0, size_t((total + 31) / 32) * 4));
+        for (const Launch& ln : seq) {
+          std::vector<float> want[3], got[3];
+          const size_t n = size_t(ln.rows) * n_split * lh;
+          const std::string tag = std::string("staged listed attention (") + latent_format_name(form.fmt) + " " +
+                                  std::to_string(kv) + "+" + std::to_string(form.rope) + ", " + std::to_string(n_split) +
+                                  " splits, rows " + std::to_string(ln.r0) + "+" + std::to_string(ln.rows) + ", copy of " +
+                                  std::to_string(ln.slots) + ")";
+          for (int staged = 0; staged < 2; ++staged) {
+            DGPP_CUDA_OK(cudaMemset(dm.p, 0xEE, parts * 4));
+            DGPP_CUDA_OK(cudaMemset(dl.p, 0xEE, parts * 4));
+            DGPP_CUDA_OK(cudaMemset(dc.p, 0xEE, parts * kv * 4));
+            const void* qrows = static_cast<const uint16_t*>(dq.p) + size_t(ln.r0) * lh * sd;
+            const int32_t* lists = static_cast<const int32_t*>(dtopk.p) + size_t(ln.r0) * max_selected;
+            const int32_t* cnts = static_cast<const int32_t*>(dcnt.p) + ln.r0;
+            unsigned long long st[4];
+            if (staged) dsa_attn_stage_stats(st, /*clear=*/true, 0);
+            const bool ok =
+                staged ? dsa_attn_listed_staged(qrows, dcache.p, req, static_cast<const int32_t*>(dri.p), lists,
+                                                max_selected, cnts, ln.rows, n_split, lh, kv, bt_tokens,
+                                                static_cast<const int32_t*>(dbt.p), n_blocks, 0.05f,
+                                                static_cast<float*>(dm.p), static_cast<float*>(dl.p),
+                                                static_cast<float*>(dc.p), 0, form.fmt,
+                                                static_cast<const float*>(dscale.p), form.rope, -1, dstage.p, total,
+                                                ln.slots)
+                       : dsa_attn_listed(qrows, dcache.p, static_cast<const int32_t*>(dri.p), lists, max_selected, cnts,
+                                         ln.rows, n_split, lh, kv, bt_tokens, static_cast<const int32_t*>(dbt.p),
+                                         n_blocks, 0.05f, static_cast<float*>(dm.p), static_cast<float*>(dl.p),
+                                         static_cast<float*>(dc.p), 0, form.fmt, static_cast<const float*>(dscale.p),
+                                         form.rope);
+            if (!ok) throw std::runtime_error(tag + ": the kernel refused the geometry");
+            DGPP_CUDA_OK(cudaDeviceSynchronize());
+            std::vector<float>* out = staged ? got : want;
+            out[0].resize(n), out[1].resize(n), out[2].resize(n * kv);
+            dm.download(out[0].data(), n * 4);
+            dl.download(out[1].data(), n * 4);
+            dc.download(out[2].data(), n * kv * 4);
+            // Both forms met the guarded entries of their rows.
+            const bool guarded = (ln.r0 <= 1 && 1 < ln.r0 + ln.rows) || (ln.r0 <= 4 && 4 < ln.r0 + ln.rows) ||
+                                 (ln.r0 <= 7 && 7 < ln.r0 + ln.rows);
+            const unsigned long long anomalies = dsa_attn_anomalies(first, /*clear=*/true, 0);
+            if ((anomalies != 0) != guarded)
+              throw std::runtime_error(tag + (staged ? " staged" : " from the cache") + ": " + std::to_string(anomalies) +
+                                       " guarded gathers recorded");
+            if (staged) {
+              dsa_attn_stage_stats(st, /*clear=*/false, 0);
+              const unsigned long long want_distinct = distinct(ln.r0, ln.rows);
+              const unsigned long long want_unstaged = want_distinct > static_cast<unsigned long long>(ln.slots) ? 1 : 0;
+              if (st[0] != 1 || st[1] != want_unstaged || st[2] != want_distinct || st[3] != want_distinct)
+                throw std::runtime_error(tag + ": the staging counted " + std::to_string(st[2]) + " distinct rows in " +
+                                         std::to_string(st[0]) + " launch(es), " + std::to_string(st[1]) +
+                                         " not staged; the lists hold " + std::to_string(want_distinct));
+            } else {
+              double mass = 0;
+              for (float v : out[1]) mass += double(v);
+              if (!(mass > 0)) throw std::runtime_error(tag + ": the launch attended to nothing");
+            }
+          }
+          require_bitwise(tag + " m", got[0].data(), want[0].data(), n * 4);
+          require_bitwise(tag + " l", got[1].data(), want[1].data(), n * 4);
+          require_bitwise(tag + " c", got[2].data(), want[2].data(), n * kv * 4);
+        }
+      }
+    }
+    std::printf("[ OK ] staged listed attention %s %d+%d: bitwise the listed attention, staged and past the copy\n",
+                latent_format_name(form.fmt), kv, form.rope);
+  }
+  // A bf16 cache is its own decoded copy: the staged form declines it.
+  if (dsa_attn_listed_staged(nullptr, nullptr, 0, nullptr, nullptr, 1, nullptr, 1, 4, 16, 512, 128, nullptr, 1, 1.f, nullptr,
+                             nullptr, nullptr, 0, LatentFormat::kBf16, nullptr, 0, -1, reinterpret_cast<void*>(256), 128, 8))
+    throw std::runtime_error("staged listed attention: a bf16 cache was not declined");
+}
+
 // Exercise every finite nonnegative e4m3 block-scale code and every e2m1
 // value through the actual attention loaders. The host codec supplies an
 // equivalent bf16 cache, so both kernels must produce identical partials.
@@ -4921,12 +5391,13 @@ DGPP_TEST(dsa_layer_full_tp2_head_slice_matches_tp1) {
 }
 
 // The select networks at the full model's width: select_k 2048 over
-// per-token entries (kpool 1) with the relu'd logits, bitwise against the
-// host spec — the prefill select (a 4096-key tile) over materialized dots
-// and the fused decode select over an fp8 cache, then the expansion's
-// eight rounds (2048 ids sorted ascending, no tail).
+// per-token entries (kpool 1) with the relu'd logits — the prefill select
+// (a 4096-key tile) over materialized dots, bitwise against the host spec,
+// and the fused decode select over an fp8 cache, bitwise from its own keys
+// (their scores against the exact logits); then the expansion's eight
+// rounds (2048 ids sorted ascending, no tail).
 DGPP_TEST(dsa_select_kpool1_select2048_bitwise) {
-  const int select_k = 2048, kpool = 1, max_selected = 2048, heads = 32, dim = 128;
+  const int select_k = 2048, kpool = 1, max_selected = 2048, heads = 32;
   // Prefill: positions around the dense/sparse boundary and beyond.
   std::vector<int64_t> cases = {0, 1, 7, 2046, 2047, 2048, 2049, 2100, 4095, 4096, 6000, 9001};
   for (int i = 0; i < 12; ++i) cases.push_back(int64_t(2048 + hash32(7600 + i) % 7000));
@@ -4973,73 +5444,19 @@ DGPP_TEST(dsa_select_kpool1_select2048_bitwise) {
                                " (count " + std::to_string(got_cnt) + " want " +
                                std::to_string(n_tok) + ")");
   }
-  // Decode over an fp8 cache: 6000 visible entries, the same mirror.
+  // Decode over an fp8 cache: 6000 visible entries, relu — the scores
+  // against the exact logits, the selection bitwise from the kernel's keys.
   {
-    const int n_pools = 6000;
-    const int64_t pos = n_pools - 1;
-    std::vector<uint16_t> qb = random_bf16_bits(7640, heads * dim, -2, 1);
-    std::vector<uint8_t> q8(size_t(heads) * dim);
-    std::vector<float> q_scale(heads);
-    dsa_ref::fwht128_quant_fp8<float>(qb.data(), heads, dim, q8.data(), q_scale.data());
-    std::vector<float> w(heads);
-    const float logit_scale = float(std::pow(128.0, -0.5) * std::pow(32.0, -0.5));
-    for (int h = 0; h < heads; ++h)
-      w[size_t(h)] = (random_f32(7641, h) * 0.01f * q_scale[size_t(h)]) * logit_scale;
-    std::vector<uint8_t> k8(size_t(n_pools) * dim);
-    std::vector<float> ks(n_pools);
-    for (size_t i = 0; i < k8.size(); ++i) {
-      k8[i] = uint8_t(hash32(7642 + i) & 0xFF);
-      if ((k8[i] & 0x7Fu) == 0x7Fu) k8[i] ^= 0x01u;
-    }
-    for (int j = 0; j < n_pools; ++j) ks[size_t(j)] = std::fabs(random_f32(7643, j)) * 0.05f;
-    DevBuf dq8(q8.size()), dks(ks.size() * 4), dw(w.size() * 4), dki(k8.size()), dpos(8), dri(4),
-        dbt(4), dtopk(size_t(max_selected) * 4), dcnt(4),
-        dws(dsa_select_workspace_bytes(1, n_pools)), dctr(8);
-    dq8.upload(q8.data(), q8.size());
-    dw.upload(w.data(), w.size() * 4);
-    dki.upload(k8.data(), k8.size());
-    dks.upload(ks.data(), ks.size() * 4);
-    const std::vector<int64_t> posv = {pos};
-    const std::vector<int32_t> req0 = {0}, bt0 = {0};
-    dpos.upload(posv.data(), 8);
-    dri.upload(req0.data(), 4);
-    dbt.upload(bt0.data(), 4);
-    const int32_t zero2[2] = {0, 0};
-    dctr.upload(zero2, 8);
-    dsa_select_decode(dq8.p, static_cast<const float*>(dw.p), static_cast<const int32_t*>(dri.p),
-                      static_cast<const int64_t*>(dpos.p), 1, static_cast<const int32_t*>(dbt.p), 1,
-                      dki.p, static_cast<const float*>(dks.p), n_pools, heads, dim, select_k, kpool,
-                      max_selected, static_cast<int32_t*>(dtopk.p), static_cast<int32_t*>(dcnt.p),
-                      dws.p, n_pools, static_cast<int32_t*>(dctr.p), 48, 0, /*relu=*/true);
-    std::vector<float> logits(n_pools);
-    for (int j = 0; j < n_pools; ++j) {
-      float contrib[32];
-      for (int h = 0; h < 32; ++h) {
-        float partial = 0.0f;
-        for (int d = 0; d < 128; ++d)
-          partial = partial + fp8_e4m3_bits_to_float(q8[size_t(h) * 128 + d]) *
-                                  fp8_e4m3_bits_to_float(k8[size_t(j) * 128 + d]);
-        contrib[h] = (w[size_t(h)] * ks[size_t(j)]) * std::max(partial, 0.0f);
-      }
-      logits[size_t(j)] = butterfly_sum_32(contrib);
-    }
-    std::vector<int32_t> ids(select_k);
-    const int n_sel = dsa_ref::select_pools(logits.data(), n_pools, select_k, ids.data());
-    std::vector<int32_t> want(size_t(max_selected), -1);
-    dsa_ref::expand_append_tail(ids.data(), n_sel, pos, kpool, max_selected, want.data());
-    std::vector<int32_t> got(size_t(max_selected), -12345);
-    int32_t got_cnt = -1;
-    dtopk.download(got.data(), got.size() * 4);
-    dcnt.download(&got_cnt, 4);
-    if (got_cnt != select_k) throw std::runtime_error("select2048 decode count");
-    if (std::memcmp(got.data(), want.data(), got.size() * 4) != 0) {
-      std::string detail;
-      for (int i = 0; i < max_selected; ++i)
-        if (got[size_t(i)] != want[size_t(i)] && detail.size() < 400)
-          detail += " [" + std::to_string(i) + "] " + std::to_string(got[size_t(i)]) + " vs " +
-                    std::to_string(want[size_t(i)]);
-      throw std::runtime_error("select2048 decode mismatch:" + detail);
-    }
+    DecodeSelScenario sc(kpool);
+    if (sc.g.select_k != select_k) throw std::runtime_error("select2048 decode: the scenario's geometry");
+    sc.relu = true;
+    sc.init(7640, {int64_t(kpool) * 6000 - 1});
+    std::vector<int32_t> got, counts, want, want_counts;
+    sc.run(48, got, counts);
+    sc.expect(want, want_counts);
+    if (counts[0] != select_k * kpool) throw std::runtime_error("select2048 decode count");
+    if (counts[0] != want_counts[0] || std::memcmp(got.data(), want.data(), got.size() * 4) != 0)
+      throw std::runtime_error("select2048 decode: not the top of the kernel's own keys");
   }
 }
 

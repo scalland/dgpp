@@ -123,6 +123,7 @@ std::string encode_journal_warm(
 // when they differed). The effective-config digest on the warm record
 // then holds by construction and stays as an assertion.
 struct WorldSettings {
+  std::string runtime_adapter_id;  // empty keeps ordinary serving unchanged
   std::string version;     // rank 0's dgpp version: a mixed-version world refuses to form
   std::string model;       // the HF model id ("" when rank 0 ran from a directory)
   std::string checkpoint;  // rank 0's checkpoint directory (a peer without an id uses it)
@@ -144,6 +145,7 @@ struct WorldSettings {
   bool prefill_fp8_gemm = false;
   bool prefill_fp8_per_tensor = false;  // the Qwen3.8-27B per-tensor prefill recipe (opt-in)
   std::string prefill_activations = "bf16";  // "native": the checkpoint's activation recipe on prefill rows
+  std::string activations = "bf16";  // MiniMax and Inkling 2 targets: every row, including decode
   std::string prefill_attention = "bf16";    // Qwen3.5 / Flash-Next attention over an fp8 pool
   std::string decode_attention = "bf16";     // Flash-Next QSA: bf16 or native fp8 compute
   std::string dflash_model;             // the DFlash2 drafter (Qwen3.8-27B, world 1); empty: none
@@ -196,6 +198,7 @@ struct WorldSettings {
   double mtp_schedule_lambda = 0.0;
   int mtp_schedule_min_depth = 1;
   int mtp_schedule_options = 0;
+  int mtp_schedule_max_live = 0;
   bool mtp_schedule_adapt = true;
   double mtp_schedule_sampled_scale = 0.93;  // engine.mtp_schedule_sampled_scale
   std::string mtp_draft = "auto";  // engine.mtp_draft: every rank resolves the same rule
@@ -222,6 +225,7 @@ struct WorldSettings {
   std::optional<bool> prefill_early_admission = false;
   int prefix_min_tokens = 0;          // the prefix cache's entry floor (2026-09-28); absent legacy field = 0
   bool prefix_head_snapshots = false;  // the head cut (2026-09-28); absent legacy field = off
+  bool prefix_partial_hits = false;    // the attach inside an entry (2026-11-13); absent legacy field = off
   int prefix_pin_max_pct = 50;        // the pin cap (2026-10-28); absent legacy field = 50
   double bulk_pace_gbps = 0.0;
   int bulk_inflight = 0;
@@ -337,6 +341,7 @@ class JournalWriter {
   // member of a live-serving world — the fabric is broken, and this
   // says so loudly.
   void broadcast(const std::string& line);
+  void broadcast_payload(const std::string& payload, int timeout_ms);
 
   // The peer liveness watch (the death discipline above): a thread
   // polling every peer connection each `poll_ms`; the first closed or
@@ -356,6 +361,10 @@ class JournalWriter {
   // written since the last poll, as (rank, line), without blocking. The
   // engine thread's alone (broadcast's too); the death watch only peeks.
   std::vector<std::pair<int, std::string>> poll_peer_lines();
+  // Separate research protocol phase: bounded binary replies on the existing
+  // journal star. Do not mix with readiness/line replies in the same phase.
+  // A shared deadline covers the complete gather, including partial reads.
+  std::vector<std::pair<int, std::string>> gather_peer_payloads(size_t max_bytes, int timeout_ms);
   ~JournalWriter();
 
  private:
@@ -401,6 +410,10 @@ class JournalReader {
   // The return path (issue #26): one status line to rank 0. False when
   // the connection is gone (the loop sees the EOF next).
   bool send_line(const std::string& line);
+  // Counterpart to gather_peer_payloads. The caller's control record selects
+  // the binary phase; ordinary serving never calls these operations.
+  bool send_payload(const std::string& payload, int timeout_ms);
+  std::string read_payload(size_t expected_bytes, int timeout_ms);
 
  private:
   dgpp::net::TcpConn conn_;

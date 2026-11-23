@@ -7,6 +7,24 @@ Other model templates use the same launcher with their own memory and
 engine settings. See the [configuration reference](configuration.md) for
 settings, defaults and their effects.
 
+For LoRA adapter loading or access to logits and activations, see
+[runtime adapters and research inference](runtime-adapters.md). Adapter serving
+uses `engine.runtime_adapters=true` and `engine.runtime_adapter_path`; the
+launcher stages the bundle on every node, and each server validates it against
+the base checkpoint. Changing the adapter requires restarting the serving world.
+Startup verifies metadata and factor hashes without scanning base weight contents.
+Set `engine.runtime_adapter_verify_weights=true` for full base-weight hashing on
+every rank, with per-shard progress logs; this can add minutes to startup.
+The shipped Mixed346 template retains its graphs, MTP, prefix caching and
+memory formats with the adapter flag and path added. The guide lists other
+supported settings and compatibility bounds.
+
+Inspection and tensor capture use a separate worker with
+`engine.heretic_research=true`. Inspection reads metadata only; the worker
+loads the checkpoint on demand across one, two or four nodes. Its launcher
+owns separate process records and research ports. Reserve the participating
+nodes for the worker and stop it before starting a serving deployment there.
+
 ## Sampling penalty defaults
 
 Set `engine.repetition_penalty`, `engine.frequency_penalty` and
@@ -154,6 +172,7 @@ its node.
 | `cluster_deepseek-v4.1-flash-1017_mxfp4-fp8_w4.example.json` | DeepSeek-V4.1-Flash-1017 (the refined weights, the same architecture) as shipped, the V4.1-Flash shape; the indexer budget is a key (`engine.index_topk`, the checkpoint's 512 as shipped, 2048 priced in the card) |
 | `cluster_mimo-v2.6-flash_mxfp4-fp8_w{4,2}.example.json` | MiMo-V2.6-Flash as shipped (MXFP4 experts, fp8 dense, the BF16 matrices in their 12-bit form), four nodes with a 128K BF16 K/V pool or two nodes with a 256K K/V pool in the fp8 row form (`kv_dtype`), four request slots, MTP depth 1 |
 | `cluster_flint_fp8-nvfp4_w{1,2,4}.example.json` | Flint as shipped (the routed experts in the export's per-projection FP8 / NVFP4 formats, every BF16 matrix the GEMM interface serves in its 12-bit form), one, two or four nodes, a 512K BF16 K/V pool, eight request slots, no draft head (`mtp` off) |
+| `cluster_inkling-2-mini_nvfp4-mxfp8_w{1,2,4}.example.json` | Inkling 2 Mini as shipped (NVFP4 and MXFP8 routed experts under the checkpoint's activation recipe, the BF16 decode matrices in their 12-bit form), one, two or four nodes, the same matrices kept in BF16 for verify passes of several requests (`"bf12+bf16"`), a BF16 K/V pool of 384K, 768K or 1.5M tokens with one plane per layer visit and per draft layer, eight request slots, the bundled draft model with a scheduled verify depth, image inputs |
 
 One template per model, quant and world (2026-09-14): the modes a template
 does not name are knobs — `--no-mtp` for the plain T=1 world, `--mtp-depth N`,
@@ -927,7 +946,12 @@ prefill at the prompt's first structural boundary past its start (a long
 system prompt's end), where the next conversation under that prompt or the
 turn after a client-side compaction attaches. Both are world settings pushed
 to every peer; `/v1/metrics` shows them under `prefix_cache` as `min_tokens`
-and `head_cuts`, with `head_snapshots` counting the head entries taken. See
+and `head_cuts`, with `head_snapshots` counting the head entries taken.
+`engine.prefix_partial_hits` (`--prefix-partial-hits`,
+`--no-prefix-partial-hits`, default on) lets a prompt that differs from every
+entry before a stored position open on the tokens it shares with the nearest
+one, on model families whose cached state is the KV rows alone. `/v1/metrics`
+counts those admissions as `partial_hits`. See
 [the sizing guide](prefix-cache.md).
 
 Unfinished prefills share the selected budget in deterministic arrival order,
@@ -998,7 +1022,8 @@ quoting it. Qwen3.5-122B-A10B templates select depth 2; throughput and
 acceptance measurements for the shipped templates remain pending under
 [the benchmark protocol](benchmarks.md#workload-and-timing).
 
-**The draft depth** (`engine.mtp_depth`, `--mtp-depth`, 1–5, with `mtp`)
+**The draft depth** (`engine.mtp_depth`, `--mtp-depth`, 1–5 for MTP chains,
+7 for MiniMax DSpark, with `mtp`)
 is the number of draft tokens verified per decode step. Depth 1 is the
 two-row step: the pending token and one draft through the main stack, the
 draft block proposing the next draft. A deeper step feeds 1 + depth rows,
@@ -1056,7 +1081,9 @@ cost with the draft, default 28), `mtp_schedule_lambda`
 default, is the reservation rate `1 / (base + row)` — a verify row is
 taken only when it beats a plain step's rate), `mtp_schedule_min_depth`
 (`--mtp-schedule-min-depth`, the fewest drafts a step verifies, default
-1). The scheduled path gives up the pipelined replay's launch-ahead (the
+1), `mtp_schedule_max_live` (`--mtp-schedule-max-live`, default 0: past
+that many live requests a step verifies and drafts the minimum depth
+only, the pass a fixed depth of the minimum runs). The scheduled path gives up the pipelined replay's launch-ahead (the
 graph to launch is not known until the previous replay's confidence is
 published at its tail), so a stream that stays at the full block pays the
 graph launch (~0.5 ms a step) for nothing; the win is on the streams the

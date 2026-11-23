@@ -252,13 +252,12 @@ __global__ void block_attn_kernel(const uint16_t* __restrict__ q, int64_t q_stri
 // [(row * heads + head) * kSplits + s][dim + 2]; the combine pass merges.
 constexpr int kBlockAttnSplits = 32;
 
-__global__ void block_attn_split_kernel(const uint16_t* __restrict__ q, int64_t q_stride,
-                                        const uint16_t* __restrict__ k_cache,
-                                        const uint16_t* __restrict__ v_cache,
-                                        const int32_t* __restrict__ block_table, int block_tokens,
-                                        int blocks_per_request, int block_rows, int64_t window,
-                                        const int64_t* __restrict__ pos, float scale,
-                                        float* __restrict__ partials, int heads, int kv_heads, int dim) {
+template <bool Fp32P>
+__global__ void block_attn_split_kernel(
+    const uint16_t* __restrict__ q, int64_t q_stride, const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache, const int32_t* __restrict__ block_table, int block_tokens,
+    int blocks_per_request, int block_rows, int64_t window, const int64_t* __restrict__ pos,
+    float scale, float* __restrict__ partials, int heads, int kv_heads, int dim, bool block_window) {
   dgpp_pdl_wait();
   const int row = blockIdx.x;
   const int kvh = blockIdx.y;
@@ -275,7 +274,9 @@ __global__ void block_attn_split_kernel(const uint16_t* __restrict__ q, int64_t 
   int last_valid = block_rows - 1;
   while (last_valid > 0 && pos[row - row % block_rows + last_valid] < 0) --last_valid;
   const int64_t blk_hi = p0 + last_valid;
-  const int64_t lo = p - window + 1;
+  // The window ends at the query, or (block_window) at the block's last
+  // row: the block's rows then see one span, the block included in it.
+  const int64_t lo = (block_window ? p0 + block_rows : p + 1) - window;
   const int64_t ctx_lo = lo > 0 ? lo : 0;
   // This split's share of the context keys (empty for a short context).
   const int64_t ctx_n = ctx_end >= ctx_lo ? ctx_end - ctx_lo + 1 : 0;
@@ -317,7 +318,7 @@ __global__ void block_attn_split_kernel(const uint16_t* __restrict__ q, int64_t 
         const float m_new = dot > m ? dot : m;
         const float correction = m == -INFINITY ? 0.0f : std::exp(m - m_new);
         const float pf = m_new == -INFINITY ? 0.0f : std::exp(dot - m_new);
-        const float pb = bf16_bits_to_float(float_to_bf16_bits(pf));
+        const float pb = Fp32P ? pf : bf16_bits_to_float(float_to_bf16_bits(pf));
         l = l * correction + pf;
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[j] = acc[j] * correction + pb * bf16_bits_to_float(v_cache[kbase + d0 + j]);
@@ -431,8 +432,9 @@ __device__ __forceinline__ Cand* block_fold_lists(Cand* X, Cand* Y, int count) {
 template <int K>
 __global__ void __launch_bounds__(kTopkThreads)
     topk_chunk_kernel(const float* __restrict__ logits, int64_t vocab, int chunks, Cand* __restrict__ partial,
-                      int32_t* __restrict__ ids, float* __restrict__ scores) {
+                      int32_t* __restrict__ ids, float* __restrict__ scores, const int32_t* __restrict__ gate) {
   dgpp_pdl_wait();
+  if (gate != nullptr && *gate != 0) return;  // the lists keep the last step's
   constexpr int S = kTopkThreads;
   __shared__ Cand sl[K * S];
   __shared__ Cand ml[K * S];
@@ -472,8 +474,9 @@ __global__ void __launch_bounds__(kTopkThreads)
 template <int K>
 __global__ void __launch_bounds__(kTopkThreads)
     topk_merge_kernel(const Cand* __restrict__ partial, int chunks, int32_t* __restrict__ ids,
-                      float* __restrict__ scores) {
+                      float* __restrict__ scores, const int32_t* __restrict__ gate) {
   dgpp_pdl_wait();
+  if (gate != nullptr && *gate != 0) return;
   constexpr int S = kTopkThreads;
   __shared__ Cand sl[K * S];
   __shared__ Cand ml[K * S];
@@ -514,22 +517,24 @@ __device__ __forceinline__ void write_proposal(DraftProposal* pr, const int32_t*
   }
 }
 
-__global__ void selector_kernel(const int32_t* __restrict__ ids, const float* __restrict__ unary,
-                                const float* __restrict__ hidden, const uint16_t* __restrict__ pred_cb,
-                                const uint16_t* __restrict__ succ_cb,
-                                const int64_t* __restrict__ anchor_tok, int32_t* __restrict__ tokens,
-                                int steps, int k, int rank, const int64_t* __restrict__ pos,
-                                const SampleSpec* __restrict__ spec, DraftProposal* __restrict__ proposal,
-                                DraftProposal* __restrict__ proposal_host, float* __restrict__ conf) {
+__global__ void selector_kernel(
+    const int32_t* __restrict__ ids, const float* __restrict__ unary,
+    const float* __restrict__ hidden, const uint16_t* __restrict__ pred_cb,
+    const uint16_t* __restrict__ succ_cb, const int64_t* __restrict__ anchor_tok,
+    int32_t* __restrict__ tokens, int steps, int k, int rank, const int64_t* __restrict__ pos,
+    const SampleSpec* __restrict__ spec, DraftProposal* __restrict__ proposal,
+    DraftProposal* __restrict__ proposal_host, float* __restrict__ conf, int step_offset,
+    int64_t* __restrict__ next_anchor, int32_t* __restrict__ record_ids, int position_offset) {
   dgpp_pdl_wait();
   extern __shared__ float sm[];
-  const int32_t anchor = static_cast<int32_t>(*anchor_tok);
+  const int32_t anchor = anchor_tok ? static_cast<int32_t>(*anchor_tok) : 0;
   float* h = sm;                  // [rank]
   float* pred = h + rank;         // [k][rank]
   float* succ = pred + k * rank;  // [k][rank]
   float* sc = succ + k * rank;    // [k][k]
   float* ex = sc + k * k;         // [k] the sampled step's exps
   const int tid = threadIdx.x;
+  if (record_ids != nullptr && tid < k) record_ids[tid] = ids[tid];
   // The sampled walk: a stochastic request (temperature > 0) draws each
   // step from the softmax of its scores at the draft temperature and
   // proposes the set it drew from; otherwise the argmax, no proposal.
@@ -614,8 +619,10 @@ __global__ void selector_kernel(const int32_t* __restrict__ ids, const float* __
           den = kept;
         }
         const uint64_t seed = spec->seed ^ kSampleDraftSeedMix ^
-                              (static_cast<uint64_t>(l + 1) * 0xD1B54A32D192ED03ull);
-        const int64_t p = pos != nullptr ? pos[l + 1] : static_cast<int64_t>(l + 1);
+                              (static_cast<uint64_t>(l + 1 + step_offset) * 0xD1B54A32D192ED03ull);
+        const int64_t p =
+            pos != nullptr ? pos[rank == 0 ? l : l + 1] + position_offset
+                           : static_cast<int64_t>(l + 1 + step_offset);
         const double u = uniform01(seed, static_cast<uint64_t>(p < 0 ? 0 : p));
         double cum = 0.0;
         int chosen = -1, last_live = 0;
@@ -652,6 +659,7 @@ __global__ void selector_kernel(const int32_t* __restrict__ ids, const float* __
         conf[l] = fminf(fmaxf(logf(q / (1.0f - q)), -30.0f), 30.0f);
       }
       tokens[l] = lid[best];
+      if (next_anchor != nullptr) *next_anchor = lid[best];
       prev = best;
     }
   }
@@ -895,20 +903,27 @@ size_t dflash2_block_attn_partials_bytes(int rows, int heads) {
 
 void dflash2_block_attn_split(const uint16_t* q, int64_t q_row_stride, const uint16_t* k_cache,
                               const uint16_t* v_cache, const int32_t* block_table, int block_tokens,
-                              int blocks_per_request, int block_rows, int64_t window, const int64_t* pos,
-                              int rows, int heads, int kv_heads, int dim, float scale, float* partials,
-                              uint16_t* out, cudaStream_t stream) {
+                              int blocks_per_request, int block_rows, int64_t window,
+                              const int64_t* pos, int rows, int heads, int kv_heads, int dim,
+                              float scale, float* partials, uint16_t* out, cudaStream_t stream,
+                              bool fp32_p, bool block_window) {
   if (rows <= 0) return;
-  if (dim != 128 || heads % kv_heads || heads / kv_heads > 8)
-    throw std::invalid_argument("dflash2_block_attn_split: dim must be 128 and heads/kv_heads in [1, 8]");
+  if (dim != 128 || heads % kv_heads || heads / kv_heads > 16)
+    throw std::invalid_argument(
+        "dflash2_block_attn_split: dim must be 128 and heads/kv_heads in [1, 16]");
   if (block_rows < 1 || rows % block_rows != 0)
     throw std::invalid_argument("dflash2_block_attn_split: rows must be whole blocks");
   if (partials == nullptr) throw std::invalid_argument("dflash2_block_attn_split: null partials");
   const int hpq = heads / kv_heads;
   const dim3 grid(rows, kv_heads, kBlockAttnSplits);
-  block_attn_split_kernel<<<grid, 32 * hpq, 0, stream>>>(q, q_row_stride, k_cache, v_cache, block_table,
-                                                         block_tokens, blocks_per_request, block_rows, window,
-                                                         pos, scale, partials, heads, kv_heads, dim);
+  if (fp32_p)
+    block_attn_split_kernel<true><<<grid, 32 * hpq, 0, stream>>>(
+        q, q_row_stride, k_cache, v_cache, block_table, block_tokens, blocks_per_request,
+        block_rows, window, pos, scale, partials, heads, kv_heads, dim, block_window);
+  else
+    block_attn_split_kernel<false><<<grid, 32 * hpq, 0, stream>>>(
+        q, q_row_stride, k_cache, v_cache, block_table, block_tokens, blocks_per_request,
+        block_rows, window, pos, scale, partials, heads, kv_heads, dim, block_window);
   DGPP_CUDA_OK(cudaGetLastError());
   const dim3 cgrid(rows, heads);
   block_attn_combine_kernel<<<cgrid, 32, 0, stream>>>(partials, heads, dim, out);
@@ -921,7 +936,7 @@ size_t dflash2_topk_ws_bytes(int64_t vocab, int rows, int k) {
 }
 
 void dflash2_topk_f32(const float* logits, int32_t* ids, float* scores, int64_t vocab, int rows,
-                      int k, cudaStream_t stream, void* ws, size_t ws_bytes) {
+                      int k, cudaStream_t stream, void* ws, size_t ws_bytes, const int32_t* gate) {
   if (rows <= 0) return;
   if (k != 16) throw std::invalid_argument("dflash2_topk: only k = 16 is implemented");
   // Each row in chunks of kTopkChunkSpan over as many blocks (32 at most),
@@ -931,11 +946,11 @@ void dflash2_topk_f32(const float* logits, int32_t* ids, float* scores, int64_t 
     throw std::invalid_argument("dflash2_topk: the partials workspace is too small (dflash2_topk_ws_bytes)");
   const dim3 grid(static_cast<unsigned>(chunks), static_cast<unsigned>(rows));
   topk_chunk_kernel<16><<<grid, kTopkThreads, 0, stream>>>(logits, vocab, chunks, static_cast<Cand*>(ws), ids,
-                                                           scores);
+                                                           scores, gate);
   DGPP_CUDA_OK(cudaGetLastError());
   if (chunks > 1) {
     topk_merge_kernel<16><<<static_cast<unsigned>(rows), kTopkThreads, 0, stream>>>(
-        static_cast<const Cand*>(ws), chunks, ids, scores);
+        static_cast<const Cand*>(ws), chunks, ids, scores, gate);
     DGPP_CUDA_OK(cudaGetLastError());
   }
 }
@@ -955,7 +970,23 @@ void dflash2_selector_walk(const int32_t* ids, const float* unary, const float* 
   if (smem > 47u * 1024)
     throw std::invalid_argument("dflash2_selector_walk: shared memory over the static limit");
   selector_kernel<<<1, 256, smem, stream>>>(ids, unary, hidden, pred_cb, succ_cb, anchor, tokens,
-                                            steps, k, rank, pos, spec, proposal, proposal_host, conf);
+                                            steps, k, rank, pos, spec, proposal, proposal_host,
+                                            conf, 0, nullptr, nullptr, 0);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void dflash2_sample_candidates(const int32_t* ids, const float* scores, int k, int step,
+                               int32_t* token, int64_t* next_anchor, int32_t* record_ids,
+                               cudaStream_t stream, const int64_t* pos, const SampleSpec* spec,
+                               DraftProposal* proposal, DraftProposal* proposal_host,
+                               int position_offset) {
+  if (!ids || !scores || !token || !next_anchor || !record_ids || k < 2 || k > kSampleProposalMax ||
+      step < 0 || step >= kSampleProposalSlots)
+    throw std::invalid_argument("dflash2_sample_candidates: buffers/shape/step");
+  // rank=0 is a unary-only walk: no codebook reads or transition term.
+  selector_kernel<<<1, 256, static_cast<size_t>(k * k + k) * 4, stream>>>(
+      ids, scores, nullptr, nullptr, nullptr, nullptr, token, 1, k, 0, pos, spec, proposal,
+      proposal_host, nullptr, step, next_anchor, record_ids, position_offset);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

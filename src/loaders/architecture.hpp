@@ -11,16 +11,19 @@
 namespace dgpp {
 
 enum class ModelArchitecture : int {
-  Glm5,     // Glm5ForConditionalGeneration / glm5_next (GLM-5.3-Flash)
-  Qwen4Exp, // Qwen4ExpForConditionalGeneration / qwen4_exp (Qwen3.8-Flash-Next)
-  Glm4Moe,  // Glm4MoeForCausalLM / glm4_moe (GLM-4.7, 2026-09-09)
-  GlmMoeDsa, // GlmMoeDsaForCausalLM / glm_moe_dsa (full GLM-5.3, 2026-09-12)
-  DeepseekV41, // DeepseekV41ForCausalLM / deepseek_v41 (DeepSeek-V4.1-Flash, 2026-09-13)
-  MimoV2,      // MiMoV2ForCausalLM / mimo_v2 (MiMo-V2.6-Flash, 2026-09-22)
-  Qwen3_5,     // Qwen3_5ForConditionalGeneration / qwen3_5 (Qwen3.8-27B, text-only support lands first)
-  DeepseekV4,  // DeepseekV4ForCausalLM / deepseek_v4 (DeepSeek-V4-Flash-0731, 2026-10-01)
-  Dory,        // DoryForCausalLM / dory (Dory1.0-4B, 2026-10-16, docs/dory_plan.md)
-  Flint,       // FlintForCausalLM / flint (RecursiveSI/flint, the HawkBearPig mixed export, 2026-10-22)
+  Glm5,         // Glm5ForConditionalGeneration / glm5_next (GLM-5.3-Flash)
+  Qwen4Exp,     // Qwen4ExpForConditionalGeneration / qwen4_exp (Qwen3.8-Flash-Next)
+  Glm4Moe,      // Glm4MoeForCausalLM / glm4_moe (GLM-4.7, 2026-09-09)
+  GlmMoeDsa,    // GlmMoeDsaForCausalLM / glm_moe_dsa (full GLM-5.3, 2026-09-12)
+  DeepseekV41,  // DeepseekV41ForCausalLM / deepseek_v41 (DeepSeek-V4.1-Flash, 2026-09-13)
+  MimoV2,       // MiMoV2ForCausalLM / mimo_v2 (MiMo-V2.6-Flash, 2026-09-22)
+  Qwen3_5,      // Qwen3_5ForConditionalGeneration / qwen3_5 (Qwen3.8-27B, text-only support lands
+                // first)
+  DeepseekV4,   // DeepseekV4ForCausalLM / deepseek_v4 (DeepSeek-V4-Flash-0731, 2026-10-01)
+  Dory,         // DoryForCausalLM / dory (Dory1.0-4B, 2026-10-16, docs/dory_plan.md)
+  Flint,  // FlintForCausalLM / flint (RecursiveSI/flint, the HawkBearPig mixed export, 2026-10-22)
+  MinimaxM3,  // MiniMaxM3SparseForConditionalGeneration / minimax_m3_vl
+  Inkling2Loop,  // Inkling2LoopForConditionalGeneration / inkling2_loop (Inkling 2 Mini, docs/inkling2_mini_plan.md)
 };
 
 constexpr const char* model_architecture_name(ModelArchitecture a) {
@@ -35,6 +38,10 @@ constexpr const char* model_architecture_name(ModelArchitecture a) {
     case ModelArchitecture::DeepseekV4: return "deepseek_v4";
     case ModelArchitecture::Dory: return "dory";
     case ModelArchitecture::Flint: return "flint";
+    case ModelArchitecture::MinimaxM3:
+      return "minimax_m3";
+    case ModelArchitecture::Inkling2Loop:
+      return "inkling2_loop";
   }
   return "glm5";
 }

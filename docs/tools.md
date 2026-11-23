@@ -29,6 +29,9 @@ modules to see their arguments. Their offline regression tests run with
 
 | command | purpose |
 |---|---|
+| `dgpp-heretic-inspect --config FILE` | inspect supported projection targets without loading model weights; requires `engine.heretic_research=true` |
+| `dgpp-heretic-worker --config FILE --control-fd FD` | expose logits, last-position activations, generation and token scores through an inherited Unix socket; requires `engine.heretic_research=true` |
+| `scripts/dgpp-heretic-cluster --config FILE --control-fd FD` | launch a separate research worker world on one, two or four nodes; see [runtime adapters and research inference](runtime-adapters.md) for configuration and protocol details |
 | `dgppctl info` | CUDA and platform facts |
 | `micro_mem_bw -s 4096` | LPDDR5x streaming patterns |
 | `micro_gemm_peak` | best-of-cuBLASLt-heuristics FP8/BF16 shape sweep |
@@ -41,7 +44,8 @@ modules to see their arguments. Their offline regression tests run with
 | `micro_ibv_smoke verify --peer IP:PORT --dev DEV` | ordered NIC DMA payload/doorbell → GPU hash validation |
 | `kda_bench` | KDA decode state-traffic and layer timing profile (M2) |
 | `dsa_bench [--tp N]` | the DSA layer's decode kernels at a chosen context and TP width |
-| `dsa_select_bench --ctx a,b,c [--rows R --grid G]` | the decode index selection alone, with its phase breakdown (the 2026-09-06 select rewrite's microbench) |
+| `dsa_select_bench --ctx a,b,c [--rows R --grid G --layers N --split 1]` | the decode index selection alone, with its phase breakdown (the 2026-09-06 select rewrite's microbench); `--layers` walks that many index caches so each launch reads its index from DRAM, `--split 1` makes every row its own request |
+| `dsa_attn_tile_bench [--ctx N --drift D --layers N --slots S]` | a prefill tile's listed attention alone, from the cache and from the staged copy of the tile's distinct rows, with the two forms' partials compared bit for bit |
 | `moe_slot_bench --rows R --inter I` | the MoE decode slot's expert GEMV at a chosen row count (the down kernel's row batching) |
 | `gpt_doll --selftest` | synthetic eager/graph parity testbed |
 | `glm_bind_check --config CONFIG --checkpoint-dir DIR` | validate a real GLM-5.3 checkpoint against the expected-tensor table (config parse, names, dtypes, shapes, FP8 scale pairing; headers only) |
@@ -90,6 +94,9 @@ frontend maps minimal to low and high to xhigh; low, medium and xhigh pass
 through. Qwen's checkpoint template adds short/extended thinking instructions
 for low/xhigh, while medium uses its neutral thinking prompt. Other model
 families receive the requested name unchanged and apply their own template.
+Inkling 2's template also reads `none` and `max` and writes the level it maps
+a name to into the prompt. Its `none` is the lowest level and does not switch
+thinking off.
 
 History controls use native template kwargs, as in vLLM. For example, Qwen's
 `chat_template_kwargs.preserve_thinking` is passed unchanged to Qwen's template;
@@ -120,3 +127,27 @@ Tokens that decode to no text leave the grammar state unchanged. Argument
 names must remain distinct even when `additionalProperties: true` allows
 undeclared names. Truncated or malformed calls still return as literal
 content; reaching the generation limit retains `finish_reason: length`.
+
+MiniMax M3.1 calls use a namespace before every recursive XML tag. Nested
+objects, arrays and empty containers retain their schema types, including
+numeric-looking strings. All invokes in a block are returned together;
+malformed or truncated blocks remain literal content. Its grammar enforces
+required arguments, typed values and distinct keys, and supports adaptive
+reasoning before a call or JSON answer. The template omits null fields.
+Required schemas without a finite non-null XML spelling, `anyOf` with
+multiple non-null alternatives, and container `enum`/`const` are refused
+with the offending field named. Nullable single-alternative schemas and
+scalar enums are supported; JSON response schemas keep the normal JSON
+grammar's capabilities.
+
+Inkling 2 replies are typed blocks, each opened by a content marker and
+closed by an end marker that are single special tokens. A thinking block is
+returned as `reasoning_content` and a text block as `content`. A call is a
+header naming the tool followed by a JSON block that holds an object with the
+tool's `name` and its `args`. The grammar admits a call only after a header
+that names a declared tool, and the block's body follows that tool's schema
+with the full JSON Schema machine, nested objects and `$defs` included.
+`tool_choice: required` and a named tool admit no text block, so the call
+cannot be put off with an answer, and they allow one thinking block before
+it. A JSON response is one text block that holds the value with no leading
+whitespace. Malformed or truncated blocks are returned as literal content.

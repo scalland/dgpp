@@ -55,12 +55,22 @@ class TextFrontend : public ModelFrontend {
   bool template_reads(std::string_view name) const override { return tpl_->reads(name); }
 
   ReasoningSettings reasoning_settings(std::string_view effort) const override {
+    // Inkling 2's template takes every effort name itself, "none" included
+    // (a thinking effort level of 0, which lowers the reasoning without
+    // switching it off). It reads no thinking switch.
+    if (markers_.tool_format() == dgpp::text::ToolFormat::kInkling) {
+      ReasoningSettings inkling;
+      if (tpl_->reads("reasoning_effort")) inkling.effort = std::string(effort);
+      return inkling;
+    }
     auto out = ModelFrontend::reasoning_settings(effort);
     if (!out.effort) return out;
     // The checkpoint contracts differ: Qwen exposes low/medium/xhigh;
     // GLM's effort-aware template exposes low/high/max. Never pass an
     // unrecognised value through GLM's silent fallback to max.
-    if (markers_.tool_format() == dgpp::text::ToolFormat::kQwenXml) {
+    if (markers_.minimax_namespace.available()) {
+      out.effort = effort == "minimal" ? "low" : effort == "xhigh" ? "max" : std::string(effort);
+    } else if (markers_.tool_format() == dgpp::text::ToolFormat::kQwenXml) {
       out.effort = effort == "minimal" ? "low" :
                    (effort == "high" || effort == "max") ? "xhigh" : std::string(effort);
     } else if (markers_.tool_format() == dgpp::text::ToolFormat::kGlmMarkers) {
@@ -85,6 +95,11 @@ class TextFrontend : public ModelFrontend {
     std::vector<int64_t> ids;
     for (const dgpp::text::ChatMarker& m : markers_.role_markers) ids.push_back(m.id);
     return ids;
+  }
+  // Inkling 2's template writes no generation prompt: the model opens its
+  // turn with "<|message_model|>" itself.
+  int64_t self_opened_turn_marker() const override {
+    return markers_.tool_format() == dgpp::text::ToolFormat::kInkling ? markers_.message_model.id : -1;
   }
 
  private:

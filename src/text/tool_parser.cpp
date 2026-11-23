@@ -2,8 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
-
 #include <utility>
 
 #include "text/chat_template.hpp"
@@ -30,6 +30,13 @@ ChatMarkers ChatMarkers::from_tokenizer(const Tokenizer& tok) {
   };
   m.think_open = lookup("<think>");
   m.think_close = lookup("</think>");
+  // MiniMax carries both canonical and model-specific reasoning tokens.
+  // Its shipped template uses the latter, even though both pairs exist.
+  m.minimax_namespace = lookup("]<]minimax[>[");
+  if (m.minimax_namespace.available()) {
+    m.think_open = lookup("<mm:think>");
+    m.think_close = lookup("</mm:think>");
+  }
   m.tool_call_open = lookup("<tool_call>");
   m.tool_call_close = lookup("</tool_call>");
   m.arg_key_open = lookup("<arg_key>");
@@ -37,11 +44,20 @@ ChatMarkers ChatMarkers::from_tokenizer(const Tokenizer& tok) {
   m.arg_value_open = lookup("<arg_value>");
   m.arg_value_close = lookup("</arg_value>");
   m.dsml = lookup("｜DSML｜");
+  m.message_model = lookup("<|message_model|>");
+  m.content_thinking = lookup("<|content_thinking|>");
+  m.content_text = lookup("<|content_text|>");
+  m.content_tool_json = lookup("<|content_invoke_tool_json|>");
+  m.content_tool_text = lookup("<|content_invoke_tool_text|>");
+  m.content_tool_error = lookup("<|content_tool_error|>");
+  m.end_message = lookup("<|end_message|>");
   // The MiMo tokenizers (the Qwen2 vocabulary with the audio / video
   // markers) go with the compact XML call format.
   m.xml_compact = lookup("<|mimo_audio_start|>").available();
-  for (const char* role : {"<|system|>", "<|user|>", "<|assistant|>", "<|observation|>",
-                           "<|im_start|>", "<|im_end|>", "<｜System｜>", "<｜User｜>", "<｜Assistant｜>"}) {
+  for (const char* role :
+       {"<|system|>", "<|user|>", "<|assistant|>", "<|observation|>", "<|im_start|>", "<|im_end|>",
+        "<｜System｜>", "<｜User｜>", "<｜Assistant｜>", "]~!b[", "]~b]", "[e~[",
+        "<|message_system|>", "<|message_user|>", "<|message_model|>", "<|message_tool|>"}) {
     const ChatMarker r = lookup(role);
     if (r.available()) m.role_markers.push_back(r);
   }
@@ -70,6 +86,7 @@ ToolSchemas::ToolSchemas(const minijson::Value& tools) {
     std::map<std::string, Type>& params = types_[std::string(name->as_string())];
     const minijson::Value* parameters = tool.find("parameters");
     if (parameters == nullptr || !parameters->is_object()) continue;
+    parameters_[std::string(name->as_string())] = json_text_of(*parameters);
     const minijson::Value* properties = parameters->find("properties");
     if (properties == nullptr || !properties->is_object()) continue;
     for (const minijson::Member& prop : properties->members()) {
@@ -103,6 +120,12 @@ ToolSchemas::Type ToolSchemas::type_of(const std::string& function,
   return param == fn->second.end() ? Type::kUnknown : param->second;
 }
 
+const std::string& ToolSchemas::parameters(const std::string& function) const {
+  static const std::string empty = "{}";
+  const auto it = parameters_.find(function);
+  return it == parameters_.end() ? empty : it->second;
+}
+
 // ---------------------------------------------------------------------------
 // The parser
 // ---------------------------------------------------------------------------
@@ -123,6 +146,9 @@ ToolCallParser::ToolCallParser(ChatMarkers markers, Decode decode,
   } else {
     state_ = State::kContent;
   }
+  // Inkling 2's prompt opens nothing: the model names every block itself.
+  inkling_ = markers_.tool_format() == ToolFormat::kInkling;
+  if (inkling_) state_ = State::kContent;
 }
 
 void ToolCallParser::run_append(int64_t id, Event::Kind kind,
@@ -360,6 +386,263 @@ bool ToolCallParser::parse_qwen_block(const std::string& text) {
   if (!accept("</function>")) return false;
   skip_ws();
   return i == text.size();
+}
+
+// MiniMax's namespace precedes every structural tag. Bare '<' and '&'
+// inside scalar values are literal bytes, not XML entities or markup.
+namespace {
+class MiniMaxXmlReader {
+ public:
+  MiniMaxXmlReader(const std::string& text, const std::string& ns) : text_(text), ns_(ns) {}
+  bool accept(const std::string& s) {
+    if (text_.compare(pos_, s.size(), s) != 0) return false;
+    pos_ += s.size();
+    return true;
+  }
+  bool tag(const std::string& s) { return accept(ns_ + "<" + s + ">"); }
+  void whitespace() {
+    while (pos_ < text_.size() && JsonLexer::is_ws(static_cast<uint8_t>(text_[pos_]))) ++pos_;
+  }
+  bool end() const { return pos_ == text_.size(); }
+  bool invoke(std::string* name) {
+    if (!accept(ns_ + "<invoke name=\"")) return false;
+    const auto end = text_.find('"', pos_);
+    if (end == std::string::npos || end == pos_) return false;
+    *name = text_.substr(pos_, end - pos_);
+    if (name->find_first_of("<>\r\n") != std::string::npos) return false;
+    pos_ = end;
+    return accept("\">");
+  }
+  bool value(const std::string& close, const minijson::Value* schema, std::string* result,
+             int depth = 0, bool root = false) {
+    if (depth > 128) return false;
+    if (root) root_schema_ = schema;
+    schema = resolve_schema(schema);
+    std::string type;
+    if (schema) {
+      const auto* t = schema->find("type");
+      const auto* en = schema->find("enum");
+      const auto* cs = schema->find("const");
+      const auto value_class = [](const minijson::Value& v, std::string_view kind) {
+        return (kind == "string" && v.is_string()) || (kind == "object" && v.is_object()) ||
+               (kind == "array" && v.is_array()) || (kind == "boolean" && v.is_bool()) ||
+               (kind == "null" && v.is_null()) ||
+               (kind == "integer" && v.kind() == minijson::Value::Kind::Int) ||
+               (kind == "number" && v.is_number());
+      };
+      if (t || en || cs)
+        for (const char* candidate :
+             {"string", "object", "array", "integer", "number", "boolean", "null"}) {
+          bool declared = !t || (t->is_string() && t->as_string() == candidate);
+          if (t && t->is_array())
+            for (const auto& item : t->items()) declared |= item.as_string() == candidate;
+          bool enumerated = !en && !cs;
+          if (cs) enumerated = value_class(*cs, candidate);
+          if (en && en->is_array())
+            for (const auto& item : en->items()) enumerated |= value_class(item, candidate);
+          if (declared && enumerated) {
+            type = candidate;
+            break;
+          }
+        }
+    }
+    const std::string closer = ns_ + "</" + close + ">";
+    bool children = text_.compare(pos_, ns_.size() + 1, ns_ + "<") == 0 &&
+                    text_.compare(pos_, closer.size(), closer) != 0;
+    bool array = type == "array" || (type.empty() && children &&
+                                     text_.compare(pos_, ns_.size() + 6, ns_ + "<item>") == 0);
+    bool object = root || type == "object" || (type.empty() && children && !array);
+    if (array || object) {
+      *result = array ? "[" : "{";
+      std::vector<std::string> seen;
+      bool first = true;
+      for (;;) {
+        if (accept(closer)) break;
+        // The template places no whitespace inside containers. Accept it
+        // between tags, preserving all scalar whitespace in the other arm.
+        whitespace();
+        if (accept(closer)) break;
+        if (!accept(ns_ + "<")) return false;
+        const auto end = text_.find('>', pos_);
+        if (end == std::string::npos || end == pos_) return false;
+        const std::string key = text_.substr(pos_, end - pos_);
+        if (key.find_first_of("<>/\"' \n\r\t") != std::string::npos) return false;
+        if (array && key != "item") return false;
+        if (!array && std::find(seen.begin(), seen.end(), key) != seen.end()) return false;
+        seen.push_back(key);
+        pos_ = end + 1;
+        const minijson::Value* child = nullptr;
+        if (schema) {
+          if (array)
+            child = schema->find("items");
+          else if (const auto* properties = schema->find("properties"))
+            child = properties->find(key);
+          if (!array && !child) {
+            const auto* extra = schema->find("additionalProperties");
+            if (extra && extra->is_object()) child = extra;
+          }
+        }
+        std::string item;
+        if (!value(key, child, &item, depth + 1)) return false;
+        if (!first) *result += ", ";
+        first = false;
+        if (!array) *result += Value::string_value(key).to_json(false) + ": ";
+        *result += item;
+      }
+      *result += array ? "]" : "}";
+      return true;
+    }
+    const auto end = text_.find(closer, pos_);
+    if (end == std::string::npos) return false;
+    const auto structural = text_.find(ns_ + "<", pos_);
+    if (structural != std::string::npos && structural < end) return false;
+    const std::string scalar = text_.substr(pos_, end - pos_);
+    pos_ = end + closer.size();
+    if (type != "string") {
+      try {
+        *result = normalized_json(scalar);
+        // Containers must use the recursive XML spelling, never raw JSON.
+        if (!result->empty() && ((*result)[0] == '{' || (*result)[0] == '[')) return false;
+        if (type == "boolean" && *result != "true" && *result != "false") return false;
+        if (type == "null" && *result != "null") return false;
+        if (type == "integer" || type == "number") {
+          if (result->empty() ||
+              ((*result)[0] != '-' && ((*result)[0] < '0' || (*result)[0] > '9')))
+            return false;
+          if (type == "integer" && result->find_first_of(".eE") != std::string::npos) return false;
+        }
+        return true;
+      } catch (const std::exception&) {
+        if (!type.empty()) return false;
+      }
+    }
+    *result = Value::string_value(scalar).to_json(false);
+    return true;
+  }
+
+ private:
+  const minijson::Value* resolve_schema(const minijson::Value* schema) const {
+    for (int depth = 0; schema && depth < 128; ++depth) {
+      if (const auto* ref = schema->find("$ref"); ref && ref->is_string()) {
+        const std::string path(ref->as_string());
+        if (path.empty() || path[0] != '#') return schema;
+        schema = root_schema_;
+        size_t begin = 2;
+        while (schema && begin <= path.size() && path.size() > 1) {
+          const auto end = path.find('/', begin);
+          std::string key = path.substr(begin, end == std::string::npos ? end : end - begin);
+          for (size_t p = 0; p + 1 < key.size(); ++p)
+            if (key[p] == '~') {
+              if (key[p + 1] == '0' || key[p + 1] == '1') {
+                key.replace(p, 2, key[p + 1] == '0' ? "~" : "/");
+              }
+            }
+          schema = schema->find(key);
+          if (end == std::string::npos) break;
+          begin = end + 1;
+        }
+        continue;
+      }
+      if (const auto* any = schema->find("anyOf"); any && any->is_array()) {
+        const minijson::Value* selected = nullptr;
+        for (const auto& alt : any->items()) {
+          const auto* type = alt.find("type");
+          if (!type || type->as_string() != "null") {
+            selected = &alt;
+            break;
+          }
+        }
+        if (selected) {
+          schema = selected;
+          continue;
+        }
+      }
+      return schema;
+    }
+    return schema;
+  }
+  const std::string& text_;
+  const std::string& ns_;
+  const minijson::Value* root_schema_ = nullptr;
+  size_t pos_ = 0;
+};
+}  // namespace
+
+bool ToolCallParser::parse_minimax_block(const std::string& text, std::vector<Call>* calls) const {
+  MiniMaxXmlReader reader(text, markers_.minimax_namespace.text);
+  if (!reader.tag("tool_call")) return false;
+  reader.whitespace();
+  while (!reader.tag("/tool_call")) {
+    Call call;
+    if (!reader.invoke(&call.name)) return false;
+    const auto schema = minijson::parse(schemas_.parameters(call.name));
+    if (!reader.value("invoke", &schema.root, &call.arguments, 0, true)) return false;
+    calls->push_back(std::move(call));
+    reader.whitespace();
+  }
+  return reader.end() && !calls->empty();
+}
+
+void ToolCallParser::minimax_flush(size_t bytes, std::vector<Event>* out) {
+  if (!bytes) return;
+  Event event;
+  event.kind = Event::Kind::kContent;
+  event.text = minimax_run_.text.substr(0, bytes);
+  slice_tokens(&event, minimax_run_.tokens, 0, bytes);
+  out->push_back(std::move(event));
+  Event tail;
+  slice_tokens(&tail, minimax_run_.tokens, bytes, minimax_run_.text.size());
+  minimax_run_.text.erase(0, bytes);
+  minimax_run_.tokens = std::move(tail.tokens);
+}
+
+void ToolCallParser::minimax_append(int64_t id, std::vector<Event>* out) {
+  const size_t begin = minimax_run_.text.size();
+  minimax_run_.text += decode_({id});
+  if (options_.track_tokens && minimax_run_.text.size() > begin)
+    minimax_run_.tokens.push_back({current_token_, begin, minimax_run_.text.size()});
+  const std::string open = markers_.minimax_namespace.text + "<tool_call>";
+  const std::string close = markers_.minimax_namespace.text + "</tool_call>";
+  for (;;) {
+    if (state_ == State::kContent) {
+      const auto found = minimax_run_.text.find(open);
+      if (found == std::string::npos) {
+        size_t held = std::min(open.size() - 1, minimax_run_.text.size());
+        while (held &&
+               minimax_run_.text.compare(minimax_run_.text.size() - held, held, open, 0, held))
+          --held;
+        minimax_flush(minimax_run_.text.size() - held, out);
+        return;
+      }
+      minimax_flush(found, out);
+      state_ = State::kToolCall;
+    }
+    const auto end = minimax_run_.text.find(close, open.size());
+    const auto nested = minimax_run_.text.find(open, open.size());
+    if (nested != std::string::npos && (end == std::string::npos || nested < end)) {
+      minimax_flush(nested, out);
+      continue;
+    }
+    if (end == std::string::npos) return;
+    const size_t bytes = end + close.size();
+    std::vector<Call> calls;
+    if (!parse_minimax_block(minimax_run_.text.substr(0, bytes), &calls)) {
+      minimax_flush(bytes, out);
+    } else {
+      for (auto& call : calls) {
+        Event event;
+        event.kind = Event::Kind::kToolCall;
+        event.call = std::move(call);
+        out->push_back(std::move(event));
+        ++calls_;
+      }
+      Event tail;
+      slice_tokens(&tail, minimax_run_.tokens, bytes, minimax_run_.text.size());
+      minimax_run_.text.erase(0, bytes);
+      minimax_run_.tokens = std::move(tail.tokens);
+    }
+    state_ = State::kContent;
+  }
 }
 
 // ---- the DSML format ------------------------------------------------------------
@@ -674,8 +957,193 @@ void ToolCallParser::complete_block(std::vector<Event>* out) {
   raw_.clear();
 }
 
+// ---------------------------------------------------------------------------
+// Inkling 2: typed blocks
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The raw text of member `key` of the JSON object `text` (its value as
+// written), or nullopt when `text` is not an object with that member.
+// `text` has already parsed as JSON.
+std::optional<std::string> json_member_text(const std::string& text, std::string_view key) {
+  size_t i = text.find_first_not_of(" \n\r\t");
+  if (i == std::string::npos || text[i] != '{') return std::nullopt;
+  ++i;
+  const auto skip_ws = [&] {
+    while (i < text.size() && (text[i] == ' ' || text[i] == '\n' || text[i] == '\r' || text[i] == '\t')) ++i;
+  };
+  const auto skip_string = [&] {  // at the opening quote, to one past the closing one
+    ++i;
+    while (i < text.size() && text[i] != '"') i += text[i] == '\\' ? 2 : 1;
+    ++i;
+  };
+  const auto skip_value = [&] {
+    int depth = 0;
+    while (i < text.size()) {
+      const char c = text[i];
+      if (c == '"') {
+        skip_string();
+        if (depth == 0) return;
+        continue;
+      }
+      if (c == '{' || c == '[') ++depth;
+      else if (c == '}' || c == ']') {
+        if (depth == 0) return;
+        --depth;
+        ++i;
+        if (depth == 0) return;
+        continue;
+      } else if (depth == 0 && (c == ',' || c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
+        return;
+      }
+      ++i;
+    }
+  };
+  for (;;) {
+    skip_ws();
+    if (i >= text.size() || text[i] != '"') return std::nullopt;
+    const size_t key_begin = i;
+    skip_string();
+    if (i > text.size()) return std::nullopt;
+    const std::string raw_key = text.substr(key_begin, i - key_begin);
+    skip_ws();
+    if (i >= text.size() || text[i] != ':') return std::nullopt;
+    ++i;
+    skip_ws();
+    const size_t value_begin = i;
+    skip_value();
+    if (i > text.size()) return std::nullopt;
+    if (raw_key.size() == key.size() + 2 && raw_key.compare(1, key.size(), key) == 0)
+      return text.substr(value_begin, i - value_begin);
+    skip_ws();
+    if (i < text.size() && text[i] == ',') {
+      ++i;
+      continue;
+    }
+    return std::nullopt;
+  }
+}
+
+}  // namespace
+
+bool ToolCallParser::inkling_complete_call(std::vector<Event>* out) {
+  const std::string text = decode_(raw_);
+  Call call;
+  try {
+    const auto parsed = minijson::parse(text);
+    if (!parsed.root.is_object()) return false;
+    const minijson::Value* name = parsed.root.find("name");
+    if (name == nullptr || !name->is_string() || name->as_string().empty()) return false;
+    call.name = std::string(name->as_string());
+    // The checkpoint writes the arguments under "args". A call without
+    // them takes none.
+    const minijson::Value* args = parsed.root.find("args");
+    if (args == nullptr) {
+      call.arguments = "{}";
+    } else {
+      if (!args->is_object()) return false;
+      const std::optional<std::string> raw = json_member_text(text, "args");
+      if (!raw) return false;
+      call.arguments = normalized_json(*raw);
+    }
+  } catch (const std::exception&) {
+    return false;
+  }
+  Event ev;
+  ev.kind = Event::Kind::kToolCall;
+  ev.call = std::move(call);
+  out->push_back(std::move(ev));
+  ++calls_;
+  return true;
+}
+
+void ToolCallParser::inkling_flush_header(std::vector<Event>* out) {
+  // A header that no content marker followed: what the model wrote there
+  // is shown rather than lost.
+  if (raw_.empty()) return;
+  Event ev;
+  ev.kind = Event::Kind::kContent;
+  ev.text = decode_(raw_);
+  if (!ev.text.empty()) {
+    annotate_block(&ev, false);
+    out->push_back(std::move(ev));
+  }
+  raw_.clear();
+  raw_indices_.clear();
+}
+
+void ToolCallParser::inkling_feed(int64_t id, std::vector<Event>* out) {
+  const auto close_open_block = [&] {
+    if (ink_block_ == InkBlock::kThinking) {
+      Event ev;
+      ev.kind = Event::Kind::kReasoningClosed;
+      out->push_back(std::move(ev));
+    } else if (ink_block_ == InkBlock::kToolJson) {
+      // A body that is not a call is the text the model wrote.
+      if (!inkling_complete_call(out)) inkling_flush_header(out);
+    } else if (ink_block_ == InkBlock::kHeader) {
+      inkling_flush_header(out);
+    }
+    raw_.clear();
+    raw_indices_.clear();
+    ink_block_ = InkBlock::kNone;
+    state_ = State::kContent;
+  };
+  const auto open = [&](InkBlock block, State state) {
+    // A marker inside an open body block ends that block: the model moved on
+    // without closing it. A header's name text is dropped here.
+    if (ink_block_ != InkBlock::kNone && ink_block_ != InkBlock::kHeader) close_open_block();
+    raw_.clear();
+    raw_indices_.clear();
+    raw_has_prefix_ = true;
+    ink_block_ = block;
+    state_ = state;
+  };
+  if (is_marker(id, markers_.end_message)) {
+    close_open_block();
+    return;
+  }
+  if (is_marker(id, markers_.message_model)) {
+    if (ink_block_ != InkBlock::kNone) close_open_block();
+    open(InkBlock::kHeader, State::kContent);
+    return;
+  }
+  if (is_marker(id, markers_.content_thinking)) {
+    open(InkBlock::kThinking, State::kReasoning);
+    return;
+  }
+  if (is_marker(id, markers_.content_text) || is_marker(id, markers_.content_tool_text) ||
+      is_marker(id, markers_.content_tool_error)) {
+    open(InkBlock::kText, State::kContent);
+    return;
+  }
+  if (is_marker(id, markers_.content_tool_json)) {
+    open(InkBlock::kToolJson, State::kToolCall);
+    return;
+  }
+  switch (ink_block_) {
+    case InkBlock::kThinking:
+      run_append(id, Event::Kind::kReasoning, out);
+      return;
+    case InkBlock::kHeader:
+    case InkBlock::kToolJson:
+      raw_.push_back(id);
+      raw_indices_.push_back(current_token_);
+      return;
+    case InkBlock::kText:
+    case InkBlock::kNone:
+      run_append(id, Event::Kind::kContent, out);
+      return;
+  }
+}
+
 void ToolCallParser::feed(int64_t id, std::vector<Event>* out) {
   current_token_ = next_token_++;
+  if (inkling_) {
+    inkling_feed(id, out);
+    return;
+  }
   switch (state_) {
     case State::kReasoning:
       if (is_marker(id, markers_.think_close)) {
@@ -694,6 +1162,18 @@ void ToolCallParser::feed(int64_t id, std::vector<Event>* out) {
       return;
 
     case State::kContent:
+      // MiniMax's adaptive no-thinking reply starts with </mm:think>
+      // without an opener. It is a mode delimiter, not answer text.
+      if (options_.model_may_open_thinking && !content_started_ &&
+          markers_.minimax_namespace.available() && is_marker(id, markers_.think_close)) {
+        content_started_ = true;
+        Event ev;
+        ev.kind = Event::Kind::kReasoningClosed;
+        if (options_.track_tokens)
+          ev.tokens.push_back({current_token_, 0, markers_.think_close.text.size()});
+        out->push_back(std::move(ev));
+        return;
+      }
       // The model's own opener (the prompt left it the choice): before any
       // content, <think> opens the reasoning.
       if (options_.model_may_open_thinking && !content_started_ && is_marker(id, markers_.think_open) &&
@@ -707,8 +1187,12 @@ void ToolCallParser::feed(int64_t id, std::vector<Event>* out) {
         dsml_content_append(id, out);
         return;
       }
-      if (is_marker(id, markers_.tool_call_open) &&
-          markers_.tool_calls_available()) {
+      if (markers_.minimax_namespace.available()) {
+        content_started_ = true;
+        minimax_append(id, out);
+        return;
+      }
+      if (is_marker(id, markers_.tool_call_open) && markers_.tool_calls_available()) {
         content_started_ = true;
         enter_tool_call(id);
         return;
@@ -721,6 +1205,10 @@ void ToolCallParser::feed(int64_t id, std::vector<Event>* out) {
       break;
   }
 
+  if (markers_.minimax_namespace.available()) {
+    minimax_append(id, out);
+    return;
+  }
   if (markers_.tool_format() == ToolFormat::kDsml) {
     // The DSML block buffers its ids until its closing text; parsed then.
     raw_.push_back(id);
@@ -848,6 +1336,19 @@ void ToolCallParser::feed(int64_t id, std::vector<Event>* out) {
 }
 
 void ToolCallParser::finish(std::vector<Event>* out) {
+  if (inkling_) {
+    // The generation ended inside a block: a cut call or header is the text
+    // the model wrote.
+    if (ink_block_ == InkBlock::kToolJson || ink_block_ == InkBlock::kHeader) inkling_flush_header(out);
+    ink_block_ = InkBlock::kNone;
+    state_ = State::kContent;
+    return;
+  }
+  if (markers_.minimax_namespace.available()) {
+    minimax_flush(minimax_run_.text.size(), out);
+    state_ = State::kContent;
+    return;
+  }
   if (markers_.tool_format() == ToolFormat::kDsml) {
     if (state_ == State::kToolCall) abort_dsml_block(out);
     else if (state_ == State::kContent) dsml_flush_held(out);

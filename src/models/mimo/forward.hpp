@@ -148,6 +148,10 @@ class MimoModel : public SessionModel<MimoModel> {
   Outputs run_rows(const RowRun& run);
   void reset_slot_state(int req);
   GlmSpecSegments spec_segments(int req, int snapshot_row0 = 0) const;
+  // The snapshot is the pool's blocks and the two counters unless the
+  // native draft keeps its history rows in it: without them a request may
+  // open on the first tokens of a deeper snapshot.
+  bool attaches_within_snapshot() const { return !native_mtp(); }
   size_t snapshot_state_bytes() const { return kSnapshotStamp; }
   size_t draft_state_bytes() const {
     return native_mtp() ? size_t(kNativeHistoryRows) * cfg_.hidden_size * 2 : 0;
@@ -279,7 +283,7 @@ class MimoModel : public SessionModel<MimoModel> {
   // The early (normal-priority) prefetch of the next layer's projection
   // from fold 1 on, sized to the fold's idle DRAM time (0: off; an
   // experiment behind DGPP_MIMO_EARLY_QKV_MB together with the fp4 slot
-  // kernels' streaming loads, -DDGPP_FP4_SLOT_STREAMING=1).
+  // kernels' streaming loads, the gate/up launcher's `streaming`).
   size_t early_qkv_bytes_ = 0;
   void prefetch_ffn_side(const MimoLayerResident& r);
   void prefetch_attention_side(int layer);

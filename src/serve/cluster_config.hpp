@@ -48,6 +48,12 @@ struct ClusterConfig {
   // address; 0 = off. Rank-local: not part of the config digest.
   int metrics_port = 0;
   struct Engine {
+    // Opt in to the separate Heretic research tools. Ordinary serving does
+    // not allocate capture/adapter buffers or change its execution path.
+    bool heretic_research = false;
+    bool runtime_adapters = false;
+    bool runtime_adapter_verify_weights = false;
+    std::string runtime_adapter_path;
     int max_concurrency = 8;
     int64_t kv_capacity = 8192;
     // The cache format: GLM-5.3's latent cache bf16 | fp8 | fp4; MiMo's
@@ -190,6 +196,11 @@ struct ClusterConfig {
     bool prefill_fp8_gemm = false;
     bool prefill_fp8_per_tensor = false;
     std::string prefill_activations = "bf16";
+    // MiniMax and Inkling 2: the activation recipe on every target row,
+    // including decode ("native" is the checkpoint's own expert input
+    // recipe). Independent of kv_dtype, so both precision controls can be
+    // measured.
+    std::string activations = "bf16";
     std::string prefill_attention = "bf16";
     // Flash-Next QSA decode arithmetic over its fp8 pool. Independent of
     // prefill_attention so either phase can retain bf16 compute.
@@ -265,8 +276,9 @@ struct ClusterConfig {
     bool compact_batches = true;
     bool decode_graph = false;
     bool mtp = false;
-    int mtp_depth = 1;             // draft tokens per step (1..5); needs mtp
-    bool mtp_depth_set = false;    // the file named it (else a family may default it: DSpark's block is 5)
+    int mtp_depth = 1;  // draft tokens per step (1..7); family-specific limits apply
+    bool mtp_depth_set =
+        false;  // the file named it (else a family may default it from its checkpoint)
     // The DFlash2 block drafter (Qwen3.5-family, eager path only): a
     // checkpoint directory or HF id whose config.json names the drafter.
     // Replaces mtp (mutually exclusive); the draft width is the
@@ -319,6 +331,7 @@ struct ClusterConfig {
     double mtp_schedule_lambda = 0.0;
     int mtp_schedule_min_depth = 1;
     int mtp_schedule_options = 0;  // at most this many scheduled depths (0: as many as the graph-variant budget holds)
+    int mtp_schedule_max_live = 0;  // past this many live requests a step verifies and drafts the minimum depth only (0: no limit)
     bool mtp_schedule_adapt = true;  // lambda follows the modeled throughput, floored at mtp_schedule_lambda
     // A sampled request's acceptance per position as a fraction of the
     // confidence head's, when its drafts are the draft's argmax
@@ -366,6 +379,7 @@ struct ClusterConfig {
     double prefix_cache_gib = 1.5;
     int prefix_min_tokens = 1024;       // no prefix snapshot below this position (0: every cut)
     bool prefix_head_snapshots = true;  // a cold prompt also keeps its first structural cut (the system prompt's end)
+    bool prefix_partial_hits = true;    // a prompt opens on the tokens it shares with a deeper entry
     // prompt_cache_key pins protect their entries while the pinned entries
     // hold at most this share of the arena's slots and the NVMe slab's
     // pages; past it a pin protects nothing (100: always).
@@ -397,6 +411,9 @@ struct ClusterConfig {
   struct NvmeCache {
     bool enabled = false;
     std::string path = "~/dgpp/nvme-cache";
+    // Local placement assertion, independent of cache identity and rank 0's
+    // numerical settings. Empty disables it; otherwise an absolute mountpoint.
+    std::string required_mount;
     double capacity_gib = 0.0;
     int64_t min_tokens = 0;
     // One staging slice in MiB: two slices of device work move per tick, so
@@ -415,8 +432,8 @@ struct ClusterConfig {
     // Select an existing binding across build/settings changes. This is
     // the operator's compatibility assertion; structural checks still run.
     std::string reuse_binding;
-    // A filesystem that refuses direct I/O (tmpfs) is refused unless this
-    // allows buffered I/O: the page cache would grow into the model's memory.
+    // Tests/experiments only: permits RAM-backed storage and filesystems that
+    // refuse direct I/O. Neither is suitable for the normal memory budget.
     bool allow_buffered = false;
     // An op without progress for this long fails, so a request waiting on
     // its restore admits cold instead of never (0: never).

@@ -73,6 +73,9 @@
 #include "models/glm_dsa/loader.hpp"
 
 namespace dgpp {
+namespace adapters {
+class Runtime;
+}
 
 class GlmDsaModel : public SessionModel<GlmDsaModel> {
  public:
@@ -120,6 +123,25 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   // closed), fresh state, every row's logits; the slot is closed after.
   // capture_layers: every layer's residual output [T, H] in layer_states.
   Outputs forward(const std::vector<int64_t>& token_ids, bool capture_layers = false);
+  struct ProjectionCapture {
+    std::string id;
+    std::vector<uint16_t> input;  // this rank's input-column slice
+    std::vector<float> output;    // shared: FP32 local partial; others: replicated widened BF16
+  };
+  struct ResearchOutputs {
+    Outputs prediction;  // raw last-prompt-position logits only
+    std::vector<ProjectionCapture> projections;
+    std::vector<uint16_t> residuals;  // [layers + 1, hidden]: embedding, boundaries, final norm
+  };
+  // A separate compiled walk: no capture branches/allocations in normal
+  // serving. The caller passes the explicit cluster research flag.
+  ResearchOutputs research_forward(const std::vector<int64_t>& token_ids, bool enabled);
+  // A bounded row slice of one immutable target, in this rank's input columns.
+  // Decode the resident representation to FP32 without rounding through BF16.
+  std::vector<float> research_projection_rows(const std::string& target_id, int row_begin,
+                                              int row_count, bool enabled);
+  void set_runtime_adapter(std::unique_ptr<adapters::Runtime> adapter, bool enabled);
+  bool has_runtime_adapter() const { return runtime_adapter_ != nullptr; }
   // A test's capture of the session walks too (the Qwen families' form):
   // every session prefill / step keeps its layer rows and DSA selections
   // (a sync per layer — diagnostics only). Process-wide.
@@ -155,6 +177,9 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   Outputs run_rows(const RowRun& run);
   void reset_slot_state(int req);
   GlmSpecSegments spec_segments(int req, int snapshot_row0 = 0) const;
+  // The snapshot is the pool's blocks and the two counters: a request may
+  // open on the first tokens of a deeper one.
+  bool attaches_within_snapshot() const { return true; }
   size_t snapshot_state_bytes() const { return kSnapshotStamp; }
   size_t draft_state_bytes() const { return 0; }
   void write_state_snapshot(int req, uint8_t* dst, int spec_row);
@@ -178,6 +203,7 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   void restore_chain_state(int) {}
 
  private:
+  std::unique_ptr<adapters::Runtime> runtime_adapter_;
   static constexpr int kBlockTokens = 128;
   static constexpr int kPrefillChunkTokens = 2048;
   // No state families beside the pool's blocks: a 16-byte zero stamp keeps
@@ -219,7 +245,11 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
     const int32_t* span_lens = nullptr;
     int num_spans = 0;
   };
-  void enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, uint16_t* resid, int T, const WalkRows& rows);
+  template <bool Research, bool Adapted = false>
+  Outputs run_rows_impl(const RowRun& run, ResearchOutputs* research);
+  template <bool Research, bool Adapted = false>
+  void enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, uint16_t* resid, int T,
+                     const WalkRows& rows, ResearchOutputs* research = nullptr);
   // A layer's closing residual add (its folded FFN output) is deferred into
   // the next norm that reads the residual — the next layer's input norm,
   // the final norm or the draft head's — as one fused kernel
@@ -230,6 +260,8 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   void enqueue_dense(const GlmDsaDenseMlpResident& d, const uint16_t* x, int T, uint16_t* out);
   uint16_t* stage(uint16_t* fallback, int T, int width, bool capture);
   void fold(uint16_t* buf, int T, int width, bool capture);
+  uint16_t* adapter_rider(int layer, bool attention, uint16_t* buf, int T, int width, bool capture);
+  void fold_adapted(int layer, bool attention, uint16_t* buf, int T, int width, bool capture, uint16_t* rider);
 
   // The vocab-sharded embedding (the loader's setting at world > 1):
   // each rank gathers the rows it holds and one fold sums them — bitwise

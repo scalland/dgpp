@@ -22,6 +22,21 @@ import prepare_data
 import site_env
 
 
+def shipped_scripts():
+    """Names of the files scripts/ ships. In a checkout that is what Git
+    tracks, because a working tree may also hold local files. Elsewhere it is
+    every file in the directory."""
+    try:
+        listed = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", "scripts"],
+                                capture_output=True, text=True, timeout=30)
+    except OSError:
+        listed = None
+    if listed is not None and listed.returncode == 0 and listed.stdout:
+        names = (name.partition("/")[2] for name in listed.stdout.split("\0") if name)
+        return sorted(name for name in names if "/" not in name)
+    return sorted(path.name for path in (ROOT / "scripts").iterdir() if path.is_file())
+
+
 class PortabilityTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -86,6 +101,19 @@ class PortabilityTest(unittest.TestCase):
                 self.config.write_text(json.dumps({"model": "org/model", "world_size": 1,
                                                   "nvme_cache": {**cache, **changes}}))
                 with self.assertRaisesRegex(ValueError, "nvme_cache.reuse_binding"):
+                    site_env.resolve_config(self.config, self.values)
+
+    def test_nvme_required_mount_survives_resolution(self):
+        for mount in ("", "/", "/mnt/cache", "/mnt/space tab\tback\\line\n"):
+            cache = {"enabled": True, "capacity_gib": 64, "required_mount": mount}
+            self.config.write_text(json.dumps({"model": "org/model", "world_size": 1, "nvme_cache": cache}))
+            resolved = site_env.server_config(site_env.resolve_config(self.config, self.values))
+            self.assertEqual(resolved["nvme_cache"], cache)
+        for mount in (True, None, 1, [], "relative", "~/cache", "/cache\0suffix"):
+            with self.subTest(mount=mount):
+                self.config.write_text(json.dumps({"model": "org/model", "world_size": 1,
+                                                  "nvme_cache": {"required_mount": mount}}))
+                with self.assertRaisesRegex(ValueError, "nvme_cache.required_mount"):
                     site_env.resolve_config(self.config, self.values)
 
     def test_http_types_and_ports_rejected(self):
@@ -249,9 +277,8 @@ class PortabilityTest(unittest.TestCase):
 
     def test_scripts_index_and_setup_document_links(self):
         index = (ROOT / "scripts/README.md").read_text()
-        for path in (ROOT / "scripts").iterdir():
-            if path.is_file():
-                self.assertIn(f"[{path.name}]({path.name})", index)
+        for name in shipped_scripts():
+            self.assertIn(f"[{name}]({name})", index)
         for name in ("README.md", "CONTRIBUTING.md", "deploy/README.md", "scripts/README.md", "docs/getting-started.md", "docs/dependencies.md", "docs/networking.md", "docs/testing.md", "docs/operations.md"):
             source = ROOT / name
             for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", source.read_text()):
@@ -294,6 +321,8 @@ class PortabilityTest(unittest.TestCase):
             "kaushikvira/Qwen3.8-Flash-Next-swift15-nvfp4-dgpp": "qwen-3.8-flash-next_nvfp4-swift15",
             "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-NVFP4": "dory1.0-4b_nvfp4",
             "HawkBearPig/flint-FP8-NVFP4": "flint_fp8-nvfp4",
+            "MiniMaxAI/MiniMax-M3.1-Flash": "minimax-m3.1-flash_nvfp4-mxfp8",
+            "thinkingmachines/Inkling-2-Mini": "inkling-2-mini_nvfp4-mxfp8",
         }
         # Families whose checkpoint ships no draft layer: their templates run
         # plain (the spec keys are refused by name at boot, not merely off) —
@@ -306,7 +335,8 @@ class PortabilityTest(unittest.TestCase):
         self.assertTrue(templates)
         index = (ROOT / "deploy/README.md").read_text()
         # One template per model, quant and world (2026-09-14): every template
-        # enables the decode graph and MTP, except a DFlash2-drafter variant
+        # enables the decode graph, with the measured draft or plain default.
+        # A DFlash2-drafter variant
         # (2026-10-01): it names engine.dflash_model instead of MTP, the
         # drafter replacing the MTP draft one-for-one, its block proposal
         # recorded in the graph step (2026-10-05; the eager engine is the
@@ -325,7 +355,7 @@ class PortabilityTest(unittest.TestCase):
                     self.assertFalse(engine.get("mtp", False), "a draftless family's template runs plain")
                     self.assertTrue(engine["decode_graph"])
                 else:
-                    self.assertTrue(engine["mtp"], "every template enables MTP (the plain world is --no-mtp)")
+                    self.assertTrue(engine["mtp"], "this family's template enables MTP (plain is --no-mtp)")
                     self.assertTrue(engine["decode_graph"])
                 # The name is the shape: cluster_<model>_<quant>_w<n>, with an
                 # optional trailing _<variant> for a template that deviates from

@@ -481,30 +481,6 @@ void glm_upload_i64(const int64_t* pinned_src, int64_t* dst, int count,
   launch_upload_words("glm_upload_i64", pinned_src, dst, count, stream);
 }
 
-namespace {
-__global__ void device_copy_kernel(uint4* __restrict__ dst,
-                                   const uint4* __restrict__ src,
-                                   size_t units) {
-  dgpp_pdl_wait();
-  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       i < units; i += static_cast<size_t>(gridDim.x) * blockDim.x)
-    dst[i] = src[i];
-}
-}  // namespace
-
-void glm_device_copy(void* dst, const void* src, size_t bytes,
-                     cudaStream_t stream) {
-  if (dst == nullptr || src == nullptr || bytes == 0 || bytes % 16 != 0 ||
-      (reinterpret_cast<uintptr_t>(dst) & 15) != 0 ||
-      (reinterpret_cast<uintptr_t>(src) & 15) != 0)
-    throw std::invalid_argument("glm_device_copy: alignment/size");
-  const size_t units = bytes / 16;
-  const unsigned blocks = static_cast<unsigned>(
-      std::min<size_t>((units + 255) / 256, 1024));
-  device_copy_kernel<<<blocks, 256, 0, stream>>>(
-      static_cast<uint4*>(dst), static_cast<const uint4*>(src), units);
-  DGPP_CUDA_OK(cudaGetLastError());
-}
 
 namespace {
 __global__ void store_u8x2_kernel(uint8_t* __restrict__ dst, uint8_t a, uint8_t b) {
@@ -662,11 +638,12 @@ void glm_spec_next_tokens_batched(const int64_t* next, const GlmSpecDrafts& draf
       throw std::invalid_argument(
           "glm_spec_next_tokens_batched: null draft verdicts");
   if (requests < 1 || requests > kPickMaxRequests ||
-      rows_per_request != 1 + drafts.count ||
+      rows_per_request < 1 + drafts.count ||
       requests * rows_per_request > kPickMaxRows)
     throw std::invalid_argument(
         "glm_spec_next_tokens_batched: the feed is [next, draft_1 .. "
-        "draft_n] per request (rows_per_request = 1 + drafts)");
+        "draft_n] per request (rows_per_request >= 1 + drafts; the rows "
+        "past a narrower write are zeroed)");
   spec_next_tokens_batched_kernel<<<requests, 32, 0, stream>>>(next, drafts, rows_per_request,
                                                                tokens, request_map);
   DGPP_CUDA_OK(cudaGetLastError());

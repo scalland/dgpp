@@ -38,8 +38,13 @@ venv/
 benchmarks/*
 !benchmarks/micro/
 benchmarks/micro/*
+!benchmarks/micro/minimax_index_bench.cpp
+!benchmarks/micro/minimax_head_bench.cpp
 !benchmarks/micro/qsa_fp8_bench.cu
 !benchmarks/micro/host_penalties_bench.cpp
+!benchmarks/micro/minimax_moe_bench.cpp
+!benchmarks/micro/mxfp8_gemm_bench.cu
+!benchmarks/micro/dsa_attn_tile_bench.cu
 
 # --- Debug residue ---------------------------------------------------------------
 
@@ -121,3 +126,6 @@ flint_tp_fixture/
 flint_engine_fixture/
 flint_engine_cap_fixture/
 flint_decode_fixture/
+
+# The Inkling 2 tests write these fixtures into their working directory
+inkling2_*_fixture/

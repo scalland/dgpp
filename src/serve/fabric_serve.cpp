@@ -179,7 +179,7 @@ std::string encode_journal_tick(const GenerationService::PassEvents& events) {
         append_json_string(&out, r.cache_key);
       }
       if (!r.images.empty()) {
-        validate_image_inputs(r.images, r.prompt.size());
+        validate_image_inputs(r.images, r.prompt.size(), true);
         out += ",\"images\":[";
         for (size_t j = 0; j < r.images.size(); ++j) {
           const auto& im = r.images[j];
@@ -195,6 +195,24 @@ std::string encode_journal_tick(const GenerationService::PassEvents& events) {
           out += ',';
           append_json_int(&out, im.grid);
           out += ',';
+          // A padded canvas names its content region. An image without one
+          // keeps the entry it always had.
+          if (im.valid_width > 0) {
+            out += '[';
+            append_json_int(&out, im.valid_width);
+            out += ',';
+            append_json_int(&out, im.valid_height);
+            out += "],";
+          }
+          if (im.is_video()) {
+            append_json_int(&out, im.frames);
+            out += ",[";
+            for (size_t k = 0; k < im.frame_offsets.size(); ++k) {
+              if (k) out += ',';
+              append_json_int(&out, im.frame_offsets[k]);
+            }
+            out += "],";
+          }
           append_json_string(
               &out, encode_base64(std::string_view(reinterpret_cast<const char*>(im.rgb.data()),
                                                    im.rgb.size())));
@@ -424,6 +442,7 @@ std::string encode_journal_warm(const dgpp::sched::AdmissionPolicy& policy,
   if (policy.prefill_early_admission) out += ",\"pfearly\":1";
   if (policy.prefix_min_tokens > 0) out += ",\"pmin\":" + std::to_string(policy.prefix_min_tokens);
   if (policy.prefix_head_snapshots) out += ",\"phead\":1";
+  if (policy.prefix_partial_hits) out += ",\"ppart\":1";
   if (policy.prefix_pin_max_pct != 50) out += ",\"ppin\":" + std::to_string(policy.prefix_pin_max_pct);
   if (!config_digest.empty()) {
     out += ",\"cfg\":";
@@ -442,6 +461,10 @@ std::string encode_journal_settings(const WorldSettings& s) {
   append_json_string(&out, s.model);
   out += ",\"ckpt\":";
   append_json_string(&out, s.checkpoint);
+  if (!s.runtime_adapter_id.empty()) {
+    out += ",\"runtime_adapter_id\":";
+    append_json_string(&out, s.runtime_adapter_id);
+  }
   out += std::format(
       ",\"world\":{},\"fabric\":{},\"conc\":{},\"kv\":{},\"maxtok\":{},\"queue\":{},"
       "\"eos\":{},\"graph\":{},\"mtp\":{},\"mtpd\":{},\"batchmin\":{},\"cand\":{},\"pcgib\":{:.17g},"
@@ -459,6 +482,7 @@ std::string encode_journal_settings(const WorldSettings& s) {
   else if (*s.prefill_early_admission) out += ",\"pfearly\":1";
   if (s.prefix_min_tokens > 0) out += ",\"pmin\":" + std::to_string(s.prefix_min_tokens);
   if (s.prefix_head_snapshots) out += ",\"phead\":1";
+  if (s.prefix_partial_hits) out += ",\"ppart\":1";
   if (s.prefix_pin_max_pct != 50) out += ",\"ppin\":" + std::to_string(s.prefix_pin_max_pct);
   out += std::format(",\"win\":{},\"pace\":{:.17g},\"inflight\":{},\"rdv\":{},\"stats\":{:.17g},\"ric\":{},\"kvdt\":",
       s.admission_window, s.bulk_pace_gbps, s.bulk_inflight, s.rendezvous_timeout_ms,
@@ -495,6 +519,8 @@ std::string encode_journal_settings(const WorldSettings& s) {
                      s.prefill_fp8_per_tensor ? 1 : 0);
   out += ",\"pfact\":";
   append_json_string(&out, s.prefill_activations);
+  out += ",\"act\":";
+  append_json_string(&out, s.activations);
   out += ",\"pfattn\":";
   append_json_string(&out, s.prefill_attention);
   out += ",\"dcattn\":";
@@ -569,6 +595,8 @@ std::string encode_journal_settings(const WorldSettings& s) {
   // a missing key to 0; a peer without the key would differ in the digest
   // and refuse the world, as every setting does).
   if (s.mtp_schedule_options > 0) out += std::format(",\"msopt\":{}", s.mtp_schedule_options);
+  // The live-request limit (2026-11-15): absent when 0, like the cap above.
+  if (s.mtp_schedule_max_live > 0) out += std::format(",\"msml\":{}", s.mtp_schedule_max_live);
   out += ",\"mdr\":";
   append_json_string(&out, s.mtp_draft);
   out += std::format(",\"mdt\":{:.17g}", s.mtp_draft_temperature);
@@ -691,6 +719,12 @@ JournalRecord decode_journal_line(std::string_view line) {
   if (op == "settings") {
     rec.settings = true;
     WorldSettings& s = rec.world_settings;
+    if (const auto* adapter = v.find("runtime_adapter_id")) {
+      if (!adapter->is_string() || adapter->as_string().size() != 64 ||
+          adapter->as_string().find_first_not_of("0123456789abcdef") != std::string_view::npos)
+        throw std::runtime_error("journal: invalid runtime_adapter_id");
+      s.runtime_adapter_id = std::string(adapter->as_string());
+    }
     const auto num = [&](const char* key) -> const dgpp::minijson::Value& {
       const dgpp::minijson::Value& f = field(v, key, "settings");
       if (!f.is_number())
@@ -749,6 +783,7 @@ JournalRecord decode_journal_line(std::string_view line) {
       s.prefix_min_tokens = static_cast<int>(pmin->as_int());
     }
     if (v.find("phead")) s.prefix_head_snapshots = flag("phead");
+    if (v.find("ppart")) s.prefix_partial_hits = flag("ppart");
     if (const auto* ppin = v.find("ppin")) {
       if (!ppin->is_number() || ppin->as_int() < 0 || ppin->as_int() > 100)
         throw std::runtime_error("journal: settings record with a bad prefix pin cap");
@@ -824,6 +859,9 @@ JournalRecord decode_journal_line(std::string_view line) {
     if (v.find("pffp8")) s.prefill_fp8_gemm = flag("pffp8");
     if (v.find("pfpt")) s.prefill_fp8_per_tensor = flag("pfpt");  // 2026-10-03: the 27B recipe
     if (const dgpp::minijson::Value* pa = v.find("pfact")) s.prefill_activations = std::string(pa->as_string());
+    if (const dgpp::minijson::Value* a = v.find("act")) s.activations = std::string(a->as_string());
+    if (s.activations != "bf16" && s.activations != "native")
+      throw std::runtime_error("journal: settings record with invalid activation recipe");
     // The prefill attention's arithmetic (2026-10-16): records before it carry none (bf16).
     if (const dgpp::minijson::Value* pt = v.find("pfattn")) s.prefill_attention = std::string(pt->as_string());
     if (const dgpp::minijson::Value* dt = v.find("dcattn")) s.decode_attention = std::string(dt->as_string());
@@ -924,6 +962,8 @@ JournalRecord decode_journal_line(std::string_view line) {
       s.mtp_schedule_min_depth = static_cast<int>(field(v, "msmin", "settings").as_int());
       if (const dgpp::minijson::Value* msopt = v.find("msopt")) s.mtp_schedule_options = static_cast<int>(msopt->as_int());
       else s.mtp_schedule_options = 0;
+      if (const dgpp::minijson::Value* msml = v.find("msml")) s.mtp_schedule_max_live = static_cast<int>(msml->as_int());
+      else s.mtp_schedule_max_live = 0;
       // Records before the adaptive lambda (2026-09-14, later) carry no msad: fixed.
       if (const dgpp::minijson::Value* msad = v.find("msad")) s.mtp_schedule_adapt = msad->as_int() != 0;
       else s.mtp_schedule_adapt = false;
@@ -1017,6 +1057,11 @@ JournalRecord decode_journal_line(std::string_view line) {
           throw std::runtime_error("journal: warm record with a bad head-cut flag");
         rec.admission.prefix_head_snapshots = phead->as_int() == 1;
       }
+      if (const auto* ppart = v.find("ppart")) {
+        if (!ppart->is_number() || (ppart->as_int() != 0 && ppart->as_int() != 1))
+          throw std::runtime_error("journal: warm record with a bad partial-hit flag");
+        rec.admission.prefix_partial_hits = ppart->as_int() == 1;
+      }
       if (const auto* ppin = v.find("ppin")) {
         if (!ppin->is_number() || ppin->as_int() < 0 || ppin->as_int() > 100)
           throw std::runtime_error("journal: warm record with a bad prefix pin cap");
@@ -1105,10 +1150,13 @@ JournalRecord decode_journal_line(std::string_view line) {
           throw std::runtime_error("journal: invalid image list");
         size_t image_bytes = 0;
         for (const auto& entry : images->items()) {
-          if (!entry.is_array() || (entry.items().size() != 5 && entry.items().size() != 6))
+          if (!entry.is_array() || entry.items().size() < 5 || entry.items().size() > 8)
             throw std::runtime_error("journal: invalid image entry");
           const auto& a = entry.items();
-          for (size_t j = 0; j + 1 < a.size(); ++j)
+          // Five fields predate the pixel grid, six carry it, seven add a
+          // still image's content region [width, height], eight are a video.
+          const size_t scalars = a.size() == 8 ? 6 : a.size() == 7 ? 5 : a.size() - 1;
+          for (size_t j = 0; j < scalars; ++j)
             if (!a[j].is_number() || !std::isfinite(a[j].as_double()) || a[j].as_double() < 0 ||
                 a[j].as_double() > INT32_MAX || a[j].as_double() != std::floor(a[j].as_double()))
               throw std::runtime_error("journal: invalid image dimension or span");
@@ -1119,14 +1167,35 @@ JournalRecord decode_journal_line(std::string_view line) {
           im.width = static_cast<int>(a[2].as_int());
           im.height = static_cast<int>(a[3].as_int());
           // A five-field entry predates the per-family pixel grid.
-          im.grid = a.size() == 6 ? static_cast<int>(a[4].as_int()) : 28;
+          im.grid = a.size() >= 6 ? static_cast<int>(a[4].as_int()) : 28;
+          if (a.size() == 7) {
+            if (!a[5].is_array() || a[5].items().size() != 2)
+              throw std::runtime_error("journal: invalid image content region");
+            for (const auto& side : a[5].items())
+              if (side.kind() != minijson::Value::Kind::Int || side.as_int() < 1 ||
+                  side.as_int() > INT32_MAX)
+                throw std::runtime_error("journal: invalid image content region");
+            im.valid_width = static_cast<int>(a[5].items()[0].as_int());
+            im.valid_height = static_cast<int>(a[5].items()[1].as_int());
+          }
+          if (a.size() == 8) {
+            im.frames = static_cast<int>(a[5].as_int());
+            if (!a[6].is_array() || a[6].items().size() > 4)
+              throw std::runtime_error("journal: invalid video spans");
+            for (const auto& at : a[6].items()) {
+              if (at.kind() != minijson::Value::Kind::Int || at.as_int() < 0 ||
+                  at.as_int() > INT32_MAX)
+                throw std::runtime_error("journal: invalid video span offset");
+              im.frame_offsets.push_back(at.as_int());
+            }
+          }
           const auto bytes =
               decode_base64(a.back().as_string(), kMaxRequestImageBytes - image_bytes);
           image_bytes += bytes.size();
           im.rgb.assign(bytes.begin(), bytes.end());
           r.images.push_back(std::move(im));
         }
-        validate_image_inputs(r.images, r.prompt.size());
+        validate_image_inputs(r.images, r.prompt.size(), true);
       }
       if (const dgpp::minijson::Value* lb = item.find("lb")) {
         if (!lb->is_array())
@@ -1421,6 +1490,20 @@ void JournalWriter::broadcast(const std::string& line) {
   }
 }
 
+void JournalWriter::broadcast_payload(const std::string& payload, int timeout_ms) {
+  if (payload.size() > 64u * 1024u * 1024u || timeout_ms <= 0)
+    throw std::invalid_argument("journal: invalid broadcast payload bounds");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  for (auto& peer : peers_) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now())
+                          .count();
+    if (left <= 0 ||
+        !peer.write_all_bounded(payload.data(), payload.size(), static_cast<int>(left)))
+      throw std::runtime_error("journal: binary broadcast failed");
+  }
+}
+
 bool JournalWriter::wait_peers_ready(int timeout_ms, const std::function<bool()>& should_stop,
                                      std::vector<std::pair<int, std::string>>* notes) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -1533,6 +1616,77 @@ JournalReader::JournalReader(const std::string& host, uint16_t port,
   const std::string hello = "hello " + std::to_string(rank) + "\n";
   if (!conn_.write_all(hello.data(), hello.size()))
     throw std::runtime_error("journal: could not send the hello to rank 0");
+}
+
+std::vector<std::pair<int, std::string>> JournalWriter::gather_peer_payloads(size_t max_bytes,
+                                                                             int timeout_ms) {
+  if (max_bytes == 0 || max_bytes > 128u * 1024u * 1024u || timeout_ms <= 0)
+    throw std::invalid_argument("journal: invalid binary gather bounds");
+  for (const auto& pending : peer_pending_)
+    if (!pending.empty()) throw std::logic_error("journal: binary phase has pending line data");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  std::vector<std::pair<int, std::string>> out;
+  for (size_t i = 0; i < peers_.size(); ++i) {
+    auto read = [&](char* dst, size_t size) {
+      while (size) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        if (left <= 0 || !peers_[i].wait_readable(static_cast<int>(left)))
+          throw std::runtime_error("journal: binary reply deadline on rank " +
+                                   std::to_string(peer_ranks_[i]));
+        const int got = peers_[i].read_some(dst, std::min<size_t>(size, 65536));
+        if (got <= 0)
+          throw std::runtime_error("journal: truncated binary reply on rank " +
+                                   std::to_string(peer_ranks_[i]));
+        dst += got;
+        size -= got;
+      }
+    };
+    unsigned char length[4];
+    read(reinterpret_cast<char*>(length), sizeof(length));
+    const uint32_t bytes = uint32_t{length[0]} | (uint32_t{length[1]} << 8) |
+                           (uint32_t{length[2]} << 16) | (uint32_t{length[3]} << 24);
+    if (bytes > max_bytes) throw std::runtime_error("journal: binary reply exceeds budget");
+    std::string payload(bytes, '\0');
+    read(payload.data(), payload.size());
+    out.emplace_back(peer_ranks_[i], std::move(payload));
+  }
+  std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+  return out;
+}
+
+bool JournalReader::send_payload(const std::string& payload, int timeout_ms) {
+  if (payload.size() > 128u * 1024u * 1024u || timeout_ms <= 0)
+    throw std::invalid_argument("journal: invalid binary reply bounds");
+  const auto n = static_cast<uint32_t>(payload.size());
+  const unsigned char length[4] = {
+      static_cast<unsigned char>(n), static_cast<unsigned char>(n >> 8),
+      static_cast<unsigned char>(n >> 16), static_cast<unsigned char>(n >> 24)};
+  conn_.set_io_deadline_ms(timeout_ms);
+  return conn_.write_all(length, sizeof(length)) && conn_.write_all(payload.data(), payload.size());
+}
+
+std::string JournalReader::read_payload(size_t expected_bytes, int timeout_ms) {
+  if (expected_bytes > 64u * 1024u * 1024u || timeout_ms <= 0)
+    throw std::invalid_argument("journal: invalid broadcast payload bounds");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  std::string result(expected_bytes, '\0');
+  size_t copied = std::min(expected_bytes, pending_.size());
+  std::copy_n(pending_.data(), copied, result.data());
+  pending_.erase(0, copied);
+  while (copied < expected_bytes) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now())
+                          .count();
+    if (left <= 0 || !conn_.wait_readable(static_cast<int>(left)))
+      throw std::runtime_error("journal: binary broadcast deadline");
+    const auto got =
+        conn_.read_some(result.data() + copied, std::min<size_t>(65536, expected_bytes - copied));
+    if (got <= 0) throw std::runtime_error("journal: truncated binary broadcast");
+    copied += got;
+  }
+  return result;
 }
 
 void JournalReader::send_ready(const std::string& note) {

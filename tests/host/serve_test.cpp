@@ -115,11 +115,14 @@ class FakeEngine : public SchedulerEngine {
   MtpAcceptance mtp_acceptance() const override { return mtp_counters(mtp_fixture.load()); }
 
   std::atomic<bool> images_available{false};
+  std::atomic<bool> video_available{false};
   std::atomic<int> image_prefills{0};
   bool supports_images() const override { return images_available; }
+  bool supports_video() const override { return video_available; }
   bool supports_image_prefix_cache() const override { return images_available; }
   int32_t prefill_images(int req, const std::vector<int64_t>& prompt, const std::vector<dgpp::ImageInput>& images) override {
-    require(!images.empty() && images[0].rgb.size() == 112 * 112 * 3, "decoded image reaches the engine");
+    require(!images.empty(), "decoded media reaches the engine");
+    dgpp::validate_image_inputs(images, prompt.size(), video_available);
     ++image_prefills;
     return prefill(req, prompt);
   }
@@ -225,8 +228,8 @@ class FakeEngine : public SchedulerEngine {
   int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
                          dgpp::sched::SchedulerEngine::PrefixPrefill* plan) override {
     if (plan->images && !plan->images->empty()) {
-      require(images_available && plan->images->front().rgb.size() == 112 * 112 * 3,
-              "image payload survives cached admission");
+      require(images_available, "image payload survives cached admission");
+      dgpp::validate_image_inputs(*plan->images, prompt.size(), video_available);
       ++image_prefills;
     }
     if (plan->attach_slot >= 0) {
@@ -447,7 +450,9 @@ class FakeFrontend : public ModelFrontend {
   std::function<std::string(const dgpp::minijson::Value&)> render_hook;
   mutable std::atomic<size_t> decoded_ids{0};
   std::atomic<bool> images_available{false};
+  std::atomic<bool> video_available{false};
   bool supports_images() const override { return images_available; }
+  bool supports_video() const override { return video_available; }
   ChatInput prepare_chat(const dgpp::minijson::Value& globals) const override {
     auto input = ModelFrontend::prepare_chat(globals);
     const auto& messages = globals.at("messages").items();
@@ -455,6 +460,13 @@ class FakeFrontend : public ModelFrontend {
       const auto* content = messages[i].find("content");
       if (!content || !content->is_array()) continue;
       for (size_t j = 0; j < content->items().size(); ++j) {
+        if (content->items()[j].find("video_url")) {
+          const int64_t offset = input.tokens.size();
+          input.images.push_back(
+              {offset, 2, 28, 56, std::vector<uint8_t>(28 * 56 * 3 * 2), 28, 2, {offset}});
+          input.tokens.insert(input.tokens.end(), 2, 200026);
+          continue;
+        }
         const auto* image = content->items()[j].find("image_url");
         if (!image) continue;
         auto im = dgpp::serve::prepare_glm_image(*image,
@@ -563,9 +575,16 @@ class FakeFrontend : public ModelFrontend {
   }
   // The prefix cache's boundary token (M7): the byte '|' plays the role
   // marker — a prompt "ab|cd|ef" has boundaries at 2 and 5.
+  // A template without a generation prompt (Inkling 2): '|' is the user's
+  // marker and '^' the one the model opens its own turn with. The service
+  // reads both declarations when it is built, so a test sets the switch
+  // before it builds its rig.
+  static inline std::atomic<bool> model_opens_turn{false};
   std::vector<int64_t> boundary_token_ids() const override {
+    if (model_opens_turn) return {static_cast<int64_t>('|'), static_cast<int64_t>('^')};
     return {static_cast<int64_t>('|')};
   }
+  int64_t self_opened_turn_marker() const override { return model_opens_turn ? static_cast<int64_t>('^') : -1; }
 
  private:
   bool with_markers_;
@@ -4257,6 +4276,75 @@ DGPP_TEST(serve_prefixCache_boundariesAttachOptOutAndMetrics) {
           "metrics: " + met);
 }
 
+// A template that writes no generation prompt: the model opens its turn
+// with its own marker ('^' here), so a prompt has no marker at its end. The
+// cuts then stand one token before every change of speaker and at the last
+// token of a prompt the model answers. The fake arena aligns at 4.
+DGPP_TEST(serve_prefixCache_cutsAtTurnEndsWhenTheModelOpensItsTurn) {
+  struct Switch {
+    Switch() { FakeFrontend::model_opens_turn = true; }
+    ~Switch() { FakeFrontend::model_opens_turn = false; }
+  } on;
+  ServiceRig rig(/*queue_limit=*/8, dgpp::sample::greedy_params(),
+                 /*can_sample=*/false, std::nullopt, /*with_markers=*/false,
+                 /*reasoning_in_content=*/false, dgpp::sched::AdmissionPolicy{},
+                 /*prefix_slots=*/8);
+  const auto post = [&](const std::string& content) {
+    const std::string body = chat_body(content, 3);
+    Client c(rig.port());
+    c.send_all("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\n"
+               "Content-Type: application/json\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body);
+    const std::string resp = c.read_until("usage", 5000) + c.read_available(300);
+    require(resp.find("200 OK") != std::string::npos, "the request answers: " + resp.substr(0, 160));
+    return resp;
+  };
+  const auto ops_since = [&](size_t from) {
+    const std::vector<std::string> ops = rig.engine.prefix_ops();
+    std::string joined;
+    for (size_t i = from; i < ops.size(); ++i) joined += ops[i] + " ";
+    return joined;
+  };
+  const auto has = [](const std::string& joined, const std::string& op) { return joined.find(op) != std::string::npos; };
+
+  // A prompt of nine tokens with no marker past its first: its end, position
+  // 8, is the cut. The first request stores the state there and an
+  // identical one attaches to it.
+  size_t mark = 0;
+  const std::string first = post("|abcdefgh");
+  std::string ops = ops_since(mark);
+  require(has(ops, "N:0:8 ") && !has(ops, "X:"), "a snapshot at the prompt's last token: " + ops);
+  mark = rig.engine.prefix_ops().size();
+  const std::string again = post("|abcdefgh");
+  ops = ops_since(mark);
+  require(has(ops, "X:0:8 "), "the repeated prompt attaches at its last token: " + ops);
+  require(again.find("\"cached_tokens\":8") != std::string::npos, "the usage reports the attach: " + again.substr(0, 600));
+
+  // The next turn: the same nine tokens, the model's answer under its own
+  // marker at 9, the user's marker at 12. Both changes of speaker cut one
+  // token earlier (8 and 11, the latter's aligned image is 8), and the
+  // prompt's end cuts at 16. The turn attaches at 8 and stores 16.
+  mark = rig.engine.prefix_ops().size();
+  post("|abcdefgh^xy|pqrs");
+  ops = ops_since(mark);
+  require(has(ops, "X:0:8 ") && has(ops, "N:0:16 "), "the next turn attaches at the turn's end and stores its own: " + ops);
+
+  // A marker that continues the same speaker cuts at itself: '|' at 4
+  // after '|' at 0. The deepest cut is still the prompt's end, 12.
+  mark = rig.engine.prefix_ops().size();
+  post("|xyz|uvwxyzab");
+  ops = ops_since(mark);
+  require(has(ops, "N:0:12 "), "the end of a prompt with two parts of one speaker: " + ops);
+
+  // A prompt that ends inside the model's own block is continued, not
+  // answered: no cut at its end. The change of speaker at 8 cuts at 7,
+  // whose aligned image is 4.
+  mark = rig.engine.prefix_ops().size();
+  post("|mnopqrs^tuvw");
+  ops = ops_since(mark);
+  require(has(ops, "N:0:4 ") && !has(ops, "N:0:12 "), "a prompt the model continues takes no cut at its end: " + ops);
+}
+
 DGPP_TEST(serve_throughputLog_reports_unfinished_prefill_work) {
   using dgpp::serve::ThroughputLog;
   const auto now = ThroughputLog::Clock::now();
@@ -4390,6 +4478,100 @@ std::string post_legacy(ServiceRig& rig, const std::string& body,
              std::to_string(body.size()) + "\r\n\r\n" + body);
   return c.read_until(until, budget_ms);
 }
+DGPP_TEST(serve_promptLogprobs_rejectsUnsupportedScoringOnBothRoutes) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      for (const std::string value :
+           {"0", "1", "-1", "1.5", "true", "false", "\"0\"", "[]", "{}"}) {
+        const std::string extra =
+            ",\"prompt_logprobs\":" + value + (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, extra)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra + "}";
+        const auto response = chat ? post_chat(rig, body, "unsupported_parameter")
+                                   : post_legacy(rig, body, "unsupported_parameter");
+        expect_invalid_request(response, "prompt_logprobs");
+        require(response.find("\"code\":\"unsupported_parameter\"") != std::string::npos,
+                "prompt scoring is explicitly unsupported, not silently ignored");
+        require(response.find("text/event-stream") == std::string::npos,
+                "reject before starting a stream");
+      }
+    }
+  }
+  require(rig.engine.armed().empty(), "unsupported scoring never reaches generation");
+}
+
+DGPP_TEST(serve_promptLogprobs_nullAndOmissionPreserveGeneratedLogprobs) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      for (bool explicit_null : {false, true}) {
+        const std::string extra = std::string(chat ? ",\"logprobs\":true" : ",\"logprobs\":1") +
+                                  (explicit_null ? ",\"prompt_logprobs\":null" : "") +
+                                  (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, extra)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + extra + "}";
+        const std::string until = stream ? "[DONE]" : "usage";
+        const auto response = chat ? post_chat(rig, body, until) : post_legacy(rig, body, until);
+        require(response.starts_with("HTTP/1.1 200 OK"), "null is omission on both routes");
+        require(response.find(chat ? "\"logprob\":-0.25" : "\"token_logprobs\":[-0.25") !=
+                    std::string::npos,
+                "generated-token logprobs remain available");
+      }
+    }
+  }
+}
+
+DGPP_TEST(serve_parameters_duplicateFieldsRejectBeforeGeneration) {
+  ServiceRig rig(8, model_defaults(), true);
+  for (bool chat : {false, true}) {
+    for (bool stream : {false, true}) {
+      Client client(rig.port());
+      const auto post = [&](const std::string& extra) {
+        const std::string options = extra + (stream ? ",\"stream\":true" : "");
+        const std::string body = chat ? chat_body("abcd", 2, options)
+                                      : "{\"model\":\"" + kModel +
+                                            "\",\"prompt\":\"abcd\",\"max_tokens\":2" + options +
+                                            "}";
+        client.send_all(
+            std::string("POST ") + (chat ? "/v1/chat/completions" : "/v1/completions") +
+            " HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + body);
+        return client.read_response(5000);
+      };
+      const size_t armed = rig.engine.armed().size();
+      const auto admitted = rig.service.stats().requests_total;
+      for (const auto& [extra, param] :
+           {std::pair{R"(,"prompt_logprobs":null,"prompt_logprobs":0)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":0,"prompt_logprobs":null)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":null,"prompt_logprobs":null)", "prompt_logprobs"},
+            std::pair{R"(,"prompt_logprobs":null,"\u0070rompt_logprobs":1)", "prompt_logprobs"},
+            std::pair{R"(,"max_tokens":3)", "max_tokens"},
+            std::pair{R"(,"model":"glm-5.3-flash-fp8")", "model"},
+            std::pair{R"(,"logprobs":null,"logprobs":1)", "logprobs"},
+            std::pair{R"(,"client_extension":null,"client_extension":{})", "client_extension"}}) {
+        const auto response = post(extra);
+        expect_invalid_request(response, param);
+        require(response.find("text/event-stream") == std::string::npos,
+                "duplicate fields never start SSE");
+        if (!chat)
+          require(response.find("\"code\":\"invalid_parameter\"") != std::string::npos,
+                  "legacy duplicate fields use the invalid_parameter code");
+      }
+      require(rig.engine.armed().size() == armed && rig.service.stats().requests_total == admitted,
+              "duplicate fields never reach admission or generation");
+      const auto response =
+          post(std::string(R"(,"prompt_logprobs":null,"logprobs":)") + (chat ? "true" : "1"));
+      require(response.starts_with("HTTP/1.1 200 OK") &&
+                  response.find(chat ? "\"logprob\":-0.25" : "\"token_logprobs\":[-0.25") !=
+                      std::string::npos,
+              "the same connection still serves valid null and generated logprobs after refusals");
+    }
+  }
+}
+
 // A one-shot chat read through the usage object's last key.
 std::string post_full(ServiceRig& rig, const std::string& body) {
   return post_chat(rig, body, "reasoning_tokens\":", 5000);
@@ -5360,6 +5542,31 @@ DGPP_TEST(serve_images_capability_validation_and_streaming) {
   response = post_chat(rig, body("data:image/png;base64,AAAA", false), "invalid_image");
   require(response.find("messages[0].content[1].image_url.url") != std::string::npos,
           "invalid image names the precise field");
+}
+
+DGPP_TEST(serve_video_requires_both_capabilities_and_reaches_the_engine) {
+  ServiceRig rig;
+  const std::string body =
+      R"({"model":"glm-5.3-flash-fp8","max_tokens":1,"messages":[{"role":"user","content":[{"type":"video_url","video_url":{"url":"fixture"}}]}]})";
+  auto response = post_chat(rig, body, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "text frontend refuses video");
+  rig.frontend.video_available = true;
+  response = post_chat(rig, body, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "image-only engine refuses video");
+  rig.engine.images_available = true;
+  rig.engine.video_available = true;
+  response = post_chat(rig, body, "usage");
+  require(response.find("200 OK") != std::string::npos && rig.engine.image_prefills == 1,
+          "video payload reaches prefill");
+  Client models(rig.port());
+  models.send_all("GET /v1/models HTTP/1.1\r\nHost: t\r\n\r\n");
+  require(models.read_available(800).find("\"input_modalities\":[\"text\",\"video\"]") !=
+              std::string::npos,
+          "model capabilities report the effective video modality");
+  auto wrong_role = body;
+  wrong_role.replace(wrong_role.find("user"), 4, "assistant");
+  response = post_chat(rig, wrong_role, "unsupported_content_type");
+  require(response.find("400 Bad Request") != std::string::npos, "video requires a user message");
 }
 
 DGPP_TEST(serve_models_reports_the_active_rope_and_the_effective_limit) {

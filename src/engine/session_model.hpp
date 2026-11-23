@@ -309,6 +309,18 @@ class SessionModel : public PrefillReporting {
   SessionSnapshotMeta session_snapshot_post_row0(int req, void* dst, int spec_row, int rows_after = 1);
   void session_release_snapshot(const SessionSnapshotMeta& meta);
   void session_attach(int req, const void* src, const SessionSnapshotMeta& meta);
+  // Whether a closed slot may open on the first tokens of a snapshot taken
+  // at a later position. A family declares it (shadowing this) when its
+  // snapshot holds nothing but the pool's blocks and the two counters: the
+  // state at a position is then the cache rows before it, wherever they
+  // were written. Recurrent or pooled state, and a draft block that keeps
+  // state of its own, do not truncate.
+  bool attaches_within_snapshot() const { return false; }
+  // Opens closed slot `req` at `position`, inside the snapshot: its whole
+  // blocks by reference, the block the position falls in as the request's
+  // own copy. The draft block's row q embeds token q + 1, so the caller
+  // holds that the request's tokens [0, position] are the snapshot's.
+  void session_attach_within(int req, const SessionSnapshotMeta& meta, int64_t position);
 
   // ---- the graph era --------------------------------------------------------
   const float* device_logits() const { return logits_; }
@@ -1634,6 +1646,50 @@ void SessionModel<D>::session_attach(int req, const void* src, const SessionSnap
   push_position(req);
 }
 
+template <class D>
+void SessionModel<D>::session_attach_within(int req, const SessionSnapshotMeta& meta, int64_t position) {
+  check_req(req, "session_attach_within");
+  if (!derived().attaches_within_snapshot() || !derived().has_pool())
+    throw std::logic_error("session_attach_within: this family's snapshots open at their own position only");
+  if (session_pos_[static_cast<size_t>(req)] != 0)
+    throw std::logic_error("session_attach_within: the slot is open");
+  if (position <= 0 || position >= meta.position || position % snapshot_align_ != 0)
+    throw std::invalid_argument("session_attach_within: the position must sit inside the snapshot");
+  // The snapshot's draft rows reach its position or stop one row short.
+  if (mtp_ && meta.mtp_position < position)
+    throw std::invalid_argument("session_attach_within: the snapshot's draft rows stop before the position");
+  auto& pool = derived().pool();
+  const int64_t n_full = position / block_tokens_;
+  const int64_t snap_full = static_cast<int64_t>(meta.full_blocks.size());
+  if (snap_full != meta.position / block_tokens_)
+    throw std::invalid_argument("session_attach_within: block list does not match the snapshot's position");
+  // The block the position falls in: one of the snapshot's whole blocks,
+  // or its partial block when the position sits past the last of them.
+  int32_t source = -1;
+  if (position % block_tokens_ != 0) {
+    source = n_full < snap_full ? meta.full_blocks[static_cast<size_t>(n_full)] : meta.partial_block;
+    if (source < 0) throw std::invalid_argument("session_attach_within: the snapshot lacks its partial block");
+  }
+  open_slot(req);
+  if (!pool.share_blocks_into(req, meta.full_blocks.data(), n_full, stream_))
+    throw std::runtime_error("session_attach_within: could not share the prefix blocks");
+  if (source >= 0) {
+    if (!pool.ensure_request_blocks(req, position, stream_))
+      throw std::runtime_error("session_attach_within: cache pool exhausted");
+    // Rows past the position in the copy are overwritten before any row
+    // reads them, as a fresh block's are.
+    pool.copy_block_contents(source, pool.request_table_row(req)[n_full], stream_);
+  }
+  if (mtp_) {
+    // Row position - 1 of the draft block embeds the token at `position`,
+    // which the request shares: the draft stands level with the session.
+    mtp_pos_[static_cast<size_t>(req)] = position;
+    push_mtp_position(req);
+  }
+  session_pos_[static_cast<size_t>(req)] = position;
+  push_position(req);
+}
+
 // ---- the graph era ----------------------------------------------------------
 
 template <class D>
@@ -1964,7 +2020,10 @@ template <class D>
 void SessionModel<D>::session_graph_capture_next_tokens(int req,
                                                         const std::vector<const PickVerdict*>& draft_verdicts) {
   check_req(req, "session_graph_capture_next_tokens");
-  if (draft_verdicts.size() == 1) {
+  // One draft into a two-row feed is the fixed depth-1 form. One draft into a
+  // wider feed (the scheduled verify depth's narrow variant) writes the
+  // feed's prefix below.
+  if (draft_verdicts.size() == 1 && (graph_feed_rows_ > 0 ? graph_feed_rows_ : decode_rows_) == 2) {
     session_graph_capture_next_tokens(req, draft_verdicts[0]);
     return;
   }
@@ -1973,9 +2032,12 @@ void SessionModel<D>::session_graph_capture_next_tokens(int req,
   if (draft_verdicts.empty() || draft_verdicts.size() > static_cast<size_t>(kSpecMaxDrafts))
     throw std::invalid_argument("session_graph_capture_next_tokens: draft count");
   // The feed carries every draft of the block whatever the verify's rows.
+  // A replay that drafts fewer (the narrow variant) writes [next, draft_1 ..
+  // draft_m]; the rows past them keep an older step's tokens, which the
+  // engine does not verify (its count of the drafts available).
   const int feed_rows = graph_feed_rows_ > 0 ? graph_feed_rows_ : decode_rows_;
-  if (feed_rows != 1 + static_cast<int>(draft_verdicts.size()))
-    throw std::logic_error("session_graph_capture_next_tokens: the token feed is [next, draft_1 .. draft_n] (T = 1 + n)");
+  if (feed_rows < 1 + static_cast<int>(draft_verdicts.size()))
+    throw std::logic_error("session_graph_capture_next_tokens: the token feed is [next, draft_1 .. draft_n] (T >= 1 + n)");
   GlmSpecDrafts d;
   for (size_t i = 0; i < draft_verdicts.size(); ++i) {
     if (draft_verdicts[i] == nullptr) throw std::invalid_argument("session_graph_capture_next_tokens: null verdict");
@@ -2132,9 +2194,9 @@ void SessionModel<D>::session_graph_capture_next_tokens_batch(const std::vector<
   // The feeds carry every draft of the block whatever the verify's rows
   // (the reduced-depth batch verified a prefix off the compacted copy).
   const int feed_rows = graph_feed_rows_ > 0 ? graph_feed_rows_ : graph_rows_per_request_;
-  if (feed_rows != 1 + static_cast<int>(draft_verdicts.size()))
+  if (feed_rows < 1 + static_cast<int>(draft_verdicts.size()))  // fewer drafts: the narrow variant writes a prefix
     throw std::logic_error(
-        "session_graph_capture_next_tokens_batch: the token feed is [next, draft_1 .. draft_n] per request (T = 1 + n)");
+        "session_graph_capture_next_tokens_batch: the token feed is [next, draft_1 .. draft_n] per request (T >= 1 + n)");
   GlmSpecDrafts d;
   for (size_t i = 0; i < draft_verdicts.size(); ++i) {
     if (draft_verdicts[i] == nullptr)

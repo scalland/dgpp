@@ -7,6 +7,8 @@
 #include <utility>
 
 #include "loaders/minijson.hpp"
+#include "text/inkling_tool_grammar.hpp"
+#include "text/minimax_tool_grammar.hpp"
 #include "text/tokenizer.hpp"
 
 namespace dgpp::text {
@@ -39,9 +41,9 @@ GrammarVocab::GrammarVocab(std::vector<std::string> texts, ChatMarkers markers,
         static_cast<int32_t>(id));
   }
   for (const ChatMarker* m :
-       {&markers_.tool_call_open, &markers_.tool_call_close,
-        &markers_.arg_key_open, &markers_.arg_key_close,
-        &markers_.arg_value_open, &markers_.arg_value_close, &markers_.dsml})
+       {&markers_.tool_call_open, &markers_.tool_call_close, &markers_.arg_key_open,
+        &markers_.arg_key_close, &markers_.arg_value_open, &markers_.arg_value_close,
+        &markers_.dsml, &markers_.minimax_namespace})
     if (m->available()) marker_ids_.push_back(m->id);
   if (call_eos_ < 0 && !eos_.empty()) call_eos_ = eos_[0];
 }
@@ -165,7 +167,7 @@ minijson::Value argument_schema(const minijson::Value& params, const std::string
 
 GrammarTool grammar_tool_from_function(const minijson::Value& def,
                                        std::vector<std::string>* warnings,
-                                       std::vector<std::string>* notes) {
+                                      std::vector<std::string>* notes, bool recursive_xml) {
   GrammarTool tool;
   if (const minijson::Value* name = def.find("name"))
     tool.name = std::string(name->as_string());
@@ -218,6 +220,9 @@ GrammarTool grammar_tool_from_function(const minijson::Value& def,
     arg.key = pm.key;
     const minijson::Value& prop = pm.value;
     const auto contextual = argument_schema(*params, pm.key);
+    // Recursive XML cannot recover types from JSON spelling. Keep the full
+    // schema even for raw strings/enums; it rides the existing schema field.
+    if (recursive_xml) arg.schema = json_text_of(contextual);
     const std::string path = "parameters.properties." + pm.key;
     if (!prop.is_object()) {
       if (strict) throw std::invalid_argument(path + ": must be a schema object");
@@ -293,6 +298,14 @@ GrammarState::GrammarState(const GrammarVocab* vocab, GrammarSpec spec,
                            bool prompt_opens_thinking, bool model_may_open_thinking)
     : vocab_(vocab), spec_(std::move(spec)) {
   if (!spec_.active()) return;
+  if (vocab_ != nullptr && vocab_->markers().tool_format() == ToolFormat::kInkling) {
+    // The reply is typed blocks from its first id: one grammar for the tool
+    // modes and the JSON modes alike.
+    if (vocab_->eos_ids().empty())
+      throw std::invalid_argument("GrammarState: an active grammar needs a vocabulary with an EOS id");
+    inkling_ = std::make_shared<InklingToolGrammar>(vocab_, spec_);
+    return;
+  }
   think_openable_ = model_may_open_thinking && !prompt_opens_thinking && vocab_ != nullptr &&
                     vocab_->markers().think_open.available() && vocab_->markers().think_close.available();
   if (spec_.has_json()) {
@@ -358,9 +371,10 @@ GrammarState::GrammarState(const GrammarVocab* vocab, GrammarSpec spec,
           compile_json_schema(parsed.root, &unenforced));
     }
   }
-  state_ = prompt_opens_thinking && vocab_->markers().think_close.available()
-               ? State::kThink
-               : State::kTop;
+  state_ = prompt_opens_thinking && vocab_->markers().think_close.available() ? State::kThink
+                                                                              : State::kTop;
+  if (vocab_->markers().tool_format() == ToolFormat::kMiniMax)
+    minimax_ = std::make_shared<MiniMaxToolGrammar>(vocab_, spec_);
 }
 
 const GrammarArg* GrammarState::current_arg() const {
@@ -372,6 +386,8 @@ const GrammarArg* GrammarState::current_arg() const {
 
 const char* GrammarState::state_name() const {
   if (!active()) return dead_ ? "dead" : "inactive";
+  if (inkling_) return inkling_->state_name();
+  if (minimax_ && state_ == State::kTop) return minimax_->state_name();
   switch (state_) {
     case State::kThink: return "think";
     case State::kTop: return "top";
@@ -625,7 +641,6 @@ void GrammarState::compact_xml_mask(TokenMask* out) const {
 bool GrammarState::qwen() const {
   return vocab_ != nullptr && vocab_->markers().tool_format() == ToolFormat::kQwenXml;
 }
-
 
 bool GrammarState::dsml() const {
   return vocab_ != nullptr && vocab_->markers().tool_format() == ToolFormat::kDsml;
@@ -935,6 +950,10 @@ void GrammarState::list_mask(TokenMask* out,
 void GrammarState::mask(TokenMask* out) const {
   out->allowed = 0;
   if (!active()) return;
+  if (inkling_) {
+    inkling_->mask(out);
+    return;
+  }
   if (compact_xml_text_state()) {
     compact_xml_mask(out);
     return;
@@ -946,14 +965,28 @@ void GrammarState::mask(TokenMask* out) const {
     settled.think_openable_ = false;
     settled.mask(out);
     if (out->allowed == 0) return;  // unconstrained already
-    const int64_t id = m.think_open.id;
-    if (id >= 0 && id < vocab_->vocab_size()) {
+    for (const int64_t id :
+         {m.think_open.id, m.minimax_namespace.available() ? m.think_close.id : -1}) {
+      if (id < 0 || id >= vocab_->vocab_size()) continue;
       uint32_t& w = out->words[static_cast<size_t>(id >> 5)];
       const uint32_t bit = 1u << (id & 31);
       if (!(w & bit)) {
         w |= bit;
         ++out->allowed;
       }
+    }
+    return;
+  }
+  if (minimax_ && state_ == State::kTop) {
+    minimax_->mask(out);
+    if (spec_.mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started()) {
+      TokenMask json;
+      json_mask(json_, -1, &json);
+      for (int id = 0; id < out->vocab; ++id)
+        if (json.allows(id) && !out->allows(id)) {
+          out->words[id >> 5] |= 1u << (id & 31);
+          ++out->allowed;
+        }
     }
     return;
   }
@@ -1220,6 +1253,7 @@ bool GrammarState::keys_possible_for(const std::string& name) const {
 
 bool GrammarState::allows(int64_t id) const {
   if (!active()) return true;
+  if (inkling_) return inkling_->allows(id);
   if (compact_xml_text_state()) {
     TokenMask m;
     mask(&m);
@@ -1227,9 +1261,16 @@ bool GrammarState::allows(int64_t id) const {
   }
   if (think_openable_) {
     if (id == vocab_->markers().think_open.id) return true;
+    if (vocab_->markers().minimax_namespace.available() && id == vocab_->markers().think_close.id)
+      return true;
     GrammarState settled = *this;
     settled.think_openable_ = false;
     return settled.allows(id);
+  }
+  if (minimax_ && state_ == State::kTop) {
+    if (minimax_->allows(id)) return true;
+    return spec_.mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started() &&
+           json_allows(json_, -1, id);
   }
   if (state_ == State::kJsonBody) return json_allows(json_, -1, id);
   if (state_ == State::kValue) {
@@ -1269,6 +1310,13 @@ void GrammarState::advance(int64_t id) {
     dead_ = true;
     return;
   }
+  if (inkling_) {
+    if (inkling_.use_count() != 1) inkling_ = std::make_shared<InklingToolGrammar>(*inkling_);
+    inkling_->advance(id);
+    calls_ = inkling_->calls();
+    if (inkling_->done()) state_ = State::kDone;
+    return;
+  }
   if (compact_xml_text_state()) {
     if (!compact_xml_text(vocab_->text(id))) dead_ = true;
     return;
@@ -1282,6 +1330,21 @@ void GrammarState::advance(int64_t id) {
       enter(State::kThink);
       return;
     }
+    if (m.minimax_namespace.available() && id == m.think_close.id) return;
+  }
+  if (minimax_ && state_ == State::kTop) {
+    if (spec_.mode == GrammarSpec::Mode::kJsonOrTools && !minimax_->started() &&
+        !minimax_->allows(id)) {
+      state_ = State::kJsonBody;
+      for (unsigned char byte : vocab_->text(id))
+        if (!json_.feed(byte)) dead_ = true;
+      return;
+    }
+    if (!minimax_.unique()) minimax_ = std::make_shared<MiniMaxToolGrammar>(*minimax_);
+    minimax_->advance(id);
+    calls_ = minimax_->calls();
+    if (vocab_->is_eos(id)) state_ = State::kDone;
+    return;
   }
   const auto after_call = [&] {
     ++calls_;

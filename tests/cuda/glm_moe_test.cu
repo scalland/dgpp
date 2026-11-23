@@ -1719,6 +1719,8 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path) {
     dgpp::MoeTraceStaging trace{pin_ids, pin_w, pin_b};
     layer.enqueue_decode(c.d_hidden, c.d_out, cs.M, &trace, nullptr);
     DGPP_CUDA_OK(cudaDeviceSynchronize());
+    // (two rows or more: the shared expert in its own launches, GlmMoeConfig::shared_run_lane)
+    require(layer.decode_shared_lane(cs.M) == (cs.M >= 2), "the shared expert's lane takes two rows or more");
     std::vector<uint16_t> fused(host.size(), 0x7F7F);
     std::memcpy(fused.data(), c.d_out, fused.size() * 2);
     require(std::memcmp(host.data(), fused.data(), host.size() * 2) == 0,
@@ -1995,6 +1997,12 @@ DGPP_TEST(moe_grouped_mma_fp4_mx_matches_the_oracle_per_segment) {
                                           d_views, 0, d_split, I, I, H, nullptr, nullptr, 32);
     DGPP_CUDA_OK(cudaDeviceSynchronize());
     require(std::memcmp(d_grouped, d_split, gate_bytes) == 0, "mx gate output bitwise under the z split");
+    dgpp::launch_moe_grouped_mma_fp4_bf16(c.d_hidden, H, d_segs, static_cast<int>(segs.size()), 245,
+                                          0, d_views, 0, d_split, I, I, H, nullptr, nullptr, 32,
+                                          16);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    require(std::memcmp(d_grouped, d_split, gate_bytes) == 0,
+            "mx gate output bitwise with a 16-row activation ring");
     double worst = 0;
     for (const dgpp::MoeSegment& sg : segs) {
       const int m = sg.expert * 3 + 0;
@@ -2053,6 +2061,13 @@ DGPP_TEST(moe_grouped_mma_fp4_mx_matches_the_oracle_per_segment) {
     }
     std::printf("[ .. ] mx fp4 ldm down I=%d: worst relative error vs the oracle %.3e (fp32 out)\n", I, worst_down);
     require(worst_down < 1e-4, "mx down within the fp32 accumulation of the oracle");
+    const std::vector<float> down64(d_down, d_down + static_cast<size_t>(kRows) * H);
+    DGPP_CUDA_OK(cudaMemset(d_down, 0xA5, down64.size() * sizeof(float)));
+    dgpp::launch_moe_grouped_mma_fp4_f32(d_act, I, d_segs, static_cast<int>(segs.size()), 245, 0,
+                                         d_views, 2, d_down, H, H, I, nullptr, nullptr, 32, 16);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    require(std::memcmp(d_down, down64.data(), down64.size() * sizeof(float)) == 0,
+            "mx down output bitwise with a 16-row activation ring");
     cudaFree(d_act); cudaFree(d_down); cudaFree(d_grouped); cudaFree(d_split); cudaFree(d_segs); cudaFree(d_views);
   }
 }
@@ -2066,151 +2081,154 @@ DGPP_TEST(moe_grouped_mma_fp4_is_bitwise_the_dense_form_per_segment) {
   // fill) and k = 320. Every element bitwise the dense form's per segment,
   // whether one block walks a segment's m-tiles or a z split spreads them.
   constexpr int kRows = 400;
-  for (const int I : {208, 320}) {
-    SmallCase c = make_small_case(/*E=*/6, /*H=*/4096, /*I=*/I, /*K=*/2,
-                                  /*tokens=*/kRows, 0x6F4 + I, /*nvfp4=*/true);
-    c.alloc();
-    const int H = c.cfg.hidden, E = c.cfg.n_experts;
-    const int lens[] = {1, 5, 4, 130, 13, 2, 245};
-    std::vector<dgpp::MoeSegment> segs;
-    int row0 = 0;
-    for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); ++i) {
-      segs.push_back(dgpp::MoeSegment{row0, lens[i], static_cast<int>(i % E)});
-      row0 += lens[i];
-    }
-    require(row0 == kRows, "segments cover the rows");
-    dgpp::MoeSegment* d_segs = nullptr;
-    dgpp::MoeExpertView* d_views = nullptr;
-    DGPP_CUDA_OK(cudaMallocManaged(&d_segs, segs.size() * sizeof(dgpp::MoeSegment)));
-    std::memcpy(d_segs, segs.data(), segs.size() * sizeof(dgpp::MoeSegment));
-    DGPP_CUDA_OK(cudaMallocManaged(&d_views, E * 3 * sizeof(dgpp::MoeExpertView)));
-    for (int m = 0; m < E * 3; ++m) d_views[m] = dgpp::MoeExpertView::of(c.expert_mats_fp4[m]);
-    uint16_t *d_grouped = nullptr, *d_split = nullptr, *d_ref = nullptr;
-    const size_t gate_bytes = static_cast<size_t>(kRows) * I * 2;
-    DGPP_CUDA_OK(cudaMallocManaged(&d_grouped, gate_bytes));
-    DGPP_CUDA_OK(cudaMallocManaged(&d_split, gate_bytes));
-    DGPP_CUDA_OK(cudaMallocManaged(&d_ref, gate_bytes));
-    DGPP_CUDA_OK(cudaMemset(d_grouped, 0xA5, gate_bytes));
-    DGPP_CUDA_OK(cudaMemset(d_split, 0xA5, gate_bytes));
-    DGPP_CUDA_OK(cudaMemset(d_ref, 0x5A, gate_bytes));
-    dgpp::launch_moe_grouped_mma_fp4_bf16(c.d_hidden, H, d_segs, static_cast<int>(segs.size()),
-                                          245, /*rows_per_block=*/0, d_views, 0, d_grouped,
-                                          I, I, H, nullptr);
-    dgpp::launch_moe_grouped_mma_fp4_bf16(c.d_hidden, H, d_segs, static_cast<int>(segs.size()),
-                                          245, /*rows_per_block=*/128, d_views, 0, d_split,
-                                          I, I, H, nullptr);
-    for (const dgpp::MoeSegment& sg : segs)
-      dgpp::launch_dense_mma_fp4_bf16(c.d_hidden + static_cast<size_t>(sg.row0) * H, H,
-                                      c.expert_mats_fp4[sg.expert * 3 + 0],
-                                      d_ref + static_cast<size_t>(sg.row0) * I, sg.rows, I,
-                                      H, nullptr);
-    DGPP_CUDA_OK(cudaDeviceSynchronize());
-    require(std::memcmp(d_grouped, d_ref, gate_bytes) == 0,
-            ("fp4 grouped mma gate output bitwise the dense form per segment (I=" +
-             std::to_string(I) + ")").c_str());
-    require(std::memcmp(d_split, d_ref, gate_bytes) == 0,
-            "fp4 grouped mma gate output bitwise under the z split");
-    // The gathered form: the same rows through a row map (the prefill's
-    // path reads the hidden rows through d_rows_ instead of a gather).
-    {
-      int32_t* d_rows = nullptr;
-      DGPP_CUDA_OK(cudaMallocManaged(&d_rows, static_cast<size_t>(kRows) * 4));
-      for (int i = 0; i < kRows; ++i) d_rows[i] = (i * 7) % kRows;  // a permutation (gcd(7,400)=1)
-      uint16_t *d_map = nullptr, *d_map_ref = nullptr;
-      DGPP_CUDA_OK(cudaMallocManaged(&d_map, gate_bytes));
-      DGPP_CUDA_OK(cudaMallocManaged(&d_map_ref, gate_bytes));
-      DGPP_CUDA_OK(cudaMemset(d_map, 0xA5, gate_bytes));
-      DGPP_CUDA_OK(cudaMemset(d_map_ref, 0x5A, gate_bytes));
-      dgpp::launch_moe_grouped_mma_fp4_bf16(c.d_hidden, H, d_segs,
-                                            static_cast<int>(segs.size()), 245, 0, d_views,
-                                            0, d_map, I, I, H, nullptr, d_rows);
-      // The reference: the permuted rows gathered by hand, then the dense form.
-      uint16_t* d_gathered = nullptr;
-      DGPP_CUDA_OK(cudaMallocManaged(&d_gathered, static_cast<size_t>(kRows) * H * 2));
-      for (int i = 0; i < kRows; ++i)
-        std::memcpy(d_gathered + static_cast<size_t>(i) * H,
-                    c.d_hidden + static_cast<size_t>(d_rows[i]) * H, static_cast<size_t>(H) * 2);
+  for (const int tile_rows : {16, 64}) {
+    for (const int I : {208, 320}) {
+      SmallCase c = make_small_case(/*E=*/6, /*H=*/4096, /*I=*/I, /*K=*/2,
+                                    /*tokens=*/kRows, 0x6F4 + I, /*nvfp4=*/true);
+      c.alloc();
+      const int H = c.cfg.hidden, E = c.cfg.n_experts;
+      const int lens[] = {1, 5, 4, 130, 13, 2, 245};
+      std::vector<dgpp::MoeSegment> segs;
+      int row0 = 0;
+      for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); ++i) {
+        segs.push_back(dgpp::MoeSegment{row0, lens[i], static_cast<int>(i % E)});
+        row0 += lens[i];
+      }
+      require(row0 == kRows, "segments cover the rows");
+      dgpp::MoeSegment* d_segs = nullptr;
+      dgpp::MoeExpertView* d_views = nullptr;
+      DGPP_CUDA_OK(cudaMallocManaged(&d_segs, segs.size() * sizeof(dgpp::MoeSegment)));
+      std::memcpy(d_segs, segs.data(), segs.size() * sizeof(dgpp::MoeSegment));
+      DGPP_CUDA_OK(cudaMallocManaged(&d_views, E * 3 * sizeof(dgpp::MoeExpertView)));
+      for (int m = 0; m < E * 3; ++m) d_views[m] = dgpp::MoeExpertView::of(c.expert_mats_fp4[m]);
+      uint16_t *d_grouped = nullptr, *d_split = nullptr, *d_ref = nullptr;
+      const size_t gate_bytes = static_cast<size_t>(kRows) * I * 2;
+      DGPP_CUDA_OK(cudaMallocManaged(&d_grouped, gate_bytes));
+      DGPP_CUDA_OK(cudaMallocManaged(&d_split, gate_bytes));
+      DGPP_CUDA_OK(cudaMallocManaged(&d_ref, gate_bytes));
+      DGPP_CUDA_OK(cudaMemset(d_grouped, 0xA5, gate_bytes));
+      DGPP_CUDA_OK(cudaMemset(d_split, 0xA5, gate_bytes));
+      DGPP_CUDA_OK(cudaMemset(d_ref, 0x5A, gate_bytes));
+      dgpp::launch_moe_grouped_mma_fp4_bf16(c.d_hidden, H, d_segs, static_cast<int>(segs.size()),
+                                            245, /*rows_per_block=*/0, d_views, 0, d_grouped, I, I,
+                                            H, nullptr, nullptr, dgpp::kFp4Group, tile_rows);
+      dgpp::launch_moe_grouped_mma_fp4_bf16(c.d_hidden, H, d_segs, static_cast<int>(segs.size()),
+                                            245, /*rows_per_block=*/128, d_views, 0, d_split, I, I,
+                                            H, nullptr, nullptr, dgpp::kFp4Group, tile_rows);
       for (const dgpp::MoeSegment& sg : segs)
-        dgpp::launch_dense_mma_fp4_bf16(d_gathered + static_cast<size_t>(sg.row0) * H, H,
-                                        c.expert_mats_fp4[sg.expert * 3 + 0],
-                                        d_map_ref + static_cast<size_t>(sg.row0) * I, sg.rows,
-                                        I, H, nullptr);
+        dgpp::launch_dense_mma_fp4_bf16(
+            c.d_hidden + static_cast<size_t>(sg.row0) * H, H, c.expert_mats_fp4[sg.expert * 3 + 0],
+            d_ref + static_cast<size_t>(sg.row0) * I, sg.rows, I, H, nullptr);
       DGPP_CUDA_OK(cudaDeviceSynchronize());
-      require(std::memcmp(d_map, d_map_ref, gate_bytes) == 0,
-              "fp4 grouped mma through the row map bitwise the gathered dense form");
-      cudaFree(d_gathered);
-      cudaFree(d_map);
-      cudaFree(d_map_ref);
-      cudaFree(d_rows);
-    }
-    // The unaligned activation path (rows not 16-byte aligned: the
-    // pipelined kernel's plain-copy fallback beside its cp.async path):
-    // the same rows from a base offset by 4 elements, bitwise the dense
-    // reference over the same offset rows.
-    {
-      uint16_t *d_un = nullptr, *d_un_ref = nullptr;
-      DGPP_CUDA_OK(cudaMallocManaged(&d_un, gate_bytes));
-      DGPP_CUDA_OK(cudaMallocManaged(&d_un_ref, gate_bytes));
-      DGPP_CUDA_OK(cudaMemset(d_un, 0xA5, gate_bytes));
-      DGPP_CUDA_OK(cudaMemset(d_un_ref, 0x5A, gate_bytes));
-      // A padded copy of the rows at an 8-byte offset (not 16-byte aligned;
-      // the offset alone would run the last row past the buffer's end).
-      uint16_t* d_pad = nullptr;
-      const size_t hidden_elems = static_cast<size_t>(kRows) * H;
-      DGPP_CUDA_OK(cudaMallocManaged(&d_pad, (hidden_elems + 16) * 2));
-      std::memcpy(d_pad + 4, c.d_hidden, hidden_elems * 2);
-      const uint16_t* base = d_pad + 4;
-      dgpp::launch_moe_grouped_mma_fp4_bf16(base, H, d_segs, static_cast<int>(segs.size()),
-                                            245, 0, d_views, 0, d_un, I, I, H, nullptr);
+      require(std::memcmp(d_grouped, d_ref, gate_bytes) == 0,
+              ("fp4 grouped mma gate output bitwise the dense form per segment (I=" +
+               std::to_string(I) + ")")
+                  .c_str());
+      require(std::memcmp(d_split, d_ref, gate_bytes) == 0,
+              "fp4 grouped mma gate output bitwise under the z split");
+      // The gathered form: the same rows through a row map (the prefill's
+      // path reads the hidden rows through d_rows_ instead of a gather).
+      {
+        int32_t* d_rows = nullptr;
+        DGPP_CUDA_OK(cudaMallocManaged(&d_rows, static_cast<size_t>(kRows) * 4));
+        for (int i = 0; i < kRows; ++i)
+          d_rows[i] = (i * 7) % kRows;  // a permutation (gcd(7,400)=1)
+        uint16_t *d_map = nullptr, *d_map_ref = nullptr;
+        DGPP_CUDA_OK(cudaMallocManaged(&d_map, gate_bytes));
+        DGPP_CUDA_OK(cudaMallocManaged(&d_map_ref, gate_bytes));
+        DGPP_CUDA_OK(cudaMemset(d_map, 0xA5, gate_bytes));
+        DGPP_CUDA_OK(cudaMemset(d_map_ref, 0x5A, gate_bytes));
+        dgpp::launch_moe_grouped_mma_fp4_bf16(c.d_hidden, H, d_segs, static_cast<int>(segs.size()),
+                                              245, 0, d_views, 0, d_map, I, I, H, nullptr, d_rows,
+                                              dgpp::kFp4Group, tile_rows);
+        // The reference: the permuted rows gathered by hand, then the dense form.
+        uint16_t* d_gathered = nullptr;
+        DGPP_CUDA_OK(cudaMallocManaged(&d_gathered, static_cast<size_t>(kRows) * H * 2));
+        for (int i = 0; i < kRows; ++i)
+          std::memcpy(d_gathered + static_cast<size_t>(i) * H,
+                      c.d_hidden + static_cast<size_t>(d_rows[i]) * H, static_cast<size_t>(H) * 2);
+        for (const dgpp::MoeSegment& sg : segs)
+          dgpp::launch_dense_mma_fp4_bf16(d_gathered + static_cast<size_t>(sg.row0) * H, H,
+                                          c.expert_mats_fp4[sg.expert * 3 + 0],
+                                          d_map_ref + static_cast<size_t>(sg.row0) * I, sg.rows, I,
+                                          H, nullptr);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        require(std::memcmp(d_map, d_map_ref, gate_bytes) == 0,
+                "fp4 grouped mma through the row map bitwise the gathered dense form");
+        cudaFree(d_gathered);
+        cudaFree(d_map);
+        cudaFree(d_map_ref);
+        cudaFree(d_rows);
+      }
+      // The unaligned activation path (rows not 16-byte aligned: the
+      // pipelined kernel's plain-copy fallback beside its cp.async path):
+      // the same rows from a base offset by 4 elements, bitwise the dense
+      // reference over the same offset rows.
+      {
+        uint16_t *d_un = nullptr, *d_un_ref = nullptr;
+        DGPP_CUDA_OK(cudaMallocManaged(&d_un, gate_bytes));
+        DGPP_CUDA_OK(cudaMallocManaged(&d_un_ref, gate_bytes));
+        DGPP_CUDA_OK(cudaMemset(d_un, 0xA5, gate_bytes));
+        DGPP_CUDA_OK(cudaMemset(d_un_ref, 0x5A, gate_bytes));
+        // A padded copy of the rows at an 8-byte offset (not 16-byte aligned;
+        // the offset alone would run the last row past the buffer's end).
+        uint16_t* d_pad = nullptr;
+        const size_t hidden_elems = static_cast<size_t>(kRows) * H;
+        DGPP_CUDA_OK(cudaMallocManaged(&d_pad, (hidden_elems + 16) * 2));
+        std::memcpy(d_pad + 4, c.d_hidden, hidden_elems * 2);
+        const uint16_t* base = d_pad + 4;
+        dgpp::launch_moe_grouped_mma_fp4_bf16(base, H, d_segs, static_cast<int>(segs.size()), 245,
+                                              0, d_views, 0, d_un, I, I, H, nullptr, nullptr,
+                                              dgpp::kFp4Group, tile_rows);
+        for (const dgpp::MoeSegment& sg : segs)
+          dgpp::launch_dense_mma_fp4_bf16(
+              base + static_cast<size_t>(sg.row0) * H, H, c.expert_mats_fp4[sg.expert * 3 + 0],
+              d_un_ref + static_cast<size_t>(sg.row0) * I, sg.rows, I, H, nullptr);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        require(std::memcmp(d_un, d_un_ref, gate_bytes) == 0,
+                "fp4 grouped mma over unaligned activation rows bitwise the dense form");
+        // And the same values as the aligned launch: the fallback path is
+        // the cp.async path's twin.
+        require(std::memcmp(d_un, d_grouped, gate_bytes) == 0,
+                "fp4 grouped mma: unaligned rows bitwise the aligned launch");
+        cudaFree(d_pad);
+        cudaFree(d_un);
+        cudaFree(d_un_ref);
+      }
+      // down: fp32 out, k = I (208: a ragged last stage; 320: five whole).
+      const size_t down_bytes = static_cast<size_t>(kRows) * H * 4;
+      float *d_gd = nullptr, *d_rd = nullptr;
+      DGPP_CUDA_OK(cudaMallocManaged(&d_gd, down_bytes));
+      DGPP_CUDA_OK(cudaMallocManaged(&d_rd, down_bytes));
+      DGPP_CUDA_OK(cudaMemset(d_gd, 0xA5, down_bytes));
+      DGPP_CUDA_OK(cudaMemset(d_rd, 0x5A, down_bytes));
+      dgpp::launch_moe_grouped_mma_fp4_f32(d_grouped, I, d_segs, static_cast<int>(segs.size()), 245,
+                                           /*rows_per_block=*/0, d_views, 2, d_gd, H, H, I, nullptr,
+                                           nullptr, dgpp::kFp4Group, tile_rows);
       for (const dgpp::MoeSegment& sg : segs)
-        dgpp::launch_dense_mma_fp4_bf16(base + static_cast<size_t>(sg.row0) * H, H,
-                                        c.expert_mats_fp4[sg.expert * 3 + 0],
-                                        d_un_ref + static_cast<size_t>(sg.row0) * I, sg.rows,
-                                        I, H, nullptr);
+        dgpp::launch_dense_mma_fp4_f32(
+            d_grouped + static_cast<size_t>(sg.row0) * I, I, c.expert_mats_fp4[sg.expert * 3 + 2],
+            d_rd + static_cast<size_t>(sg.row0) * H, sg.rows, H, I, nullptr);
       DGPP_CUDA_OK(cudaDeviceSynchronize());
-      require(std::memcmp(d_un, d_un_ref, gate_bytes) == 0,
-              "fp4 grouped mma over unaligned activation rows bitwise the dense form");
-      // And the same values as the aligned launch: the fallback path is
-      // the cp.async path's twin.
-      require(std::memcmp(d_un, d_grouped, gate_bytes) == 0,
-              "fp4 grouped mma: unaligned rows bitwise the aligned launch");
-      cudaFree(d_pad);
-      cudaFree(d_un);
-      cudaFree(d_un_ref);
+      require(std::memcmp(d_gd, d_rd, down_bytes) == 0,
+              "fp4 grouped mma down output bitwise the dense form per segment (fp32)");
+      // Nothing is NaN or garbage past the ragged edges: every gate element
+      // is finite (the 0xA5 fill would read as a large negative bf16).
+      for (size_t i = 0; i < static_cast<size_t>(kRows) * I; ++i)
+        require(std::isfinite(dgpp::bf16_bits_to_float(d_grouped[i])), "fp4 mma gate finite");
+      std::printf(
+          "[ OK ] fp4 grouped mma I=%d tile=%d: %zu segments (1..245 rows) bitwise the "
+          "dense form, gate bf16 + row map + unaligned rows + down fp32\n",
+          I, tile_rows, segs.size());
+      cudaFree(d_gd);
+      cudaFree(d_rd);
+      cudaFree(d_grouped);
+      cudaFree(d_split);
+      cudaFree(d_ref);
+      cudaFree(d_segs);
+      cudaFree(d_views);
+      c.free_all();
     }
-    // down: fp32 out, k = I (208: a ragged last stage; 320: five whole).
-    const size_t down_bytes = static_cast<size_t>(kRows) * H * 4;
-    float *d_gd = nullptr, *d_rd = nullptr;
-    DGPP_CUDA_OK(cudaMallocManaged(&d_gd, down_bytes));
-    DGPP_CUDA_OK(cudaMallocManaged(&d_rd, down_bytes));
-    DGPP_CUDA_OK(cudaMemset(d_gd, 0xA5, down_bytes));
-    DGPP_CUDA_OK(cudaMemset(d_rd, 0x5A, down_bytes));
-    dgpp::launch_moe_grouped_mma_fp4_f32(d_grouped, I, d_segs, static_cast<int>(segs.size()),
-                                         245, /*rows_per_block=*/0, d_views, 2, d_gd, H, H, I,
-                                         nullptr);
-    for (const dgpp::MoeSegment& sg : segs)
-      dgpp::launch_dense_mma_fp4_f32(d_grouped + static_cast<size_t>(sg.row0) * I, I,
-                                     c.expert_mats_fp4[sg.expert * 3 + 2],
-                                     d_rd + static_cast<size_t>(sg.row0) * H, sg.rows, H, I,
-                                     nullptr);
-    DGPP_CUDA_OK(cudaDeviceSynchronize());
-    require(std::memcmp(d_gd, d_rd, down_bytes) == 0,
-            "fp4 grouped mma down output bitwise the dense form per segment (fp32)");
-    // Nothing is NaN or garbage past the ragged edges: every gate element
-    // is finite (the 0xA5 fill would read as a large negative bf16).
-    for (size_t i = 0; i < static_cast<size_t>(kRows) * I; ++i)
-      require(std::isfinite(dgpp::bf16_bits_to_float(d_grouped[i])), "fp4 mma gate finite");
-    std::printf("[ OK ] fp4 grouped mma I=%d: %zu segments (1..245 rows) bitwise the "
-                "dense form, gate bf16 + row map + unaligned rows + down fp32\n",
-                I, segs.size());
-    cudaFree(d_gd);
-    cudaFree(d_rd);
-    cudaFree(d_grouped);
-    cudaFree(d_split);
-    cudaFree(d_ref);
-    cudaFree(d_segs);
-    cudaFree(d_views);
-    c.free_all();
   }
 }
 
@@ -2634,19 +2652,39 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_mxfp4) {
     std::memcpy(fused.data(), c.d_out, fused.size() * 2);
     require(std::memcmp(gemv_host.data(), fused.data(), host.size() * 2) == 0,
             "mxfp4 decode slot path must be bitwise-identical to the GEMV host path");
-    // The shared expert's slots early in the execution order
-    // (GlmMoeConfig::shared_slots_early, the DeepSeek-V4-Flash decode): the
-    // order alone moves — every row bitwise the default order's, one row
-    // (which launches the order kernel only under this flag) included.
+    // The shared expert's slots run early in the execution order by default
+    // (GlmMoeConfig::shared_slots_early). The order alone moves: every row
+    // is bitwise the expert order's with the shared slots last, one row
+    // (which launches the order kernel only under the early order, and
+    // reads its gate/up weights as streaming lines) included.
     {
-      dgpp::GlmMoeConfig early_cfg = c.cfg;
-      early_cfg.shared_slots_early = true;
-      GlmMoeLayer early(c.dev_w, early_cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M);
+      require(c.cfg.shared_slots_early, "the decode launches run the shared slots early by default");
+      dgpp::GlmMoeConfig late_cfg = c.cfg;
+      late_cfg.shared_slots_early = false;
+      GlmMoeLayer late(c.dev_w, late_cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M);
       DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, host.size() * 2));
-      early.enqueue_decode(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
+      late.enqueue_decode(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
       DGPP_CUDA_OK(cudaDeviceSynchronize());
       require(std::memcmp(c.d_out, fused.data(), host.size() * 2) == 0,
-              "mxfp4 decode: the early shared-slot order must be bitwise the default order");
+              "mxfp4 decode: the early shared-slot order must be bitwise the expert order");
+    }
+    // Two rows or more run the FP8 shared expert in its own launches by
+    // default (GlmMoeConfig::shared_run_lane: runs of up to four rows on a
+    // side stream, the slot kernels left with the routed slots). Every row
+    // is bitwise the slot form's, five rows (a run of three and one of
+    // two) and eighty (twenty runs) included.
+    {
+      require(c.cfg.shared_run_lane, "the decode launches run the shared expert's lane by default");
+      require(layer.decode_shared_lane(cs.M) == (cs.M >= 2), "the shared expert's lane takes two rows or more");
+      dgpp::GlmMoeConfig slot_cfg = c.cfg;
+      slot_cfg.shared_run_lane = false;
+      GlmMoeLayer in_slots(c.dev_w, slot_cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M);
+      require(!in_slots.decode_shared_lane(cs.M), "the lane is off when the family says so");
+      DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, host.size() * 2));
+      in_slots.enqueue_decode(c.d_hidden, c.d_out, cs.M, nullptr, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      require(std::memcmp(c.d_out, fused.data(), host.size() * 2) == 0,
+              "mxfp4 decode: the shared expert's lane must be bitwise the slot form");
     }
     // The prefill path takes the tile kernel's MXFP4 form: bitwise the
     // host path through it (MoeExpertKernel::kMma), within budget of the oracle.

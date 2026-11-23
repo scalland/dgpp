@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <sstream>
@@ -170,8 +171,13 @@ class FakeEngine : public SchedulerEngine {
     info.chunk_tokens = arena_chunk_;
     info.step_tokens_max = step_tokens_max_;
     info.prefill_lookahead = prefill_lookahead_;
+    info.attach_within = attach_within_;
     return info;
   }
+  // The attach inside an entry: the fake then takes an attach position
+  // below the arena slot's own (an engine that does not declare it refuses).
+  void set_attach_within(bool on) { attach_within_ = on; }
+  bool attach_within_ = false;
   // The two-token step's hop (M7): the fake commits whatever its script
   // says per step; an armed hop is taken ("H:req:pos@slot") when the step
   // returns two tokens, at the position the scheduler named, which must be
@@ -197,7 +203,9 @@ class FakeEngine : public SchedulerEngine {
     last_boundaries = *plan->boundaries;
     if (plan->attach_slot >= 0) {
       require(pinned_.count(plan->attach_slot) != 0, "fake: attach from an empty arena slot");
-      require(pinned_positions_[plan->attach_slot] == plan->attach_position,
+      require(pinned_positions_[plan->attach_slot] == plan->attach_position ||
+                  (attach_within_ && plan->attach_position > 0 &&
+                   plan->attach_position < pinned_positions_[plan->attach_slot]),
               "fake: attach position differs from the arena slot's");
       ops_.push_back("X:" + std::to_string(req) + ":" +
                      std::to_string(plan->attach_position) + "@" +
@@ -2887,6 +2895,261 @@ DGPP_TEST(scheduler_prefixCache_twoInterleavedConversationsKeepHittingUnderATigh
   require(m.prefix_evictions > 0, "the arena turned over: " + std::to_string(m.prefix_evictions));
 }
 
+DGPP_TEST(scheduler_prefixCache_cancelledHistoryReusesOnlyMatchingCommittedPrefixes) {
+  const char* scenarios[] = {"full history",  "one undelivered token", "truncated before cut",
+                             "edited answer", "edited prompt",         "changed boundary"};
+  // A normal completion is the control: cancellation after the same nine
+  // tokens should preserve the same eligible prefix, not force a rewind.
+  for (bool cancel : {false, true}) {
+    for (int scenario = 0; scenario < 6; ++scenario) {
+      FakeEngine engine(1, 100, 4);
+      engine.set_prefix_arena(8, 4);
+      std::vector<int32_t> script;
+      for (int i = 0; i < 40; ++i) script.push_back(31 + i);
+      engine.arm(0, script, 40);
+      engine.arm(0, {90}, 1);
+      Scheduler sched(&engine, {kEos});
+      const auto prompt = counted_prompt(21);
+      sched.submit(make_cached_request("first", prompt, {5, 13}, cancel ? 40 : 9));
+      if (cancel) {
+        for (int i = 0; i < 50 && sched.meters().tokens_generated < 9; ++i) sched.tick();
+        require(sched.meters().tokens_generated == 9, "generated exactly nine tokens");
+        require(sched.cancel("first"), "cancel the live request");
+      }
+      sched.run_to_completion();
+      require(sched.results()[0].generated.size() == 9, "matching response lengths");
+      require(sched.results()[0].reason == (cancel ? Scheduler::Result::Reason::kCancelled
+                                                   : Scheduler::Result::Reason::kSteps),
+              "the control completes and the interrupted request cancels");
+      auto delivered = sched.results()[0].generated;
+      if (scenario == 1) delivered.resize(8);
+      if (scenario == 2) delivered.resize(5);
+      auto next = prompt;
+      next.insert(next.end(), delivered.begin(), delivered.end());
+      const int64_t boundary = static_cast<int64_t>(next.size());
+      next.insert(next.end(), {9000, 9001, 9002});
+      if (scenario == 3) next[21] = 7000;
+      if (scenario == 4) next[0] = 7000;
+      const auto before = sched.meters();
+      sched.submit(make_cached_request("next", next, {5, 13, scenario == 5 ? 24 : boundary}, 1));
+      sched.run_to_completion();
+      const auto saved = sched.meters().prefix_tokens_saved - before.prefix_tokens_saved;
+      const int expected = scenario == 4 ? 0 : scenario < 2 ? 28 : 12;
+      require(saved == expected, std::string(cancel ? "cancel: " : "complete: ") +
+                                     scenarios[scenario] + " saved=" + std::to_string(saved));
+    }
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_cancelledSpeculativeBatchRetainsOnlyEligibleCuts) {
+  // A scripted cancel can cut a two-token batch short. Only a snapshot at
+  // a committed position that is also a cut in the new history may attach.
+  const int expected[] = {12, 12, 24, 24, 24, 12, 28};
+  for (int stop = 2; stop <= 8; ++stop) {
+    FakeEngine engine(1, 100, 4);
+    engine.set_prefix_arena(8, 4);
+    engine.set_step_tokens_max(2);
+    engine.arm_batches(0, 31, {{32, 33}, {34, 35}, {36, 37}, {38, 39}}, 20);
+    engine.arm(0, {90}, 1);
+    Scheduler sched(&engine, {kEos});
+    const auto prompt = counted_prompt(21);
+    auto request = make_cached_request("first", prompt, {5, 13}, 20);
+    request.cancel_after = stop;
+    sched.submit(request);
+    sched.run_to_completion();
+    const auto generated = sched.results()[0].generated;
+    require(generated.size() == static_cast<size_t>(stop),
+            "scripted cancellation truncates the batch");
+    auto next = prompt;
+    next.insert(next.end(), generated.begin(), generated.end());
+    const int64_t boundary = static_cast<int64_t>(next.size());
+    next.push_back(9000);
+    const auto before = sched.meters();
+    sched.submit(make_cached_request("next", next, {5, 13, boundary}, 1));
+    sched.run_to_completion();
+    const auto saved = sched.meters().prefix_tokens_saved - before.prefix_tokens_saved;
+    require(saved <= 21 + stop - 1, "never attach beyond the committed response prefix");
+    require(saved == expected[stop - 2], "eligible cut after cancellation at token " +
+                                             std::to_string(stop) +
+                                             ": saved=" + std::to_string(saved));
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_cancelledHistoryReclaimsSharedBlocksUnderPressure) {
+  // Physical block identities matter: the prompt and rolling snapshots
+  // share their first block. Evicting only the prompt entry cannot free it.
+  for (int arena_slots : {1, 2, 3}) {
+    SharedPrefixEngine engine(1, 8, arena_slots);
+    Scheduler sched(&engine, {kEos});
+    for (int round = 0; round < 12; ++round) {
+      const auto prompt = counted_prompt(9, 1000 + round * 100);
+      engine.arm(0, long_script(12), 12);
+      const auto before = sched.meters();
+      sched.submit(make_cached_request("cancel-" + std::to_string(round), prompt, {4}, 12));
+      for (int tick = 0; tick < 20 && sched.meters().tokens_generated < before.tokens_generated + 5;
+           ++tick) {
+        sched.tick();
+        require(engine.pool_blocks_in_use() <= 8, "cancellation fixture stays within the pool");
+      }
+      require(sched.meters().tokens_generated == before.tokens_generated + 5,
+              "cancel after a committed rolling snapshot exists");
+      require(sched.cancel("cancel-" + std::to_string(round)), "cancel the active request");
+      sched.run_to_completion();
+      require(!sched.has_pending() && sched.meters().requests_shed_pool == 0,
+              "old cancelled histories do not shed later requests");
+      require(engine.pool_blocks_in_use() == 3,
+              "only three physical snapshot blocks remain after cancellation");
+      require(sched.meters().prefix_entries <= arena_slots, "arena slots do not leak");
+      require(sched.meters().prefix_misses == before.prefix_misses + 1,
+              "each distinct history starts with a cache miss");
+
+      auto next = prompt;
+      const auto& generated = sched.find("cancel-" + std::to_string(round))->generated;
+      next.insert(next.end(), generated.begin(), generated.end());
+      next.push_back(9000);
+      engine.arm(0, {90}, 1);
+      const auto saved = sched.meters().prefix_tokens_saved;
+      sched.submit(make_cached_request("reuse-" + std::to_string(round), next, {4, 14}, 1));
+      sched.run_to_completion();
+      require(sched.meters().prefix_tokens_saved == saved + 12,
+              "the newest cancelled history remains reusable under pressure");
+      require(engine.pool_blocks_in_use() == 3, "reuse releases its private suffix blocks");
+    }
+    require(sched.meters().prefix_evictions > 0, "the test exercised eviction");
+    if (arena_slots > 1) {
+      require(std::any_of(engine.releases.begin(), engine.releases.end(),
+                          [](const auto& release) { return release.second == 0; }),
+              "eviction includes a shared reference that frees no physical blocks");
+    }
+    // An uncached request reserves the entire pool. All cancelled-history
+    // references must be evictable, including multiple refs to one block.
+    engine.arm(0, {kEos}, 23);
+    auto flush = make_request("full-pool", 9, 23);
+    flush.no_cache = true;
+    sched.submit(flush);
+    sched.run_to_completion();
+    require(sched.find("full-pool")->reason == Scheduler::Result::Reason::kEos,
+            "cache retention does not prevent full-pool admission");
+    require(engine.pool_blocks_in_use() == 0 && sched.meters().prefix_entries == 0,
+            "all retained blocks and arena entries are reclaimed");
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_cancelledHistoryHonorsOptOutAndEntryFloor) {
+  for (bool opt_out : {false, true}) {
+    SharedPrefixEngine engine(1, 8, 2);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefix_min_tokens = opt_out ? 0 : 32;
+    Scheduler sched(&engine, {kEos}, 0, policy);
+    for (int round = 0; round < 12; ++round) {
+      engine.arm(0, long_script(12), 12);
+      auto request =
+          make_cached_request("cancel-" + std::to_string(round), counted_prompt(9), {4}, 12);
+      request.no_cache = opt_out;
+      request.cancel_after = 5;
+      sched.submit(request);
+      sched.run_to_completion();
+      require(sched.find(request.id)->reason == Scheduler::Result::Reason::kCancelled,
+              "request is cancelled rather than shed");
+      require(engine.pool_blocks_in_use() == 0 && sched.meters().prefix_entries == 0 &&
+                  sched.meters().prefix_close_entries == 0,
+              "opted-out or below-floor cancellations retain no blocks or entries");
+    }
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_cancelledHistoryRandomizedReplay) {
+  // Fixed seeds exercise batch cuts, short client delivery, edited histories,
+  // lookahead identity and small arenas. Replay must make identical decisions;
+  // no hit may extend past either the matching ids or the committed prefix.
+  const auto run = [](uint32_t seed) {
+    std::mt19937 rng(seed);
+    const int alignments[] = {1, 4, 8};
+    const int align = alignments[rng() % 3];
+    FakeEngine engine(1, 128, 4);
+    engine.set_prefix_arena(1 + rng() % 4, align, 16);
+    engine.prefill_lookahead_ = rng() % 2;
+    engine.set_step_tokens_max(8);
+    std::vector<std::vector<int32_t>> batches;
+    int token = 1001;
+    while (token < 1080) {
+      std::vector<int32_t> batch;
+      const int count = 1 + rng() % 8;
+      for (int i = 0; i < count; ++i) batch.push_back(token++);
+      batches.push_back(std::move(batch));
+    }
+    engine.arm_batches(0, 1000, batches, 64);
+    engine.arm(0, {90}, 1);
+    Scheduler sched(&engine, {kEos});
+    const auto prompt = counted_prompt(17 + rng() % 65);
+    const int stop = 1 + rng() % 40;
+    const bool external = rng() % 2;
+    auto first = make_cached_request("cancel", prompt, {8, 16}, 64);
+    if (!external) first.cancel_after = stop;
+    sched.submit(first);
+    if (external) {
+      for (int tick = 0; tick < 100 && sched.meters().tokens_generated < stop; ++tick) sched.tick();
+      require(sched.cancel("cancel"), "external cancellation remains live");
+    }
+    sched.run_to_completion();
+    const auto& result = *sched.find("cancel");
+    require(result.reason == Scheduler::Result::Reason::kCancelled, "random cancellation retires");
+    auto history = prompt;
+    history.insert(history.end(), result.generated.begin(), result.generated.end());
+    auto next = history;
+    next.resize(prompt.size() + rng() % (result.generated.size() + 1));
+    const int64_t boundary = static_cast<int64_t>(next.size());
+    if (rng() % 2) next[rng() % next.size()] += 5000;
+    next.insert(next.end(), {9000, 9001, 9002});
+    int64_t common = 0;
+    while (common < static_cast<int64_t>(std::min(history.size(), next.size())) &&
+           history[common] == next[common]) ++common;
+    const auto before = sched.meters().prefix_tokens_saved;
+    sched.submit(make_cached_request("next", next, {8, 16, boundary}, 1));
+    sched.run_to_completion();
+    const auto saved = sched.meters().prefix_tokens_saved - before;
+    require(saved <= common && saved <= static_cast<int64_t>(history.size()) - 1,
+            "a cancelled cache hit stays inside matching committed history, seed " + std::to_string(seed));
+    require(saved % align == 0, "the reused cut is aligned");
+    // An uncached request consumes the entire pool, forcing every retained
+    // entry to relinquish its arena slot and blocks after the replay.
+    engine.arm(0, {kEos}, 128 * 4 - 4);
+    auto flush = make_request("flush", 4, 128 * 4 - 4);
+    flush.no_cache = true;
+    sched.submit(flush);
+    sched.run_to_completion();
+    require(engine.pool_blocks_in_use() == 0 && sched.meters().prefix_entries == 0,
+            "random replay leaves every retained block reclaimable");
+    return std::make_pair(engine.op_stream(), sched.prefix_digest());
+  };
+  for (uint32_t seed = 0; seed < 512; ++seed)
+    require(run(seed) == run(seed), "random cancellation replay agrees across ranks");
+}
+
+DGPP_TEST(scheduler_prefixCache_cancelledSingletonAlignmentStillRequiresAMatchingCut) {
+  for (const int boundary : {28, 30}) {
+    FakeEngine engine(1, 128, 4);
+    engine.set_prefix_arena(4, 1);
+    engine.arm(0, long_script(40), 40);
+    engine.arm(0, {90}, 1);
+    Scheduler sched(&engine, {kEos});
+    const auto prompt = counted_prompt(21);
+    sched.submit(make_cached_request("cancel", prompt, {5, 13}, 40));
+    for (int tick = 0; tick < 20 && sched.meters().tokens_generated < 9; ++tick) sched.tick();
+    require(sched.cancel("cancel"), "cancel after nine generated tokens");
+    sched.run_to_completion();
+    require(sched.meters().prefix_close_entries == 1, "the prior rolling snapshot is retained");
+    auto next = prompt;
+    const auto& generated = sched.find("cancel")->generated;
+    next.insert(next.end(), generated.begin(), generated.end());
+    next.push_back(9000);
+    sched.submit(make_cached_request("next", next, {5, 13, boundary}, 1));
+    sched.run_to_completion();
+    require(sched.meters().prefix_tokens_saved == (boundary == 28 ? 28 : 13),
+            "a boundary after the pending token does not match the older rolling position");
+  }
+}
+
 DGPP_TEST(scheduler_prefixCache_rollingSnapshotBecomesTheCloseEntryTheNextTurnAttachesTo) {
   // GIVEN a 21-token prompt whose answer runs six tokens and ends in EOS:
   // committed positions 21 (after the prefill pick), 22, 23, 24 <- aligned,
@@ -3551,6 +3814,66 @@ void settle(Scheduler& sched, FakeEngine& engine, int max_ticks = 1000) {
   }
   (void)engine;
   throw std::runtime_error("settle: the scheduler did not drain in " + std::to_string(max_ticks) + " ticks");
+}
+
+DGPP_TEST(scheduler_nvmeCache_cancelledSnapshotYieldsToLiveGrowthWithoutASpill) {
+  for (bool disk_enabled : {false, true}) {
+    for (int arena_slots : {1, 2, 3}) {
+      SharedPrefixEngine engine(2, 6, arena_slots);
+      if (disk_enabled) engine.set_disk(100, 1, 0, 100);
+      dgpp::sched::AdmissionPolicy policy;
+      policy.mode = dgpp::sched::AdmissionPolicy::Mode::kGrowOnDemand;
+      policy.window_tokens = 4;
+      Scheduler sched(&engine, {kEos}, 0, policy);
+      engine.arm(0, long_script(20), 20);
+      engine.arm(1, long_script(16), 16);
+      // No prompt cut: the only entry will be the cancelled answer's
+      // rolling snapshot. Its three blocks share the live reservation.
+      sched.submit(make_cached_request("cancel", counted_prompt(9), {}, 20));
+      auto live = make_request("live", 4, 16);
+      live.no_cache = true;
+      sched.submit(live);
+      for (int tick = 0; tick < 20 && sched.meters().prefix_rolling == 0; ++tick) sched.tick();
+      require(sched.meters().prefix_rolling > 0, "cancel with a rolling snapshot");
+      require(sched.cancel("cancel"), "cancel the active request");
+      settle(sched, engine);
+      require(sched.find("cancel")->reason == Scheduler::Result::Reason::kCancelled,
+              "the interrupted request is cancelled");
+      require(sched.find("live")->steps_done == 16 && sched.meters().requests_shed_pool == 0,
+              "cancelled history gives way when the surviving request grows");
+      require(sched.meters().prefix_close_entries == 1 && sched.meters().prefix_evictions == 1,
+              "the cancelled snapshot was retained, then evicted for live work");
+      require(engine.disk_ops_begun() == 0 && sched.disk_ops_pending() == 0,
+              "cancellation must not pin retained blocks for a new spill");
+      require(engine.pool_blocks_in_use() == 0 && sched.meters().prefix_entries == 0,
+              "the shared blocks and arena slot are reclaimed");
+    }
+  }
+}
+
+DGPP_TEST(scheduler_nvmeCache_cancelledSnapshotReusesInMemoryAndCompletionStillSpills) {
+  SharedPrefixEngine engine(1, 32, 3);
+  engine.set_disk(100, 1, 0, 3);
+  Scheduler sched(&engine, {kEos});
+  engine.arm(0, long_script(12), 12);
+  const auto prompt = counted_prompt(9);
+  auto first = make_cached_request("cancel", prompt, {}, 12);
+  first.cancel_after = 5;
+  sched.submit(first);
+  settle(sched, engine);
+  require(sched.meters().prefix_entries == 1 && engine.disk_ops_begun() == 0,
+          "cancellation keeps its eligible snapshot in memory only");
+  auto next = prompt;
+  const auto& generated = sched.find("cancel")->generated;
+  next.insert(next.end(), generated.begin(), generated.end());
+  next.push_back(9000);
+  engine.arm(0, long_script(4), 4);
+  sched.submit(make_cached_request("reuse", next, {14}, 4));
+  settle(sched, engine);
+  require(sched.meters().prefix_tokens_saved == 12,
+          "the cancelled snapshot can still serve the next turn");
+  require(engine.disk_ops_begun() > 0 && sched.meters().disk_spilled > 0,
+          "normal completion still spills its new eligible snapshot");
 }
 
 DGPP_TEST(scheduler_nvmeCache_spillsAnEvictedEntryAndRestoresItForALaterRequest) {
@@ -4258,6 +4581,459 @@ DGPP_TEST(scheduler_prefixCache_headCutThroughChunkedPrefill) {
               std::to_string(m.prefix_head_snapshots) + ": " + engine.op_stream());
 }
 
+// ---- the hit inside an entry (2026-11-13) ----------------------------------------
+namespace {
+// The arena slot of the "X:req:position@slot" attach op, -1 without one.
+int attach_slot_of(const std::string& ops, const std::string& head) {
+  const size_t at = ops.rfind(head);
+  return at == std::string::npos ? -1 : std::stoi(ops.substr(at + head.size()));
+}
+// `first` with every token from `from` on replaced: a prompt that shares
+// exactly `from` tokens with it.
+std::vector<int64_t> parting_at(std::vector<int64_t> prompt, size_t from) {
+  for (size_t i = from; i < prompt.size(); ++i) prompt[i] += 100000;
+  return prompt;
+}
+struct WithinWorld {
+  FakeEngine engine;
+  dgpp::sched::AdmissionPolicy policy;
+  std::unique_ptr<Scheduler> sched;
+  explicit WithinWorld(bool key = true, bool engine_can = true, int64_t align = 1, int64_t blocks = 400)
+      : engine(/*slots=*/1, blocks, /*block_tokens=*/4) {
+    engine.set_prefix_arena(/*slots=*/16, align);
+    engine.set_attach_within(engine_can);
+    policy.prefix_partial_hits = key;
+    sched = std::make_unique<Scheduler>(&engine, std::vector<int64_t>{kEos}, 0, policy);
+  }
+  void run(const std::string& id, std::vector<int64_t> prompt, std::vector<int64_t> boundaries) {
+    engine.arm(0, {10}, 1);
+    sched->submit(make_cached_request(id, std::move(prompt), std::move(boundaries), 1));
+    sched->run_to_completion();
+  }
+};
+}  // namespace
+
+DGPP_TEST(scheduler_prefixCache_aPromptOpensOnTheTokensItSharesInsideAnEntry) {
+  // The entry stands at the first prompt's deepest cut, 40. The second
+  // prompt shares 23 tokens with it and has no cut below them: it opens at
+  // 22 (the token at the attach position is shared too), inside the entry.
+  WithinWorld w;
+  const auto first = counted_prompt(41);
+  w.run("a", first, {40});
+  w.run("b", parting_at(first, 23), {40});
+  const Scheduler::Meters m = w.sched->meters();
+  const std::string ops = w.engine.op_stream();
+  const int slot = attach_slot_of(ops, "X:0:22@");
+  require(slot >= 0 && w.engine.prefix_position(slot) > 22, "the second prompt opens at 22 inside an entry: " + ops);
+  require(m.prefix_hits == 1 && m.prefix_partial_hits == 1 && m.prefix_misses == 1 && m.prefix_tokens_saved == 22,
+          "one hit, inside an entry, 22 tokens saved: hits " + std::to_string(m.prefix_hits) + " partial " +
+              std::to_string(m.prefix_partial_hits) + " misses " + std::to_string(m.prefix_misses) + " saved " +
+              std::to_string(m.prefix_tokens_saved));
+  require(w.sched->find("b")->status == Scheduler::Result::Status::kDone, "the second request completes");
+}
+
+DGPP_TEST(scheduler_prefixCache_theHitInsideAnEntryNeedsTheKeyAndTheEngine) {
+  // The same two prompts with the key off, and on an engine that opens a
+  // slot at an entry's own position only: the second prefills cold.
+  for (const bool key : {false, true}) {
+    WithinWorld w(key, /*engine_can=*/!key);
+    const auto first = counted_prompt(41);
+    w.run("a", first, {40});
+    w.run("b", parting_at(first, 23), {40});
+    const Scheduler::Meters m = w.sched->meters();
+    require(m.prefix_hits == 0 && m.prefix_partial_hits == 0 && m.prefix_misses == 2 &&
+                w.engine.op_stream().find("X:") == std::string::npos,
+            std::string(key ? "an engine without the attach" : "the key off") + ": both prompts prefill cold: " +
+                w.engine.op_stream());
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_theDeeperOfTheCutAndTheSharedTokensWins) {
+  // Entries at the head cut 12 and the deepest cut 40 of the first prompt.
+  // A prompt that shares 13 tokens opens at the cut's entry, whole (the
+  // shared tokens reach no deeper); one that shares 30 opens at 29 inside
+  // the deeper entry, past the cut.
+  WithinWorld w;
+  w.policy.prefix_head_snapshots = true;
+  w.sched = std::make_unique<Scheduler>(&w.engine, std::vector<int64_t>{kEos}, 0, w.policy);
+  const auto first = counted_prompt(41);
+  w.run("a", first, {12, 40});
+  w.run("b", parting_at(first, 13), {12, 40});
+  std::string ops = w.engine.op_stream();
+  int slot = attach_slot_of(ops, "X:0:12@");
+  require(slot >= 0 && w.engine.prefix_position(slot) == 12 && w.sched->meters().prefix_partial_hits == 0,
+          "13 shared tokens: the whole entry at the cut 12: " + ops);
+  w.run("c", parting_at(first, 30), {12, 40});
+  ops = w.engine.op_stream();
+  slot = attach_slot_of(ops, "X:0:29@");
+  require(slot >= 0 && w.engine.prefix_position(slot) > 29 && w.sched->meters().prefix_partial_hits == 1,
+          "30 shared tokens: 29 inside a deeper entry, past the cut at 12: " + ops);
+}
+
+DGPP_TEST(scheduler_prefixCache_aPromptThatIsAPrefixOfAnEntryPrefillsItsLastToken) {
+  // The whole prompt is the head of a cached one and none of its cuts holds
+  // an entry: it opens one token short of its end.
+  WithinWorld w;
+  const auto first = counted_prompt(41);
+  w.run("a", first, {40});
+  w.run("b", std::vector<int64_t>(first.begin(), first.begin() + 30), {});
+  const std::string ops = w.engine.op_stream();
+  require(attach_slot_of(ops, "X:0:29@") >= 0 && w.sched->meters().prefix_tokens_saved == 29,
+          "a 30-token head of the cached prompt opens at 29: " + ops);
+}
+
+DGPP_TEST(scheduler_prefixCache_theHitInsideAnEntryNeedsAWholeBlockAndKeepsTheAlignment) {
+  // Fewer shared tokens than a block bring nothing by reference: a miss.
+  {
+    WithinWorld w;
+    const auto first = counted_prompt(41);
+    w.run("a", first, {40});
+    w.run("b", parting_at(first, 4), {40});  // opens at 3 at best, under the 4-token block
+    require(w.sched->meters().prefix_hits == 0, "four shared tokens stay a miss: " + w.engine.op_stream());
+    w.run("c", parting_at(first, 5), {40});  // 4: one whole block
+    require(attach_slot_of(w.engine.op_stream(), "X:0:4@") >= 0, "five shared tokens open at 4: " + w.engine.op_stream());
+  }
+  // An aligned family opens at the aligned image below the shared tokens.
+  {
+    WithinWorld w(/*key=*/true, /*engine_can=*/true, /*align=*/4);
+    const auto first = counted_prompt(41);
+    w.run("a", first, {40});
+    w.run("b", parting_at(first, 23), {40});
+    require(attach_slot_of(w.engine.op_stream(), "X:0:20@") >= 0, "23 shared tokens at align 4 open at 20: " + w.engine.op_stream());
+  }
+}
+
+DGPP_TEST(scheduler_prefixCache_amongEqualsTheShallowestEntryIsOpened) {
+  // The deeper prompt first, so its entries are the older records; then a
+  // shorter one sharing 15 tokens with it. A third prompt shares the same
+  // 15 with all of them: it opens inside the shallowest entry, which pins
+  // the fewest blocks while the request lives.
+  WithinWorld w;
+  const auto deep = counted_prompt(41);
+  auto shallow = parting_at(deep, 15);
+  shallow.resize(21);
+  w.run("a", deep, {40});
+  w.run("b", shallow, {20});
+  auto third = parting_at(deep, 15);
+  for (size_t i = 15; i < third.size(); ++i) third[i] += 100000;  // parts from `shallow` at 15 as well
+  w.run("c", third, {40});
+  const std::string ops = w.engine.op_stream();
+  const int slot = attach_slot_of(ops, "X:0:14@");
+  require(slot >= 0 && w.engine.prefix_position(slot) == 20,
+          "the third prompt opens at 14 inside the entry at 20, the shallowest that holds it: slot " +
+              std::to_string(slot) + " at " + std::to_string(slot >= 0 ? w.engine.prefix_position(slot) : -1) + ": " + ops);
+}
+
+DGPP_TEST(scheduler_prefixCache_roomIsMadeAroundTheEntryARequestOpensInside) {
+  // Two cached prompts fill the pool: each holds its cut's entry at 40 (ten
+  // blocks) and its close entry at 41 (eleven). A third prompt shares 23
+  // tokens with the first. Room for it comes from the least recently used
+  // entry that is not the one it opens inside, and the answer in hand
+  // stands through that eviction.
+  const auto world = [](int64_t blocks, int steps) {
+    auto w = std::make_unique<WithinWorld>(/*key=*/true, /*engine_can=*/true, /*align=*/1, blocks);
+    const auto first = counted_prompt(41);
+    w->run("a", first, {40});
+    w->run("x", counted_prompt(41, 5000), {40});
+    w->engine.arm(0, {10, kEos}, steps);
+    w->sched->submit(make_cached_request("c", parting_at(first, 23), {40}, steps));
+    w->sched->run_to_completion();
+    return w;
+  };
+  {
+    const auto w = world(/*blocks=*/46, /*steps=*/1);
+    const Scheduler::Meters m = w->sched->meters();
+    const std::string ops = w->engine.op_stream();
+    const int slot = attach_slot_of(ops, "X:0:22@");
+    require(slot >= 0 && w->engine.prefix_position(slot) == 40 && m.prefix_partial_hits == 1 &&
+                m.prefix_evictions >= 1,
+            "the third prompt opens at 22 inside the first's entry at 40 after an eviction made room: evictions " +
+                std::to_string(m.prefix_evictions) + ", slot " + std::to_string(slot) + ": " + ops);
+  }
+  // A reservation the pool covers only with every entry gone: the entry the
+  // request would have opened inside goes last, and the request prefills cold.
+  {
+    const auto w = world(/*blocks=*/46, /*steps=*/135);
+    const Scheduler::Meters m = w->sched->meters();
+    require(m.prefix_partial_hits == 0 && m.prefix_hits == 0 && m.prefix_misses == 3 &&
+                w->engine.op_stream().find("X:") == std::string::npos &&
+                w->sched->find("c")->status == Scheduler::Result::Status::kDone,
+            "with its entry evicted for room the third prompt prefills cold: evictions " +
+                std::to_string(m.prefix_evictions) + ": " + w->engine.op_stream());
+  }
+}
+
+// ---- randomized workloads on a fake with the real pool's bookkeeping (2026-11-13) ----
+namespace {
+// Every arena slot's token ids and blocks, every open request's ids and
+// blocks, the blocks by identity with reference counts. The fake refuses
+// what the real engine would compute wrongly or could not hold: an attach
+// whose tokens are not the slot's (the token AT an attach inside an entry
+// included: the draft block's last row embeds it), a lookahead token that
+// changed at an entry's own position, a snapshot past what the request has
+// committed, a pool overdrawn.
+class LedgerEngine : public FakeEngine {
+ public:
+  static constexpr int64_t kBlock = 4;
+  LedgerEngine(int slots, int64_t blocks, int arena_slots, bool lookahead, int step_tokens)
+      : FakeEngine(slots, blocks, kBlock), total_(blocks), lookahead_(lookahead) {
+    set_prefix_arena(arena_slots, /*align=*/1);
+    set_attach_within(true);
+    set_step_tokens_max(step_tokens);
+    prefill_lookahead_ = lookahead;
+  }
+  int64_t attaches = 0, within_attaches = 0;
+  int64_t pool_blocks_in_use() const override { return in_use_; }
+
+  int32_t prefill(int req, const std::vector<int64_t>& prompt) override {
+    const int32_t token = FakeEngine::prefill(req, prompt);
+    Row& row = rows_[req];  // opened by an attach, or fresh
+    row.ids = prompt;
+    row.prompt = static_cast<int64_t>(prompt.size());
+    row.ids.push_back(token);
+    grow(row, blocks_for_tokens(row.prompt), "a prompt's blocks");
+    return token;
+  }
+  int32_t prefill_cached(int req, const std::vector<int64_t>& prompt,
+                         dgpp::sched::SchedulerEngine::PrefixPrefill* plan) override {
+    require(rows_.count(req) == 0, "ledger: prefill on an open slot");
+    if (plan->attach_slot >= 0) {
+      require(arena_.count(plan->attach_slot) != 0, "ledger: attach from an empty arena slot");
+      const Snapshot& s = arena_.at(plan->attach_slot);
+      const int64_t p = plan->attach_position;
+      require(p > 0 && p <= s.position && p < static_cast<int64_t>(prompt.size()),
+              "ledger: attach at " + std::to_string(p) + " of a slot at " + std::to_string(s.position) +
+                  " for a prompt of " + std::to_string(prompt.size()));
+      require(std::equal(s.ids.begin(), s.ids.begin() + p, prompt.begin()),
+              "ledger: an attach at " + std::to_string(p) + " whose tokens are not the slot's");
+      if (p < s.position) {
+        ++within_attaches;
+        require(prompt[static_cast<size_t>(p)] == s.ids[static_cast<size_t>(p)],
+                "ledger: the token at an attach inside an entry (" + std::to_string(p) + ") is not the entry's");
+      } else if (s.next >= 0) {
+        require(prompt[static_cast<size_t>(p)] == s.next, "ledger: the lookahead token at the entry's cut changed");
+      }
+      ++attaches;
+      Row row;
+      for (int64_t i = 0; i < p / kBlock; ++i) row.blocks.push_back(share(s.blocks[static_cast<size_t>(i)]));
+      if (p % kBlock != 0) row.blocks.push_back(acquire("an attach's copy of the block its position falls in"));
+      rows_[req] = std::move(row);
+    }
+    const int32_t token = FakeEngine::prefill_cached(req, prompt, plan);
+    if (plan->snap_taken) take(req, plan->snap_slot, plan->snap_position, /*cut=*/true);
+    if (plan->body_snap_taken) take(req, plan->body_snap_slot, plan->body_snap_position, /*cut=*/true);
+    if (plan->head_snap_taken) take(req, plan->head_snap_slot, plan->head_snap_position, /*cut=*/true);
+    return token;
+  }
+  void reserve(int req, int64_t tokens) override {
+    FakeEngine::reserve(req, tokens);
+    grow(rows_.at(req), blocks_for_tokens(tokens), "a reservation");
+  }
+  std::vector<int32_t> step(int req) override {
+    const bool armed = hop_armed_.count(req) != 0;
+    const std::pair<int, int64_t> hop = armed ? hop_armed_.at(req) : std::pair<int, int64_t>{-1, 0};
+    const std::vector<int32_t> out = FakeEngine::step(req);
+    Row& row = rows_.at(req);
+    row.ids.insert(row.ids.end(), out.begin(), out.end());
+    const auto result = hop_results_.find(req);
+    if (armed && result != hop_results_.end() && result->second.status == PrefixHopStatus::kStored)
+      take(req, hop.first, hop.second, /*cut=*/false);
+    return out;
+  }
+  void prefix_snapshot(int req, int slot, int64_t position) override {
+    FakeEngine::prefix_snapshot(req, slot, position);
+    take(req, slot, position, /*cut=*/false);
+  }
+  void prefix_release(int slot) override {
+    FakeEngine::prefix_release(slot);
+    drop(slot);
+  }
+  void close(int req) override {
+    FakeEngine::close(req);
+    for (const int b : rows_.at(req).blocks) unref(b);
+    rows_.erase(req);
+  }
+  bool idle() const { return rows_.empty(); }
+  // Every block in use is one an arena slot or an open request holds.
+  void audit() const {
+    std::set<int> held;
+    for (const auto& [req, row] : rows_) held.insert(row.blocks.begin(), row.blocks.end());
+    for (const auto& [slot, s] : arena_) {
+      held.insert(s.blocks.begin(), s.blocks.end());
+      if (s.partial >= 0) held.insert(s.partial);
+    }
+    require(static_cast<int64_t>(held.size()) == in_use_ && in_use_ <= total_,
+            "ledger: " + std::to_string(in_use_) + " blocks in use, " + std::to_string(held.size()) + " held");
+  }
+
+ private:
+  struct Row {
+    std::vector<int64_t> ids;  // the prompt, then every token returned
+    std::vector<int> blocks;
+    int64_t prompt = 0;
+  };
+  struct Snapshot {
+    std::vector<int64_t> ids;
+    std::vector<int> blocks;  // the whole blocks, by reference
+    int partial = -1;         // its own copy
+    int64_t position = 0;
+    int64_t next = -1;        // the token a prefill cut's draft row consumed
+  };
+  int acquire(const char* what) {
+    require(in_use_ < total_, std::string("ledger: the pool is overdrawn by ") + what);
+    ref_[next_] = 1;
+    ++in_use_;
+    return next_++;
+  }
+  int share(int b) {
+    require(ref_.count(b) != 0, "ledger: sharing a block that is not live");
+    ++ref_[b];
+    return b;
+  }
+  void unref(int b) {
+    if (--ref_.at(b) == 0) {
+      ref_.erase(b);
+      --in_use_;
+    }
+  }
+  void grow(Row& row, int64_t blocks, const char* what) {
+    while (static_cast<int64_t>(row.blocks.size()) < blocks) row.blocks.push_back(acquire(what));
+  }
+  void drop(int slot) {
+    const auto it = arena_.find(slot);
+    if (it == arena_.end()) return;
+    for (const int b : it->second.blocks) unref(b);
+    if (it->second.partial >= 0) unref(it->second.partial);
+    arena_.erase(it);
+  }
+  void take(int req, int slot, int64_t position, bool cut) {
+    const Row& row = rows_.at(req);
+    require(position > 0 && position < static_cast<int64_t>(row.ids.size()),
+            "ledger: a snapshot at " + std::to_string(position) + " past the request's committed tokens");
+    require(static_cast<int64_t>(row.blocks.size()) * kBlock >= position, "ledger: a snapshot past the request's blocks");
+    drop(slot);
+    Snapshot s;
+    s.position = position;
+    s.ids.assign(row.ids.begin(), row.ids.begin() + position);
+    if (cut && lookahead_ && position < row.prompt) s.next = row.ids[static_cast<size_t>(position)];
+    for (int64_t i = 0; i < position / kBlock; ++i) s.blocks.push_back(share(row.blocks[static_cast<size_t>(i)]));
+    if (position % kBlock != 0) s.partial = acquire("a snapshot's copy of its partial block");
+    arena_[slot] = std::move(s);
+  }
+  int64_t total_, in_use_ = 0;
+  bool lookahead_;
+  int next_ = 0;
+  std::map<int, int> ref_;
+  std::map<int, Row> rows_;
+  std::map<int, Snapshot> arena_;
+};
+}  // namespace
+
+DGPP_TEST(scheduler_prefixCache_randomWorkloadsNeverAttachPastTheSharedTokens) {
+  // Prompts that share heads of random length with three long texts and with
+  // each other (repeats, next turns over what was generated, edits), random
+  // boundaries, cancels and opt-outs, one to three slots, small arenas and
+  // pools, one- and two-token steps, with and without the draft's lookahead.
+  // The ledger refuses a wrong attach or an overdrawn pool. A replay makes
+  // the same decisions, the key off attaches inside no entry, and over the
+  // seeds the attaches inside entries save tokens.
+  struct Outcome {
+    std::string ops;
+    uint64_t digest = 0;
+    int64_t saved = 0, within = 0;
+  };
+  const auto run = [](uint32_t seed, bool partial) {
+    std::mt19937 rng(seed);
+    const auto pick = [&](int lo, int hi) { return lo + static_cast<int>(rng() % static_cast<uint32_t>(hi - lo + 1)); };
+    const int kSteps = 12, kPrompt = 120;
+    const int slots = pick(1, 3);
+    const bool lookahead = rng() % 2 != 0, two = rng() % 2 != 0;
+    LedgerEngine engine(slots, slots * 40 + pick(0, 60), pick(3, 12), lookahead, two ? 2 : 1);
+    dgpp::sched::AdmissionPolicy policy;
+    policy.prefix_partial_hits = partial;
+    policy.prefix_head_snapshots = rng() % 2 != 0;
+    policy.prefix_min_tokens = rng() % 2 != 0 ? 8 : 0;
+    Scheduler sched(&engine, {kEos}, 0, policy);
+    int32_t token = 2000;
+    for (int s = 0; s < slots; ++s)
+      for (int e = 0; e < 40; ++e) {
+        std::vector<std::vector<int32_t>> steps;
+        const int eos_at = rng() % 3 == 0 ? pick(1, kSteps) : -1;
+        for (int n = 0; n < kSteps + 2;) {
+          std::vector<int32_t> batch;
+          for (int i = two ? pick(1, 2) : 1; i > 0; --i) batch.push_back(++n == eos_at ? kEos : token++);
+          steps.push_back(std::move(batch));
+        }
+        engine.arm_batches(s, token++, std::move(steps), kSteps + 4);
+      }
+    std::vector<std::vector<int64_t>> texts;
+    for (int b = 0; b < 3; ++b) texts.push_back(counted_prompt(110, 100000 * (b + 1)));
+    std::vector<std::pair<std::string, std::vector<int64_t>>> sent;
+    int64_t fresh = 900000;
+    for (int n = 0; n < 28; ++n) {
+      std::vector<int64_t> prompt;
+      const int kind = sent.empty() ? 0 : static_cast<int>(rng() % 10);
+      if (kind < 5) {  // a text's head
+        const auto& text = texts[rng() % texts.size()];
+        prompt.assign(text.begin(), text.begin() + pick(0, 100));
+      } else {  // an earlier prompt: again as it was, or with some of its answer
+        const auto& [id, earlier] = sent[rng() % sent.size()];
+        prompt = earlier;
+        if (const Scheduler::Result* r = sched.find(id); kind >= 7 && r != nullptr && !r->generated.empty())
+          prompt.insert(prompt.end(), r->generated.begin(),
+                        r->generated.begin() + static_cast<long>(rng() % (r->generated.size() + 1)));
+      }
+      if (kind != 5 && kind != 6)  // its own tail, unless it is a repeat
+        for (int i = pick(1, 16); i > 0; --i) prompt.push_back(fresh++);
+      if (kind == 9 && prompt.size() > 8) prompt[rng() % prompt.size()] += 7;  // an edit somewhere
+      if (prompt.size() > static_cast<size_t>(kPrompt)) prompt.resize(static_cast<size_t>(kPrompt));
+      std::vector<int64_t> boundaries;
+      for (int64_t b = pick(1, 12); b < static_cast<int64_t>(prompt.size()); b += pick(3, 40)) boundaries.push_back(b);
+      const std::string id = "r" + std::to_string(n);
+      auto request = make_cached_request(id, prompt, boundaries, pick(1, kSteps));
+      if (rng() % 6 == 0) request.cancel_after = pick(1, request.max_steps);
+      if (rng() % 12 == 0) request.no_cache = true;
+      sched.submit(request);
+      sent.emplace_back(id, std::move(prompt));
+      if (rng() % 3 != 0)
+        for (int t = pick(1, 30); t > 0; --t) sched.tick();
+    }
+    sched.run_to_completion();
+    for (const auto& [id, prompt] : sent) {
+      const Scheduler::Result* r = sched.find(id);
+      require(r != nullptr && (r->status == Scheduler::Result::Status::kDone ||
+                               r->status == Scheduler::Result::Status::kCancelled),
+              "every request retires: " + id);
+    }
+    require(engine.idle(), "every slot closed");
+    engine.audit();
+    const Scheduler::Meters m = sched.meters();
+    require(partial || engine.within_attaches == 0, "the key off attaches inside no entry");
+    require(m.prefix_partial_hits == engine.within_attaches && m.prefix_hits == engine.attaches,
+            "the meters count the engine's attaches: " + std::to_string(m.prefix_hits) + "/" +
+                std::to_string(m.prefix_partial_hits) + " against " + std::to_string(engine.attaches) + "/" +
+                std::to_string(engine.within_attaches));
+    return Outcome{engine.op_stream(), sched.prefix_digest(), m.prefix_tokens_saved, engine.within_attaches};
+  };
+  int64_t saved_on = 0, saved_off = 0, within = 0;
+  for (uint32_t seed = 1; seed <= 400; ++seed) {
+    try {
+      const Outcome on = run(seed, true), again = run(seed, true), off = run(seed, false);
+      require(on.ops == again.ops && on.digest == again.digest, "a replay makes other decisions");
+      saved_on += on.saved;
+      saved_off += off.saved;
+      within += on.within;
+    } catch (const std::exception& e) {
+      throw std::runtime_error("seed " + std::to_string(seed) + ": " + e.what());
+    }
+  }
+  require(within > 400 && saved_on > saved_off,
+          "over the seeds the attaches inside entries save tokens: " + std::to_string(saved_on) + " against " +
+              std::to_string(saved_off) + " with the key off, " + std::to_string(within) + " inside entries");
+  std::printf("[ .. ] 400 random workloads: %lld tokens saved (%lld with the key off), %lld attaches inside entries\n",
+              static_cast<long long>(saved_on), static_cast<long long>(saved_off), static_cast<long long>(within));
+}
+
 int main() {
   dgpp::set_log_level_from_env("DGPP_LOG_LEVEL");
   return dgpp::test::run_all();
@@ -4358,6 +5134,72 @@ DGPP_TEST(prefix_cache_image_identity_and_partial_prefixes) {
   for (int i = 0; i < 4; ++i) require(cache.evict_lru() >= 0, "image entries remain evictable");
   require(cache.live_entries() == 0 && red[0].input->rgb.back() == 123,
           "eviction releases entries without invalidating a request's image key");
+}
+
+DGPP_TEST(prefix_cache_image_content_region_is_part_of_the_identity) {
+  using Cache = dgpp::sched::PrefixCache;
+  Cache cache({8, 1, 4});
+  const std::vector<int64_t> ids(24, 200054);
+  // An Inkling canvas: 53 x 31 pixels of content on 80 x 40.
+  dgpp::ImageInput padded;
+  padded.offset = 8;
+  padded.tokens = 2;
+  padded.width = 80;
+  padded.height = 40;
+  padded.grid = dgpp::kInklingImageGrid;
+  padded.rgb.assign(80 * 40 * 3, 123);
+  padded.valid_width = 53;
+  padded.valid_height = 31;
+  std::vector<dgpp::ImageInput> images{padded};
+  const auto keys = cache.image_keys(images);
+  const auto hash = [&](int64_t n, const Cache::Images& with) {
+    return Cache::with_images(Cache::hash_prefix(ids.data(), n), n, with);
+  };
+  const int after = cache.insert(ids.data(), 16, cache.take_free_slot(), 1, keys);
+  const auto repeated = cache.image_keys(images);
+  require(repeated[0].input == keys[0].input && cache.find_exact(ids.data(), 16, hash(16, repeated), repeated) == after,
+          "an identical padded image attaches");
+  // The same canvas bytes with the content ending elsewhere, or with no
+  // padding at all, are other inputs to the tower.
+  images[0].valid_width = 54;
+  auto wider = cache.image_keys(images);
+  require(wider[0].hash != keys[0].hash && cache.find_exact(ids.data(), 16, hash(16, wider), wider) < 0,
+          "the content region participates in the image key");
+  images[0].valid_width = images[0].valid_height = 0;
+  const auto whole = cache.image_keys(images);
+  require(whole[0].hash != keys[0].hash && cache.find_exact(ids.data(), 16, hash(16, whole), whole) < 0,
+          "a canvas read whole is not the padded image");
+  // A forced hash collision: the comparison of the regions still refuses.
+  wider[0].hash = keys[0].hash;
+  require(cache.find_exact(ids.data(), 16, hash(16, wider), wider) < 0,
+          "a hash collision cannot attach another content region");
+}
+
+DGPP_TEST(prefix_cache_video_future_frames_key_every_segment_token) {
+  using Cache = dgpp::sched::PrefixCache;
+  Cache cache({8, 1, 4});
+  const std::vector<int64_t> ids(40, 200026);
+  std::vector<dgpp::ImageInput> segments{
+      {8, 8, 56, 56, std::vector<uint8_t>(56 * 56 * 3 * 4, 123), 28, 4, {8, 24}}};
+  const auto original = cache.image_keys(segments);
+  const auto hash = [&](const Cache::Images& keys) {
+    return Cache::with_images(Cache::hash_prefix(ids.data(), 9), 9, keys);
+  };
+  const int entry = cache.insert(ids.data(), 9, cache.take_free_slot(), 1, original);
+  require(cache.find_exact(ids.data(), 9, hash(original), original) == entry,
+          "snapshot within first video span can attach");
+  segments[0].rgb.back() ^= 1;
+  auto changed = cache.image_keys(segments);
+  require(cache.find_exact(ids.data(), 9, hash(changed), changed) < 0,
+          "future video frames change the first span's cache identity");
+  changed[0].hash = original[0].hash;
+  require(cache.find_exact(ids.data(), 9, hash(changed), changed) < 0,
+          "video pixel comparison guards a hash collision");
+  segments[0].rgb.back() ^= 1;
+  segments[0].frame_offsets[1] = 25;
+  changed = cache.image_keys(segments);
+  require(cache.find_exact(ids.data(), 9, hash(changed), changed) < 0,
+          "video span layout participates in cache identity");
 }
 
 DGPP_TEST(scheduler_images_reuse_prefill_and_generated_continuations) {

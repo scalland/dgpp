@@ -43,6 +43,21 @@ DGPP_TEST(cluster_config_rejects_malformed_number_syntax) {
   require(config.engine.repetition_penalty == 1.0f, "valid exponent remains accepted");
 }
 
+DGPP_TEST(cluster_config_heretic_research_requires_explicit_boolean_opt_in) {
+  require(!dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine.heretic_research,
+          "research tools disabled by default");
+  require(dgpp::serve::parse_cluster_config(engine_json(R"({"heretic_research":true})"), "t")
+              .engine.heretic_research,
+          "explicit opt in");
+  require(!dgpp::serve::parse_cluster_config(engine_json(R"({"heretic_research":false})"), "t")
+               .engine.heretic_research,
+          "explicit opt out");
+  for (const char* bad : {"null", "1", "0", "\"true\"", "[]", "{}"})
+    require(refusal(engine_json("{\"heretic_research\":" + std::string(bad) + "}"))
+                    .find("engine.heretic_research") != std::string::npos,
+            "strict flag type with actionable error");
+}
+
 DGPP_TEST(cluster_config_penalty_defaults_preserve_omission_and_explicit_neutral_values) {
   const auto absent = dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine;
   require(!absent.repetition_penalty && !absent.frequency_penalty && !absent.presence_penalty,
@@ -164,7 +179,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
                "admission": "grow", "stats_interval_s": 0, "mtp_depth": 2, "prefill": "exact",
                "prefill_budget_tokens": 256, "prefill_idle_budget_tokens": 2048,
                "prefill_early_admission": true,
-               "prefix_min_tokens": 512, "prefix_head_snapshots": false, "mtp_draft": "greedy",
+               "prefix_min_tokens": 512, "prefix_head_snapshots": false, "prefix_partial_hits": false, "mtp_draft": "greedy",
                "mtp_schedule_sampled_scale": 0.5, "mtp_draft_temperature": 0.7, "mtp_verify": "block",
                "prefill_dense": "streaming", "prefill_fold_overlap": false, "decode_pdl": false, "prefill_window": "scalar", "decode_window": "scalar", "collective_transport": "send",
                "dflash_batch_rows": 32, "dflash_weights": "fp8", "prefill_group": false,
@@ -186,7 +201,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
               c.engine.admission == "grow" && c.engine.stats_interval_s == 0.0 && c.engine.prefill == "exact" &&
               c.engine.prefill_budget_tokens == 256 && c.engine.prefill_idle_budget_tokens == 2048 &&
               c.engine.prefill_early_admission == std::optional<bool>(true) &&
-              c.engine.prefix_min_tokens == 512 && !c.engine.prefix_head_snapshots &&
+              c.engine.prefix_min_tokens == 512 && !c.engine.prefix_head_snapshots && !c.engine.prefix_partial_hits &&
               c.engine.mtp_draft == "greedy" && c.engine.mtp_schedule_sampled_scale == 0.5 &&
               c.engine.prefill_dense == "streaming" && !c.engine.prefill_fold_overlap && !c.engine.decode_pdl && c.engine.prefill_window == "scalar" &&
               c.engine.decode_window == "scalar" &&
@@ -257,7 +272,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
               c.engine.fp8_head == "gemv" && c.engine.draft_head == "exact" && c.engine.draft_head_blocks == 32 &&
               !c.engine.prefill_bf16_partials && !c.engine.prefill_fold_scales &&
               !c.engine.prefill_fp8_gemm && !c.engine.prefill_fp8_per_tensor && c.engine.prefill_activations == "bf16" &&
-              c.engine.prefill_attention == "bf16" && c.engine.decode_attention == "bf16" &&
+              c.engine.prefill_attention == "bf16" && c.engine.decode_attention == "bf16" && c.engine.activations == "bf16" &&
               c.engine.dflash_model.empty() &&
               c.engine.dflash_verify_graph && c.engine.dflash_draft_batch && c.engine.dflash_depth == 0 &&
               c.engine.expert_gemm == "wide" && c.engine.expert_gemm_prefetch == 3 &&
@@ -295,6 +310,18 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   const auto na = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"prefill_activations":"native"}})", "t");
   require(na.engine.prefill_activations == "native", "engine.prefill_activations native parses");
+  const auto all_rows = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"activations":"native","kv_dtype":"nvfp4"}})", "t");
+  require(all_rows.engine.activations == "native" && all_rows.engine.prefill_activations == "bf16" &&
+              all_rows.engine.kv_dtype == "nvfp4", "target activation recipe and native KV parse independently");
+  for (const auto* value : {"fp8", "mixed", ""}) {
+    bool refused = false;
+    try {
+      (void)dgpp::serve::parse_cluster_config(
+          std::string(R"({"model":"m","nodes":["h"],"engine":{"activations":")") + value + R"("}})", "t");
+    } catch (const std::exception&) { refused = true; }
+    require(refused, "unsupported target activation recipe rejected");
+  }
   // The prefill attention's arithmetic on the fp8 K/V pool (2026-10-16): "bf16" (the default) or "fp8".
   const auto pa = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":"fp8","prefill_attention":"fp8"}})", "t");
@@ -515,14 +542,18 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "'engine.max_concurrency' must be in [1,"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp":"yes"}})",
        "'engine.mtp' must be true or false"},
-      {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":6}})",
-       "'engine.mtp_depth' must be in [1, 5]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":8}})",
+       "'engine.mtp_depth' must be in [1, 7]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_schedule_min_depth":8}})",
+       "'engine.mtp_schedule_min_depth' must be in [0, 7]"},
+      {R"({"model":"m","nodes":["h"],"engine":{"mtp_schedule_max_live":65}})",
+       "'engine.mtp_schedule_max_live' must be in [0, 64]"},
       {R"({"model":"m","nodes":["h"],"engine":{"dflash_depth":8}})",
        "'engine.dflash_depth' must be in [0, 7]"},
       {R"({"model":"m","nodes":["h"],"engine":{"dflash_verify_graph":"yes"}})",
        "'engine.dflash_verify_graph' must be true or false"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_depth":0}})",
-       "'engine.mtp_depth' must be in [1, 5]"},
+       "'engine.mtp_depth' must be in [1, 7]"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_draft":"beam"}})",
        "'engine.mtp_draft' must be auto, sampled or greedy"},
       {R"({"model":"m","nodes":["h"],"engine":{"mtp_draft_temperature":0}})",
@@ -557,6 +588,8 @@ DGPP_TEST(cluster_config_refusesUnknownKeysAndBadValuesByName) {
        "'engine.prefix_min_tokens' must be in [0, 1073741824]"},
       {R"({"model":"m","nodes":["h"],"engine":{"prefix_head_snapshots":"yes"}})",
        "'engine.prefix_head_snapshots' must be true or false"},
+      {R"({"model":"m","nodes":["h"],"engine":{"prefix_partial_hits":1}})",
+       "'engine.prefix_partial_hits' must be true or false"},
       {R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":"int8"}})",
        "'engine.kv_dtype' must be \"bf16\", \"fp8\" or \"fp4\""},
       {R"({"model":"m","nodes":["h"],"engine":{"kv_dtype":8}})",
@@ -840,7 +873,8 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
   const dgpp::serve::ClusterConfig off =
       dgpp::serve::parse_cluster_config(engine_json("{\"kv_capacity\":8192}"), "t");
   require(!off.nvme_cache.enabled && off.nvme_cache.capacity_gib == 0.0 &&
-              off.nvme_cache.path == "~/dgpp/nvme-cache" && off.nvme_cache.min_tokens == 0,
+              off.nvme_cache.path == "~/dgpp/nvme-cache" && off.nvme_cache.min_tokens == 0 &&
+              off.nvme_cache.required_mount.empty(),
           "off by default");
   // The top-level block: on, a path, a capacity, a minimum.
   const dgpp::serve::ClusterConfig on = dgpp::serve::parse_cluster_config(
@@ -871,6 +905,15 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
       "{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"allow_buffered\":true,\"op_timeout_s\":30}}", "t");
   require(bounded.nvme_cache.allow_buffered && bounded.nvme_cache.op_timeout_s == 30,
           "allow_buffered and op_timeout_s parse");
+  require(dgpp::serve::parse_cluster_config(
+              R"({"model":"m","world_size":1,"nvme_cache":{"required_mount":"/mnt/cache"}})", "t")
+              .nvme_cache.required_mount == "/mnt/cache", "local required mount parses");
+  require(dgpp::serve::parse_cluster_config(
+              R"({"model":"m","world_size":1,"nvme_cache":{"required_mount":""}})", "t")
+              .nvme_cache.required_mount.empty(), "empty disables required mount");
+  for (const char* bad : {R"(true)", R"(null)", R"("relative")", R"("~/cache")", R"("/cache\u0000suffix")"})
+    require(refusal(std::string(R"({"model":"m","world_size":1,"nvme_cache":{"required_mount":)") + bad + "}}")
+                .find("nvme_cache.required_mount") != std::string::npos, "invalid required mount refused by name");
   for (const char* bad : {"\"allow_buffered\":1", "\"op_timeout_s\":-1", "\"op_timeout_s\":90000", "\"op_timeout_s\":1.5"})
     require(refusal(std::string("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{") + bad + "}}")
                     .find("nvme_cache.") != std::string::npos,
@@ -901,4 +944,83 @@ DGPP_TEST(cluster_config_parses_nvme_cache) {
   require(refusal("{\"model\":\"m\",\"nodes\":[\"h\"],\"nvme_cache\":{\"path\":\"\"}}")
                   .find("nvme_cache.path") != std::string::npos,
           "an empty path is refused");
+}
+
+DGPP_TEST(cluster_config_accepts_seven_draft_block) {
+  const auto c = dgpp::serve::parse_cluster_config(
+      engine_json(
+          R"({"mtp":true,"decode_graph":true,"mtp_depth":7,"mtp_schedule":true,"mtp_schedule_min_depth":6,"mtp_schedule_max_live":1})"),
+      "MiniMax DSpark");
+  require(c.engine.mtp && c.engine.mtp_depth_set && c.engine.mtp_depth == 7,
+          "the seven-proposal MiniMax block must survive deployment parsing");
+  require(c.engine.mtp_schedule && c.engine.mtp_schedule_min_depth == 6,
+          "the MiniMax schedule must accept a six-draft minimum");
+  require(c.engine.mtp_schedule_max_live == 1, "the schedule's live-request limit must survive deployment parsing");
+  require(dgpp::serve::parse_cluster_config(engine_json(R"({"mtp":true})"), "defaults").engine.mtp_schedule_max_live == 0,
+          "the schedule's live-request limit defaults to none");
+}
+
+DGPP_TEST(cluster_config_runtime_adapters_preserve_native_serving_settings) {
+  require(!dgpp::serve::parse_cluster_config(engine_json("{}"), "t").engine.runtime_adapters,
+          "runtime adapters default off");
+  const std::string enabled = R"("runtime_adapters":true)";
+  const auto cfg = dgpp::serve::parse_cluster_config(engine_json("{" + enabled + "}"), "t");
+  require(cfg.engine.runtime_adapters, "runtime adapter explicit opt in");
+  require(!cfg.engine.runtime_adapter_verify_weights,
+          "enabling adapters must not enable a full weight scan");
+  require(
+      dgpp::serve::parse_cluster_config(
+          engine_json(R"({"runtime_adapters":true,"runtime_adapter_verify_weights":true})"), "t")
+          .engine.runtime_adapter_verify_weights,
+      "full weight verification requires explicit opt in");
+  require(refusal(engine_json(R"({"runtime_adapter_verify_weights":true})"))
+                  .find("engine.runtime_adapter_verify_weights requires") != std::string::npos,
+          "weight verification requires runtime adapters");
+  require(cfg.engine.max_concurrency == 8, "adapters retain the normal concurrency default");
+  std::ifstream file(DGPP_SOURCE_DIR "/deploy/cluster_glm-5.3_mixed346_w4.example.json");
+  require(file.good(), "read shipped Mixed346 deployment");
+  std::string shipped{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+  // Deployment templates receive site addresses from the launcher before
+  // reaching the C++ parser; supply an isolated four-rank site here.
+  shipped.insert(shipped.find('{') + 1,
+                 R"("nodes":["127.0.0.1","127.0.0.2","127.0.0.3","127.0.0.4"],)");
+  shipped = std::regex_replace(shipped, std::regex(R"("world_size"\s*:\s*4\s*,)"), "");
+  const auto engine = shipped.find("\"engine\"");
+  require(engine != std::string::npos, "shipped deployment has engine settings");
+  shipped.insert(shipped.find('{', engine) + 1,
+                 R"("runtime_adapters":true,"runtime_adapter_path":"/tmp/adapter",)");
+  const auto optimized = dgpp::serve::parse_cluster_config(shipped, "shipped Mixed346 + adapter");
+  require(
+      optimized.engine.mtp && optimized.engine.decode_graph &&
+          optimized.engine.prefix_cache_gib == 1 && optimized.engine.kv_dtype == "fp8" &&
+          optimized.engine.bf16_weights == "bf12" && optimized.engine.embed_sharding == "vocab" &&
+          optimized.engine.kv_capacity == 278528 && optimized.engine.default_max_tokens == 32768 &&
+          optimized.engine.l2_prefetch_full_form == "48x4",
+      "adapter loading must preserve optimized serving options");
+  for (int concurrency : {1, 8, 16}) {
+    const auto batched = dgpp::serve::parse_cluster_config(
+        engine_json("{" + enabled + ",\"max_concurrency\":" + std::to_string(concurrency) + "}"),
+        "t");
+    require(batched.engine.max_concurrency == concurrency, "adapters preserve configured slots");
+  }
+  for (const std::string extra :
+       {R"("kv_dtype":"fp4")", R"("attention_weights":"int4")", R"("prefill_bf16_partials":true)",
+        R"("prefill_fold_scales":true)", R"("expert_gemm":"wide4")", R"("expert_gemm_prefetch":4)",
+        R"("expert_tile_list":false)", R"("expert_gemm_pair":true)",
+        R"("collective_transport":"send")"})
+    require(
+        refusal(engine_json("{" + enabled + "," + extra + "}")).find("engine.runtime_adapters") !=
+            std::string::npos,
+        "runtime adapters reject unsupported numerical recipes");
+  require(refusal(engine_json(R"({"runtime_adapter_path":"/tmp/adapter"})"))
+                  .find("runtime_adapters=true") != std::string::npos,
+          "a path never implicitly enables runtime adapters");
+  for (const std::string bad : {"null", "1", "[]", "\"true\""}) {
+    require(refusal(engine_json("{\"runtime_adapters\":" + bad + "}"))
+                    .find("engine.runtime_adapters") != std::string::npos,
+            "runtime flag is strictly boolean");
+    require(refusal(engine_json("{" + enabled + ",\"runtime_adapter_verify_weights\":" + bad + "}"))
+                    .find("engine.runtime_adapter_verify_weights") != std::string::npos,
+            "verification flag is strictly boolean");
+  }
 }

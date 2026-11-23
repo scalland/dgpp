@@ -1,7 +1,7 @@
 # DGPP Engine Design
 
 This document describes the implemented serving architecture. The
-shared runtime supports the GLM, Qwen, DeepSeek, MiMo, Flint and Dory architectures listed
+shared runtime supports the GLM, Qwen, DeepSeek, MiMo, MiniMax, Flint, Inkling 2 and Dory architectures listed
 in the [supported-model guide](README.md), with resident loading, tensor
 parallelism, decode graphs, sampling, prefix caching and speculative decoding.
 World size and memory requirements depend on the model
@@ -11,6 +11,10 @@ The attention, weight-placement and state examples below describe
 GLM-5.3-Flash unless another family is named. Qwen's GDN/QSA/GR/PLE
 operators are documented in [its architecture study](docs/qwen38_flash_next_plan.md),
 and GLM-4.7's GQA and NVFP4 layout in [its implementation notes](docs/glm47_plan.md).
+MiniMax M3.1's per-head sparse block selection, FP32 routing, published
+MXFP8/NVFP4 weights, bundled DSpark and temporal vision encoder are described
+in [its implementation record](docs/minimax_m31_flash_plan.md). It uses the
+same session, prefill, graph, prefix-cache and speculative-decoding contracts.
 Shared session and engine interfaces live in `src/engine/`. A common scheduler
 owns admission, fair reader budgets and request lifecycle. `PrefillTask`,
 `PrefillContinuation`, `PrefillBatch`, `RowRun` and `GraphBatchMapping` share
@@ -1835,6 +1839,15 @@ the next conversation turn. Reuse requires the next prompt to contain
 the same token prefix, including the rendered answer and relevant
 reasoning/template content.
 
+Cancellation may retain an existing rolling snapshot only when its position
+is within the committed response prefix (prompt plus generated tokens,
+excluding the pending last token). It does not take a fresh retirement
+snapshot. A client that received fewer tokens or changed the rendered
+history still has to match the stored prefix and a valid cut. Retained
+entries use the ordinary arena, block accounting and eviction policy. They
+remain in memory only: cancellation must not start an NVMe spill that pins
+their blocks and prevents live requests from reclaiming capacity.
+
 MTP can commit past an aligned position in one step. The scheduler can
 arm a post-row snapshot for that position; the engine reconstructs it
 from speculative state snapshots and the corresponding cache references.
@@ -2260,6 +2273,11 @@ appropriate fed tokens. The commit updates counts for accepted rows.
 On fallback, the adapter gathers the saved verifier logits, completes
 sampling on the host and replaces the provisional feed and draft state.
 Verifier logits are saved before the draft head reuses their buffer.
+Fallback decisions use the replay's actual verification width: its last
+row is a plain sample, and block verification consumes one uniform per
+draft verified in that replay. The configured maximum width still sets
+the scalar snapshot stride and the number of drafts prepared for the
+next step.
 The sampled-MTP oracle gates follow scheduler token and retirement events,
 compare every live transcript through its final token, and cover grouped
 admission, staggered arrival and reused slots. Stored request results are
@@ -2271,8 +2289,11 @@ At positive temperature, logprobs describe the final filtered and
 renormalized sampling distribution. At temperature zero they describe
 the raw distribution used by the greedy reporting path. Chat requests
 can ask for `logprobs` and up to 20 `top_logprobs`; the legacy
-route uses its integer logprobs field. Each returned token carries its
-corresponding report through scheduler events and the HTTP response.
+route uses its integer logprobs field. These reports cover generated tokens;
+prompt scoring is not implemented. Both routes reject non-null
+`prompt_logprobs` explicitly, while null is treated as omission.
+Each returned token carries its corresponding report through scheduler
+events and the HTTP response.
 
 The common greedy path avoids the full sampling calculation. Greedy
 requests needing penalties or logprobs use the reporting path while
@@ -2340,6 +2361,12 @@ specification and the same tokenizer. For MTP verification, each row's
 mask reflects the corresponding tentative prefix; it is used only if
 the preceding draft was accepted. Draft generation itself remains
 unconstrained. The prefill pick is the first constrained position.
+
+A batch stages its mask rows by batch position and a lone request by
+slot, and a request's position need not be its slot. Every replay
+therefore stages the rows it reads for each of its requests. A request
+without a grammar writes zero headers into its rows, so a mask never
+outlives the request that staged it.
 
 The graph saves verifier logits after penalties and masking, before the
 draft head reuses the buffer. Exact-gather fallback reads that snapshot
@@ -2410,6 +2437,60 @@ schemas fall back to JSON-object mode with a warning. Each peer builds
 the same machine from the journal and its tokenizer.
 
 ## 11. Runtime and API
+
+Research inference uses a separate, opt-in tool path. The host-only GLM-5.3
+target catalog maps capture IDs to checkpoint modules, full weight
+shapes, and each rank's input-column interval. `dgpp-heretic-inspect` requires
+`engine.heretic_research=true` and advertises only target discovery. It does
+not attach to the serving process or initialize a model. The separately gated
+`dgpp-heretic-worker` owns a resident model partition and an inherited Unix socket
+for bounded baseline logits, greedy generation, and last-token capture. Its
+research model walk is a distinct template instantiation; the ordinary walk
+does not compile capture branches or copies. Capture reads the shared expert's
+BF16 input and FP32 down accumulator before routed accumulation. Worlds 2 and 4
+reuse the rank journal for settings/build agreement, commands and bounded
+capture replies; tensor parallel inference uses the existing CollectiveBus.
+The head assembles full-vocabulary logits and capture columns, verifies
+replicated tensors and sums shared FP32 outputs. The research launcher stages
+identical binaries and cleans only its recorded processes; owner/peer failure
+aborts the world. Protocol v2 adds bounded global weight reads, teacher-forced
+likelihoods, and candidate epochs. Adapter manifests bind exact checkpoint,
+quantization, tokenizer and factor hashes. Staging, activation and reset use
+all-rank barriers; no partially installed candidate can be evaluated.
+
+`engine.runtime_adapters` independently gates the low-rank execution path in
+research and ordinary serving. A is partitioned by input columns, B is
+replicated, and FP32 rank-space values are gathered losslessly and summed in
+rank order before a single BF16 boundary addition. Zero factors skip that
+addition. The ordinary disabled walk has no adapter kernels, scratch or
+collectives. Serving uses the existing request slots (1–16). The separate
+fitting worker processes one evaluation request at a time. Attention factors
+consume each span's DSA input before its scratch is reused, retaining
+rank-space rows in walk order;
+MLP factors follow the existing kernel groups. Adapter installation requires
+every session to be idle. Graph serving packs each rank's FP32 partials into
+disjoint numeric byte-digit slices and records the existing BF16 collectives;
+GPU reconstruction sums the original FP32 values in rank order. The adapter's
+scratch is separate from the model's recorded boundary buffer. Only an enabled
+adapter increases the bus's graph-node allocation, sized from its projection
+count and ranks; the serving memory plan includes those additional records.
+The normal graph budget and allocation remain unchanged. MTP proposals
+are verified by the adapted main model, and prefix snapshots retain that
+model's state. Worlds 1/2/4 support the shipped Mixed346 template's graph/MTP
+execution, FP8 KV, BF12 weights, vocabulary embeddings and prefix caching.
+Serving checks artifact identity during
+its settings handshake and includes it in the configuration digest; the
+launcher stages only the manifest and factor file. By default, each serving rank
+hashes the checkpoint metadata and sidecars, checks the revision and weight file names/sizes,
+and validates adapter factors and geometry without reading base weight contents.
+`engine.runtime_adapter_verify_weights` explicitly enables full base-weight
+hashing with per-shard progress logs. Only full inspection produces an exportable
+checkpoint fingerprint; research workers retain that path. Metadata inspection
+cannot detect same-sized weight-content changes. Both modes check file sizes
+and modification times again before installation. See
+[runtime adapters and research inference](docs/runtime-adapters.md) for the
+contract and usage, and the [worker protocol](docs/heretic.md#protocol-version-2)
+for framing and operations.
 
 The shared JSON parser validates number grammar before conversion, retaining exact
 signed integers when representable and the existing double fallback otherwise.

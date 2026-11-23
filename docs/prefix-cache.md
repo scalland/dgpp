@@ -7,6 +7,25 @@ documents and live requests still need room in the KV pool.
 Entries evicted from memory are lost unless the
 [NVMe cold tier](nvme-cache.md) is enabled.
 
+## Interrupted answers
+
+Cancellation keeps an existing rolling snapshot only through the committed
+token prefix. It takes no fresh snapshot, and keeps the retained entry in
+memory without starting an NVMe spill, so live requests can reclaim its
+blocks immediately. Earlier prompt snapshots keep their ordinary disk policy.
+
+Without [hits inside an entry](#hits-inside-an-entry), the next turn must
+match both the token prefix and a valid cold-prefill cut.
+Keep the delivered content and reasoning in the history; changed templates,
+trimmed whitespace, retokenization or undelivered tokens can shorten the match.
+Retention alone does not guarantee a deeper hit. With one-token snapshot
+alignment, for example, a saved position just before the final delivered
+token is not the next prompt's boundary after that token. A step-limited
+normal answer can have the same limitation. Earlier prompt entries can still
+serve the follow-up. The cache does not add cuts to force an interrupted
+answer to attach. On a family that supports hits inside an entry the
+follow-up opens on the tokens it shares with the retained entry instead.
+
 ## Changed questions after a long document
 
 For prompts at least four prefill chunks long, the cache keeps one earlier
@@ -16,7 +35,8 @@ Qwen, whose chunks are 4096 tokens). A new question
 after an unchanged document can attach there; an identical repeat can still
 use the deeper cut. This requires an exact token-prefix match, a valid cut
 in the new prompt, and, with MTP, the same token immediately after the cut.
-Changes earlier in the document can still miss. The policy does not discover
+Changes earlier in the document can still miss unless the family supports
+[hits inside an entry](#hits-inside-an-entry). The policy does not discover
 semantic document boundaries or cache every chunk.
 
 The extra snapshot pins existing complete KV blocks by reference. Later
@@ -56,6 +76,62 @@ after the deepest cut and before the body cut, and is off on a family
 whose prefill cannot take extra cuts (DeepSeek's bounded prefill).
 `/v1/metrics` reports `min_tokens`, `head_cuts` and the `head_snapshots`
 taken under `prefix_cache`.
+
+## Templates without a generation prompt
+
+Most templates end a prompt with the assistant's role marker, and that
+marker is where the prompt's deepest cut stands. Inkling 2's template ends
+a prompt with its last message, and the model opens its turn with its own
+marker. For such a family the service cuts one token before every change
+of speaker, and at the last token of a prompt the model answers.
+
+Those are the positions the cached state already stands at. A prompt's
+prefill stores its state at the prompt's end. A finished answer's snapshot
+stands one token before the next speaker's marker, because the token that
+ends sampling is never fed. A repeated prompt therefore attaches at its
+last token. The next turn attaches at the end of the previous prompt when
+the client drops the reasoning from its history, and at the end of the
+previous answer when the history returns the answer token for token.
+
+A marker that continues the same speaker cuts at itself: the parts of a
+system prompt, or the blocks of one answer. The head cut is therefore
+where it is for every other template. A prompt that ends inside the
+model's own block is continued, not answered, and takes no cut at its end.
+
+## Hits inside an entry
+
+`engine.prefix_partial_hits` (`--prefix-partial-hits`, default on) lets a
+prompt reuse the leading part of a longer cached entry. A prompt that shares
+its first tokens with an entry and differs from it before any stored
+position opens on the shared tokens and prefills only the rest. Clients that
+change text in the middle of a long prompt send such prompts: a clock or a
+session line inside the system prompt, retrieved notes placed ahead of the
+history, an edited earlier message.
+
+The request opens one token short of the point where the two prompts part.
+With MTP the draft block's row before a position reads the token at that
+position, so that token has to be shared as well. The request takes the
+entry's complete KV blocks below the attach position by reference and its
+own copy of the block the position falls in. At least one whole block must
+be shared. When several entries offer the same position the shallowest one
+is used, because an attached entry cannot be evicted while its request runs.
+An entry that stands at one of the prompt's cuts is preferred when it is
+just as deep.
+
+A model family supports this when its cached state at a position is the KV
+rows before that position and nothing else. Families that carry recurrent
+or pooled state in their snapshots, or a draft block with state of its own,
+keep the cut rule above.
+
+A hit inside an entry prefills its suffix from the attach position, so the
+suffix walks chunks the cold prefill would not have walked. A greedy answer
+can then be worded differently from an earlier answer to the same prompt
+where the generation passes a near tie. See
+[Greedy transcripts and chunk shape](numerics.md#greedy-transcripts-and-chunk-shape).
+Set the key to false to keep every hit on the cold walk's cuts.
+`/v1/metrics` reports `partial_hits_on` and the `partial_hits` count under
+`prefix_cache`, and the server log names each such hit with its attach
+position and the entry's position.
 
 ## Current recipe capacities
 

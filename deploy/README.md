@@ -4,6 +4,19 @@ Choose a template here, then use the [configuration reference](../docs/configura
 for site setup, defaults and the effect of each setting. Templates set model-specific
 values that can differ from the program defaults.
 
+[LoRA adapter loading](../docs/runtime-adapters.md) uses
+`engine.runtime_adapters: true` and `engine.runtime_adapter_path`. Adapter
+serving retains the shipped Mixed346 template's graphs, MTP, prefix cache,
+memory formats and request limits. Copy that template and add only the two
+adapter fields. The guide's compatibility table covers other execution settings.
+Relative bundle paths are resolved beside the deployment JSON and staged to
+every node.
+
+Logits and activation capture require `engine.heretic_research: true` in a
+separate research config for one, two or four nodes. The worker is serial and
+has its own allowed settings and token limits. Both feature flags default to
+`false` and are omitted from the standard serving templates.
+
 One template per model, quantization and world size:
 `cluster_<model>_<quant>_w<n>.example.json`. An optional trailing
 `_<variant>` names a template that deviates from that shape in one documented
@@ -23,7 +36,8 @@ it. Rank 0 serves metrics on its HTTP endpoint. See the
   `deepseek-v4.1-flash`, `mimo-v2.6-flash` and `dory1.0-4b`.
   `deepseek-v4.1-flash`, `deepseek-v4.1-flash-1017` (the 2026-10-17
   refinement of V4.1-Flash: the same architecture and config, re-trained
-  weights), `mimo-v2.6-flash` and `flint`.
+  weights), `mimo-v2.6-flash`, `flint`, `minimax-m3.1-flash` and
+  `inkling-2-mini`.
 - The quant names the checkpoint representation: `fp8`, `nvfp4`,
   `nvfp4-fp8` for the custom GLM-5.3-Flash hybrid, `int4-int8` for the full
   GLM-5.3's pack-quantized release (int4 group-64 routed experts, int8
@@ -36,6 +50,9 @@ it. Rank 0 serves metrics on its HTTP endpoint. See the
   fused attention projections and dense MLPs, BF16 o_proj / head),
   `fp8-nvfp4` for Flint's mixed export (FP8 or NVFP4 routed experts per
   projection as the export names them, every other tensor BF16),
+  `nvfp4-mxfp8` for MiniMax M3.1 Flash (NVFP4 routed experts and MXFP8 dense
+  projections) and for Inkling 2 Mini (NVFP4 routed experts on layers 0 to
+  19, MXFP8 on layers 20 to 23, every other tensor BF16),
   `exl3-3.5bpw` for the EXL3 trellis re-pack of DeepSeek-V4.1-Flash-1017
   (every projection a 3–8-bit trellis-coded matrix under the pack's
   k-map, decoded by the engine's own kernels; the Engram tables read from
@@ -56,6 +73,21 @@ never its own template: `--dflash-model DIR_OR_ID` selects the drafter on a
 template that names MTP (it takes the MTP draft's settings back to their
 defaults unless the command line names them) and `--no-dflash` runs plain,
 so one model, quant and world has one file however many worlds it serves.
+MiniMax M3.1 Flash ships its bundled DSpark with eight request slots and
+native activations. It drafts seven proposals and adaptively verifies one,
+three, five or seven for greedy requests; sampled requests verify all seven.
+Use `--no-mtp-schedule` for full-seven verification or `--no-mtp` for plain
+decoding.
+Inkling 2 Mini runs its experts under the checkpoint's activation recipe
+(`"activations": "native"`: NVFP4 inputs with the four-over-six block scale
+choice, MXFP8 inputs on the last four layers). `"activations": "bf16"` feeds
+the experts BF16 inputs instead. Its templates run the bundled draft model:
+seven proposals a step, of which the schedule verifies the ones worth their
+rows. `mtp_schedule_row_ms` and `mtp_schedule_base_ms` are measured per
+world, and `"bf16_weights": "bf12+bf16"` keeps the attention matrices in BF16
+beside their 12-bit form so a verify pass of several requests reads each
+matrix once. Use `--no-mtp` for plain decoding. Image inputs are served.
+
 The long-context templates also carry a top-level `nvme_cache` block, off by
 default: set `enabled` to true and size `capacity_gib` to the node's free
 NVMe to keep evicted prefix entries on disk. The slab outlives the process
@@ -81,6 +113,7 @@ planner adds a separate 4 GiB headroom allowance to these totals.
 
 | Template | Deployment | The shapes it replaced, as knobs |
 |---|---|---|
+| [cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json](cluster_minimax-m3.1-flash_nvfp4-mxfp8_w4.example.json) | MiniMax M3.1 Flash on four nodes: published NVFP4 experts and MXFP8 dense weights, native activations and Q8KV4 attention, eight request slots, a 2M shared token pool (1M request ceiling), seven-proposal DSpark with adaptive verification at 1/3/5/7, images and video. Measured throughput, quality and validation scope are in the [model card](../docs/model_cards/MiniMax-M3.1-Flash.md). | full-seven verification: `--no-mtp-schedule`; plain decoding: `--no-mtp`; sixteen plain slots: `--no-mtp --max-concurrency 16` |
 | [cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json](cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json) | GLM-5.3-Flash hybrid on four nodes: MTP depth 1, bf16 latent cache, 768K context, a 22 GiB prefix arena (639 snapshots), four request slots | the 8K-context template: `--kv-capacity 8192 --prefix-cache-gib 1.5`; T=1: `--no-mtp` |
 | [cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json](cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json) | the same hybrid on two nodes: MTP depth 1, FP8 latent cache, 160K context, four request slots; the BF16 decode weights resident in their 12-bit form alone (`"bf12"`: 110.0 GiB per rank with its 4.5 GiB prefix arena of 65 snapshots, 1.8 GiB of the node left at boot) | both forms resident (no prefill cost, 132K context): `--bf16-weights bf12+bf16 --kv-capacity 135168`; the 256K-context two-slot shape: `--max-concurrency 2 --kv-capacity 262144 --prefix-cache-gib 2` |
 | [cluster_qwen-3.8-flash-next_fp8_w4.example.json](cluster_qwen-3.8-flash-next_fp8_w4.example.json) | Qwen3.8-Flash-Next FP8 on four nodes: MTP depth 1, 256K context, four request slots, a 1,052,672-token shared KV pool and a 40 GiB prefix arena (1476 snapshots) | T=1: `--no-mtp`; depth 2: `--mtp-depth 2` |
@@ -111,6 +144,9 @@ planner adds a separate 4 GiB headroom allowance to these totals.
 | [cluster_flint_fp8-nvfp4_w1.example.json](cluster_flint_fp8-nvfp4_w1.example.json) | Flint (`HawkBearPig/flint-FP8-NVFP4`) as shipped on one Spark: the routed experts in the export's per-projection FP8 / NVFP4 formats, every BF16 matrix the GEMM interface serves resident in its 12-bit form (`"bf12"`), a 524288-token BF16 K/V pool (eight request slots at the model's 262144 context), no draft head (`"mtp": false` — the family has none) | the fp8 K/V row form: `--kv-dtype fp8` |
 | [cluster_flint_fp8-nvfp4_w2.example.json](cluster_flint_fp8-nvfp4_w2.example.json) | the same on two nodes: the heads, experts and MLP slices halved per rank | ditto |
 | [cluster_flint_fp8-nvfp4_w4.example.json](cluster_flint_fp8-nvfp4_w4.example.json) | the same on four nodes | ditto |
+| [cluster_inkling-2-mini_nvfp4-mxfp8_w1.example.json](cluster_inkling-2-mini_nvfp4-mxfp8_w1.example.json) | Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`) as shipped on one Spark: the looped model's 48 layer visits a token, native expert activations, the BF16 decode matrices in the lossless 12-bit form with their BF16 bytes kept for passes of more than eight rows (`"bf12+bf16"`), a BF16 K/V cache of 204 KiB a token with one plane per visit and per draft layer, a 393,216-token pool, eight request slots, the bundled draft model's seven proposals with the verify depth scheduled from its measured row cost (3.9 ms a row on a 39 ms pass), image inputs | plain decode: `--no-mtp`; BF16 expert inputs: `"activations": "bf16"` |
+| [cluster_inkling-2-mini_nvfp4-mxfp8_w2.example.json](cluster_inkling-2-mini_nvfp4-mxfp8_w2.example.json) | the same on two nodes: the heads and every expert's intermediate width halved per rank, 102 KiB of K/V a token a rank, a 786,432-token pool, 2.2 ms a verify row on a 25.7 ms pass | ditto |
+| [cluster_inkling-2-mini_nvfp4-mxfp8_w4.example.json](cluster_inkling-2-mini_nvfp4-mxfp8_w4.example.json) | the same on four nodes: 51 KiB of K/V a token a rank, a 1,572,864-token pool that seats one stream at the model's 1,048,576-token limit beside others, 1.4 ms a verify row on an 18.2 ms pass | ditto |
 | [cluster_mimo-v2.6-flash_mxfp4-fp8_w2.example.json](cluster_mimo-v2.6-flash_mxfp4-fp8_w2.example.json) | the same on two nodes: MTP depth 1, the K/V cache in the fp8 row form (`"kv_dtype": "fp8"`: 58 KiB per token per rank against 109 in bf16), 256K context (97.5 GiB of the 121.6 GiB per rank), four request slots | T=1: `--no-mtp` |
 | [cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json](cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json) | DeepSeek-V4.1-Flash as shipped on four nodes: six request slots at DSpark depth 4 (30 decode rows in one batched replay, the family's 32-row cap) with the confidence-scheduled verify depth (λ 0.045), the bounded prefill, the full 1M-token context (91.6 GiB planned a rank; 128K until 2026-10-17, its benchmark rows measure the same at both) — the six-stream shape; single and dual streams measure the same as the two-slot shapes did | the two-slot depth-5 shape: `--max-concurrency 2 --mtp-depth 5`; the two-slot depth-4 shape: `--max-concurrency 2`; T=1 at four slots: `--no-mtp --max-concurrency 4` |
 | [cluster_deepseek-v4.1-flash-1017_mxfp4-fp8_w4.example.json](cluster_deepseek-v4.1-flash-1017_mxfp4-fp8_w4.example.json) | DeepSeek-V4.1-Flash-1017 as shipped on four nodes — the V4.1-Flash template's shape (six request slots at DSpark depth 4 with the confidence-scheduled verify depth, the bounded prefill, the full 1M-token context) with the indexer budget carried as a key at the checkpoint's value (`engine.index_topk`: 512 entries per query out of the 2048 × 8 candidate pool). A wider budget shows every query on a compressing layer more of its context, the lever against the sparse attention's misses on long inputs; 2048 was measured against 512 on the same binary on 2026-10-18 (the [card](../docs/model_cards/DeepSeek-V4.1-Flash-1017.md) has both): short-context decode level, cold prefill 9 % (2K) to 48 % (32K) longer, decode at 32K–512K of context 3–8 % slower per pass, quality unchanged — so the template ships 512 | the widened budget: `"index_topk": 2048`; the pool's shape: `engine.candidate_topk_blocks`, `engine.candidate_block_size` |

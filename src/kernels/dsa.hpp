@@ -249,12 +249,20 @@ void dsa_prepare_kernel_smem();
 
 
 // Fused decode select: streams pools [0, visible(pos[r])) per row straight
-// from the blocked index cache, computes pool logits inline (warp per pool,
-// lane per head), and keeps a running top-select_k composite-key selection.
-// Fixed grid, grid-stride over pools; the last block finishes the
-// selection, extracts ids ascending, expands pools to tokens, and appends
-// each row's incomplete tail. The workspace (dsa_select_workspace_bytes,
-// sized for the caller's largest row count and pool count) and counter_ws
+// from the blocked index cache, scores them on the tensor cores (32 heads:
+// the prefill select's arithmetic, mmas on the e4m3 codes and its head-sum
+// order, so the keys are dsa_prefill_score_keys' bit for bit; 64 heads:
+// 16-entry tiles widened exactly to f16 — fp32 sums either way, the scores
+// the exact logits within those sums' rounding, the same on every rank and
+// at every grid and row count), and selects the select_k highest by a radix
+// select over the keys. Fixed grid, a stripe of pools a block: consecutive
+// rows of one request share their blocks, each staging a tile of the index
+// once and scoring every one of those rows against it (a row's keys are
+// the same whatever rows share its launch);
+// the last blocks finish the selection, extract ids ascending, expand pools
+// to tokens, and append each row's incomplete tail. The workspace (dsa_select_workspace_bytes,
+// sized for the caller's largest row count and pool count: the rows' keys,
+// their first-digit histograms and their selection bitmaps) and counter_ws
 // must be zeroed once at allocation; both self-reset after each call.
 //   q_fp8: [rows, heads, dim] fp8; w_folded: [rows, heads] fp32;
 //   block_tables: int32 [max_requests, blocks_per_request]; req_ids: [rows];
@@ -419,6 +427,57 @@ bool dsa_attn_listed(const void* q_tilde, const void* latent_cache,
 // table entry must lie under; -1 = blocks_per_request (a table whose row
 // width is the pool: the paged main caches). The decode window's ring is
 // a one-entry table per request over max_requests regions: pass that.
+
+// The listed attention of a launch whose rows are ONE request's (a prefill
+// tile), from a decoded copy of the launch's distinct rows (2026-11-16).
+// The rows of a tile are consecutive positions and select nearly the same
+// tokens (128 rows of the full GLM-5.3: 257,000 (row, token) pairs over
+// 6,900 distinct tokens), and dsa_attn_listed gathers and dequantizes a
+// cache row once a pair. Here three small launches first number the
+// launch's distinct tokens and dequantize each one's row once into the
+// workspace, bf16 [slot][kv_lora + rope]; the attention kernel then gathers
+// from that copy. The copy holds the bits the format's own decode produces,
+// so the partials are bit for bit dsa_attn_listed's. The distinct count is
+// the device's to know: a launch with more than `stage_slots` distinct
+// tokens reads the cache as dsa_attn_listed does (the kernel decides, same
+// bits). Returns false, launching nothing, where the staged form does not
+// apply (a bf16 cache, a geometry outside the listed kernel's, no
+// workspace): the caller launches dsa_attn_listed.
+//   req: the rows' request (req_ids[r] == req for every row);
+//   stage_ws: dsa_attn_stage_bytes(stage_tokens, stage_slots, kv_lora +
+//     rope) bytes, 256-byte aligned, its first (stage_tokens + 31) / 32
+//     words zeroed once at allocation (each launch leaves them zero);
+//   stage_tokens: the tokens a request can reach (a list entry at or past
+//     it is zero-filled and recorded, as one outside the table row is).
+size_t dsa_attn_stage_bytes(int64_t stage_tokens, int stage_slots, int score_width);
+// The rows a layer's staged copy holds: kAttnStageCopyBytes of bf16 rows,
+// never more than the tokens its lists can name. Sized on the fabric
+// (2026-11-16, GLM-5.3 Mixed346 on four nodes, one request, cold prefill of
+// 24K / 65K tokens: 56.7 / 165.5 s unstaged): a 19 MB copy held 77 % of the
+// launches (55.2 / 162.4 s), 24 MB 88 % (55.0 / 161.7), 32 MB 98 % (54.8 /
+// 162.2), 40 MB all but one in a thousand (54.7 / 161.3) — level or better
+// with every step, a tile listing 11,500 distinct rows on average and
+// 38,000 at most. The kernel alone over uniformly random lists is level by
+// 30,000 distinct rows (a 35 MB copy against the 24 MB L2: its rows are
+// wider than the quantized cache's) and 3 % behind at 38,000; the model's
+// lists are not uniform, and the fabric did not show that edge.
+constexpr size_t kAttnStageCopyBytes = size_t{40} << 20;
+constexpr int dsa_attn_stage_slots(int score_width, int64_t tokens) {
+  const int64_t rows = static_cast<int64_t>(kAttnStageCopyBytes / (static_cast<size_t>(score_width) * 2));
+  return static_cast<int>(rows < tokens ? rows : tokens);
+}
+bool dsa_attn_listed_staged(const void* q_tilde, const void* latent_cache, int32_t req,
+                            const int32_t* req_ids, const int32_t* topk, int topk_stride,
+                            const int32_t* counts, int rows, int n_split, int local_heads,
+                            int kv_lora, int block_tokens, const int32_t* block_tables,
+                            int blocks_per_request, float scale, float* m_ws, float* l_ws,
+                            float* c_ws, cudaStream_t stream, LatentFormat format,
+                            const float* latent_scale, int rope, int blocks_total, void* stage_ws,
+                            int64_t stage_tokens, int stage_slots);
+// The staged launches so far: [0] launches, [1] those whose distinct tokens
+// exceeded the copy (read from the cache), [2] distinct tokens summed,
+// [3] the most in a launch. `clear` resets. Synchronizes `stream`.
+void dsa_attn_stage_stats(unsigned long long out[4], bool clear, cudaStream_t stream);
 
 // Merge the split partials into normalized c rows: c_out[r,h,:] =
 // (sum_s p_s * c_s) / (sum_s p_s * l_s), p_s = exp(m_s - max m).

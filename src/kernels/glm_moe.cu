@@ -1379,13 +1379,20 @@ __device__ __forceinline__ int block_exclusive_scan_int(int v, int* s_warp,
   return excl;
 }
 
-__global__ void moe_segment_count_kernel(const int32_t* __restrict__ ids, int tk,
+// `positions` (nullable, one per token): a token with a negative position is
+// padding. It is in no expert's row list.
+__device__ __forceinline__ bool segment_live(const int64_t* __restrict__ positions, int i, int K) {
+  return positions == nullptr || positions[i / K] >= 0;
+}
+
+__global__ void moe_segment_count_kernel(const int32_t* __restrict__ ids, int tk, int K,
+                                         const int64_t* __restrict__ positions,
                                          MoeSegment* __restrict__ segs) {
   dgpp_pdl_wait();
   __shared__ int s_warp[kSegmentThreads / 32];
   const int e = blockIdx.x;
   int c = 0;
-  for (int i = threadIdx.x; i < tk; i += kSegmentThreads) c += ids[i] == e;
+  for (int i = threadIdx.x; i < tk; i += kSegmentThreads) c += ids[i] == e && segment_live(positions, i, K);
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) c += __shfl_xor_sync(0xffffffffu, c, off);
   if (threadIdx.x % 32 == 0) s_warp[threadIdx.x / 32] = c;
@@ -1398,9 +1405,12 @@ __global__ void moe_segment_count_kernel(const int32_t* __restrict__ ids, int tk
 }
 
 __global__ void moe_segment_scan_kernel(int tokens, int K, int E,
+                                        const int64_t* __restrict__ positions,
                                         int32_t* __restrict__ rows,
+                                        int32_t* __restrict__ slot_row,
                                         MoeSegment* __restrict__ segs) {
   dgpp_pdl_wait();
+  __shared__ int s_listed;
   const int tk = tokens * K;
   if (threadIdx.x == 0) {
     int acc = 0;
@@ -1409,13 +1419,33 @@ __global__ void moe_segment_scan_kernel(int tokens, int K, int E,
       acc += segs[e].rows;
     }
     segs[E] = MoeSegment{tk, tokens, E};
+    s_listed = acc;
   }
   // The shared expert: every token once more, after the routed rows.
   for (int t = threadIdx.x; t < tokens; t += blockDim.x) rows[tk + t] = t;
+  if (positions == nullptr) return;
+  // The padding tokens' slots take the gathered rows behind the experts'
+  // lists, in token order, which no launch computes. Every routed slot keeps
+  // a gathered row of its own: a caller's per-row tables (the row's slot,
+  // its scale) are then written for exactly one slot each, and a padding
+  // row's values can never land on a live slot's.
+  __syncthreads();
+  const int listed = s_listed;
+  for (int t = threadIdx.x; t < tokens; t += blockDim.x) {
+    if (positions[t] >= 0) continue;
+    int before = 0;  // the padding tokens ahead of this one
+    for (int u = 0; u < t; ++u) before += positions[u] < 0;
+    for (int j = 0; j < K; ++j) {
+      const int row = listed + before * K + j;
+      slot_row[t * K + j] = row;
+      rows[row] = t;
+    }
+  }
 }
 
 __global__ void moe_segment_place_kernel(const int32_t* __restrict__ ids, int tk,
-                                         int K, int32_t* __restrict__ rows,
+                                         int K, const int64_t* __restrict__ positions,
+                                         int32_t* __restrict__ rows,
                                          int32_t* __restrict__ slot_row,
                                          const MoeSegment* __restrict__ segs) {
   dgpp_pdl_wait();
@@ -1426,7 +1456,7 @@ __global__ void moe_segment_place_kernel(const int32_t* __restrict__ ids, int tk
   int running = seg.row0;
   for (int base = 0; base < tk; base += kSegmentThreads) {
     const int i = base + threadIdx.x;
-    const int flag = (i < tk && ids[i] == e) ? 1 : 0;
+    const int flag = (i < tk && ids[i] == e && segment_live(positions, i, K)) ? 1 : 0;
     int total = 0;
     const int excl = block_exclusive_scan_int(flag, s_warp, &total);
     if (flag) {
@@ -1580,7 +1610,7 @@ void launch_moe_tile_list(const MoeSegment* segs, int n_segs, int tile_rows,
 
 void launch_moe_segment(const int32_t* ids, int tokens, int top_k,
                         int n_experts, int32_t* rows, int32_t* slot_row,
-                        MoeSegment* segs, cudaStream_t stream) {
+                        MoeSegment* segs, cudaStream_t stream, const int64_t* positions) {
   if (tokens <= 0) return;
   if (!ids || !rows || !slot_row || !segs)
     throw std::invalid_argument("moe segment: null pointer");
@@ -1588,12 +1618,12 @@ void launch_moe_segment(const int32_t* ids, int tokens, int top_k,
       n_experts > kSegmentMaxExperts)
     throw std::invalid_argument("moe segment: top_k or n_experts out of range");
   const int tk = tokens * top_k;
-  moe_segment_count_kernel<<<n_experts, kSegmentThreads, 0, stream>>>(ids, tk, segs);
+  moe_segment_count_kernel<<<n_experts, kSegmentThreads, 0, stream>>>(ids, tk, top_k, positions, segs);
   DGPP_CUDA_OK(cudaGetLastError());
-  moe_segment_scan_kernel<<<1, 256, 0, stream>>>(tokens, top_k, n_experts, rows, segs);
+  moe_segment_scan_kernel<<<1, 256, 0, stream>>>(tokens, top_k, n_experts, positions, rows, slot_row, segs);
   DGPP_CUDA_OK(cudaGetLastError());
   moe_segment_place_kernel<<<n_experts, kSegmentThreads, 0, stream>>>(
-      ids, tk, top_k, rows, slot_row, segs);
+      ids, tk, top_k, positions, rows, slot_row, segs);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -1804,6 +1834,195 @@ void launch_moe_slot_gate_up_swiglu(
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+// ---- the fp8 shared expert's own launches (2026-11-12) -------------------
+//
+// The shared expert's weights are the same for every row of a pass, and in
+// the slot launches it was one slot per ROW inside the routed kernels: its
+// blocks took the resident places of blocks that keep the memory streaming,
+// its fp8 branch set the routed kernels' register count (the fp4 down kernel
+// 88 against 56 without it), and a pass of several rows decoded its weights
+// once per row. Here it is a RUN: R <= fp8_gemv::kMaxRows rows of the pass
+// staged together and every weight row decoded once for them through the
+// fp8 core's multi-row form, in two launches of their own (gate + up +
+// SwiGLU, then down) that the layer runs on a side stream from the layer's
+// input, beside the router and the routed launches.
+// A block is eight warps and the grid is at most `blocks` wide, which the
+// layer sets to ONE block an SM. Two an SM leave no room for a routed block
+// once a run stages three or four rows (about 100 registers a thread here
+// against the lean routed fp4 gate/up's 55: 2 x 256 x 100 + 256 x 55 is
+// over an SM's 65,536), and the routed launch then waited for the run to
+// finish: 26 to 29 us a layer at three and four rows on the DeepSeek-V4.1
+// trace. One block an SM measured 0.4 to 1 percent of a decode step shorter
+// than two. A unit is the launch's weight rows split evenly over the grid,
+// so every block has one unit a run and walks its units statically (block
+// b: units b, b + grid, ...): no counter, nothing queued in front of the
+// routed kernels' blocks.
+// The kernels issue no prefetch requests. cp.async.bulk.prefetch.L2 lines
+// do not stay in L2 (a kernel 10 us behind the requests finds most of them
+// gone again), and a launch that asked for all of its weights at its start
+// ran slower with them cold (41 against 34 us) and with them staged.
+// BITWISE the slot form: a row's chain is the same sequence of FMAs whatever
+// rows share the staging (fp8_gemv.cuh), the SwiGLU is the slot kernel's op
+// for op, and the down's rows are block_rows'.
+namespace {
+namespace shared_run {
+constexpr int kThreads = 256;         // eight warps a block
+constexpr int kWarps = kThreads / 32;
+constexpr int kDownRowsPerWarp = 4;   // the slot down kernel's (short rows: four in flight a warp)
+// The weight rows a unit: the launch's rows split evenly over the grid.
+inline int unit_rows(int n, int blocks) { return std::max(1, (n + blocks - 1) / blocks); }
+}  // namespace shared_run
+
+// The run's rows staged as [R][k]; a run of fewer rows repeats its last.
+template <int R>
+__device__ __forceinline__ void shared_run_stage(const uint16_t* __restrict__ rows, size_t row_step, int k, int cnt,
+                                                 uint16_t* __restrict__ sx) {
+#pragma unroll 1
+  for (int r = 0; r < R; ++r)
+    fp8_gemv::stage_activations<1>(rows + static_cast<size_t>(r < cnt ? r : cnt - 1) * row_step, row_step, k,
+                                   sx + static_cast<size_t>(r) * k);
+}
+
+template <int R>
+__global__ __launch_bounds__(shared_run::kThreads) void moe_shared_run_gate_up_swiglu_kernel(
+    const uint16_t* __restrict__ x, size_t x_stride, const uint8_t* __restrict__ gate_p,
+    const float* __restrict__ gate_s, const uint8_t* __restrict__ up_p, const float* __restrict__ up_s,
+    uint16_t* __restrict__ act, size_t act_step, int tokens, int n, int k, float limit, int rs, int cs,
+    int unit_rows) {
+  dgpp_pdl_wait();
+  extern __shared__ __align__(16) uint16_t sx[];
+  const int tiles = (n + unit_rows - 1) / unit_rows;
+  const int total = tiles * ((tokens + R - 1) / R);
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int scale_cols = (k + (1 << cs) - 1) >> cs;
+  int staged = -1;
+  for (int u = blockIdx.x; u < total; u += gridDim.x) {
+    const int run = u / tiles;
+    const int n0 = (u - run * tiles) * unit_rows;
+    const int n_end = min(n, n0 + unit_rows);
+    const int t0 = run * R;
+    const int cnt = min(R, tokens - t0);
+    if (run != staged) {
+      if (staged >= 0) __syncthreads();  // the previous run's readers of sx are done
+      shared_run_stage<R>(x + static_cast<size_t>(t0) * x_stride, x_stride, k, cnt, sx);
+      __syncthreads();
+      staged = run;
+    }
+    // A weight row a warp a step.
+#pragma unroll 1
+    for (int row = n0 + warp; row < n_end; row += shared_run::kWarps) {
+      const size_t scale_row = static_cast<size_t>(row >> rs) * scale_cols;
+      float g_acc[R], u_acc[R];
+      fp8_gemv::row_dots<R>(gate_p + static_cast<size_t>(row) * k, gate_s + scale_row, sx, k, lane, g_acc, cs);
+      fp8_gemv::row_dots<R>(up_p + static_cast<size_t>(row) * k, up_s + scale_row, sx, k, lane, u_acc, cs);
+      if (lane != 0) continue;
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        if (r >= cnt) break;
+        // moe_slot_gate_up_swiglu_kernel's epilogue, op for op.
+        float g = bf16_bits_to_float(float_to_bf16_bits(g_acc[r]));
+        float uu = bf16_bits_to_float(float_to_bf16_bits(u_acc[r]));
+        if (g > limit) g = limit;
+        uu = fminf(fmaxf(uu, -limit), limit);
+        const uint16_t tt = float_to_bf16_bits(g * sigmoidf_acc(g));
+        act[static_cast<size_t>(t0 + r) * act_step + row] = float_to_bf16_bits(bf16_bits_to_float(tt) * uu);
+      }
+    }
+  }
+}
+
+template <int R>
+__global__ __launch_bounds__(shared_run::kThreads) void moe_shared_run_down_kernel(
+    const uint16_t* __restrict__ act, size_t act_step, const uint8_t* __restrict__ w,
+    const float* __restrict__ scales, float* __restrict__ out, size_t out_step, int tokens, int n, int k, int rs,
+    int cs, int unit_rows) {
+  dgpp_pdl_wait();
+  extern __shared__ __align__(16) uint16_t sx[];
+  const int tiles = (n + unit_rows - 1) / unit_rows;
+  const int total = tiles * ((tokens + R - 1) / R);
+  constexpr int kStepRows = shared_run::kWarps * shared_run::kDownRowsPerWarp;
+  int staged = -1;
+  for (int u = blockIdx.x; u < total; u += gridDim.x) {
+    const int run = u / tiles;
+    const int n0 = (u - run * tiles) * unit_rows;
+    const int n_end = min(n, n0 + unit_rows);
+    const int t0 = run * R;
+    const int cnt = min(R, tokens - t0);
+    if (run != staged) {
+      if (staged >= 0) __syncthreads();
+      shared_run_stage<R>(act + static_cast<size_t>(t0) * act_step, act_step, k, cnt, sx);
+      __syncthreads();
+      staged = run;
+    }
+    // (block_rows_multi's row bound is the unit's end: the rows past it are
+    // another block's.)
+#pragma unroll 1
+    for (int sub = n0; sub < n_end; sub += kStepRows)
+      fp8_gemv::block_rows_multi<R, shared_run::kDownRowsPerWarp>(
+          w, scales, sx, sub, n_end, k, out + static_cast<size_t>(t0) * out_step, out_step, rs, cs, cnt);
+  }
+}
+
+template <class F>
+void dispatch_shared_run(int run_rows, F&& f) {
+  switch (run_rows) {
+    case 1: f(std::integral_constant<int, 1>{}); return;
+    case 2: f(std::integral_constant<int, 2>{}); return;
+    case 3: f(std::integral_constant<int, 3>{}); return;
+    case 4: f(std::integral_constant<int, 4>{}); return;
+    default: throw std::invalid_argument("moe_shared_run: a run is 1..4 rows");
+  }
+}
+
+}  // namespace
+
+void launch_moe_shared_run_gate_up_swiglu(const uint16_t* x, size_t x_stride, const uint8_t* gate_payload,
+                                          const float* gate_scales, const uint8_t* up_payload,
+                                          const float* up_scales, uint16_t* act, size_t act_step, int tokens, int n,
+                                          int k, float limit, int run_rows, int blocks, cudaStream_t stream, int rs,
+                                          int cs) {
+  if (tokens <= 0 || n <= 0) return;
+  if (!x || !gate_payload || !gate_scales || !up_payload || !up_scales || !act)
+    throw std::invalid_argument("moe_shared_run_gate_up: null pointer");
+  if (!fp8_gemv::shape_ok(gate_payload, 1, k) || !fp8_gemv::shape_ok(up_payload, 1, k) || cs < 4)
+    throw std::invalid_argument("moe_shared_run_gate_up: payloads must be 16B-aligned with k % 16 == 0");
+  if (act_step < static_cast<size_t>(n) || blocks < 1)
+    throw std::invalid_argument("moe_shared_run_gate_up: act_step below n or no block");
+  const size_t smem = fp8_gemv::smem_bytes(run_rows, k);
+  if (smem > gemv::kMaxSmemBytes) throw std::invalid_argument("moe_shared_run_gate_up: the run does not fit shared memory");
+  dispatch_shared_run(run_rows, [&](auto rc) {
+    constexpr int R = decltype(rc)::value;
+    const int unit = shared_run::unit_rows(n, blocks);
+    const int total = ((n + unit - 1) / unit) * ((tokens + R - 1) / R);
+    moe_shared_run_gate_up_swiglu_kernel<R><<<static_cast<unsigned>(std::min(total, blocks)), shared_run::kThreads, smem,
+                                              stream>>>(x, x_stride, gate_payload, gate_scales, up_payload, up_scales, act,
+                                                        act_step, tokens, n, k, limit, rs, cs, unit);
+    DGPP_CUDA_OK(cudaGetLastError());
+  });
+}
+
+void launch_moe_shared_run_down(const uint16_t* act, size_t act_step, const uint8_t* payload, const float* scales,
+                                float* out, size_t out_step, int tokens, int n, int k, int run_rows, int blocks,
+                                cudaStream_t stream, int rs, int cs) {
+  if (tokens <= 0 || n <= 0) return;
+  if (!act || !payload || !scales || !out) throw std::invalid_argument("moe_shared_run_down: null pointer");
+  if (!fp8_gemv::shape_ok(payload, 1, k) || cs < 4)
+    throw std::invalid_argument("moe_shared_run_down: payload must be 16B-aligned with k % 16 == 0");
+  if (out_step < static_cast<size_t>(n) || act_step < static_cast<size_t>(k) || blocks < 1)
+    throw std::invalid_argument("moe_shared_run_down: a step below its row or no block");
+  const size_t smem = fp8_gemv::smem_bytes(run_rows, k);
+  if (smem > gemv::kMaxSmemBytes) throw std::invalid_argument("moe_shared_run_down: the run does not fit shared memory");
+  dispatch_shared_run(run_rows, [&](auto rc) {
+    constexpr int R = decltype(rc)::value;
+    const int unit = shared_run::unit_rows(n, blocks);
+    const int total = ((n + unit - 1) / unit) * ((tokens + R - 1) / R);
+    moe_shared_run_down_kernel<R><<<static_cast<unsigned>(std::min(total, blocks)), shared_run::kThreads, smem, stream>>>(
+        act, act_step, payload, scales, out, out_step, tokens, n, k, rs, cs, unit);
+    DGPP_CUDA_OK(cudaGetLastError());
+  });
+}
+
 void launch_moe_slot_accum_routed_f32(float* out, const float* contrib,
                                       const float* weights, int tokens,
                                       int hidden, int top_k,
@@ -1850,17 +2069,24 @@ void launch_moe_slot_accum(uint16_t* out, const float* contrib,
 // at the shared width n_shared and the routed K.
 namespace {
 
-// The decode slot kernels' weight loads as streaming (evict-first) lines
-// (2026-09-22 experiment, docs/mimo_v26_flash_plan.md §7.1: the expert
-// bytes are read once per step; evict-first keeps the L2 for the
-// prefetcher's lines). -DDGPP_FP4_SLOT_STREAMING=1 builds it; off until a
-// fabric A/B decides.
-#ifndef DGPP_FP4_SLOT_STREAMING
-#define DGPP_FP4_SLOT_STREAMING 0
-#endif
-constexpr bool kFp4SlotStreaming = DGPP_FP4_SLOT_STREAMING != 0;
+// The decode slot kernels' weight loads as streaming (evict-first) lines:
+// the gate/up kernel's `kStream` (the launcher's `streaming`). The expert
+// bytes are read once per slot, and marking them evict-first keeps the L2
+// for what the ffn-side prefetch window staged (the fp8 shared expert:
+// plain loads pushed its down rows out before the down kernel ran, and the
+// shared slot's own gate/up reads out from under it). Measured 2026-11-10
+// on the DeepSeek-V4.1 world-4 shape against a pure stream of the same
+// bytes: with the shared expert staged the phase gains 8 us at one row and
+// 6 at two; with it cold the one-row phase is even and the two-row phase
+// loses 7; from three rows on it loses either way (five rows: 530 -> 551
+// us staged, 549 -> 577 cold), because an expert two rows share is served
+// to its second slot from L2 only while its lines are not the first
+// evicted. So the layer asks for it at one row with the shared expert in
+// the slots (GlmMoeLayer's decode). The loads' values are the same either
+// way: bitwise. The mixed pair and the down kernel keep plain loads.
+constexpr bool kFp4SlotStreaming = false;
 
-template <int K, bool kSharedFp4, int kGroup = fp4_gemv::kGroup>
+template <int K, bool kSharedFp4, int kGroup = fp4_gemv::kGroup, bool kStream = false>
 __global__ void moe_slot_gate_up_swiglu_fp4_kernel(
     const uint16_t* __restrict__ x, size_t x_stride,
     const int32_t* __restrict__ ids, const int32_t* __restrict__ order,
@@ -1920,12 +2146,12 @@ __global__ void moe_slot_gate_up_swiglu_fp4_kernel(
   // The first pass's weight loads in flight before the activations are
   // staged (fp4_gemv.cuh: PassLoads).
   fp4_gemv::PassLoads<G::pass_chunks(0)> L0, L1;
-  fp4_gemv::issue_pass_pair<K, 0, G::pass_chunks(0), kGroup, kFp4SlotStreaming>(
+  fp4_gemv::issue_pass_pair<K, 0, G::pass_chunks(0), kGroup, kStream>(
       vg.payload, vg.fp4_scales, vu.payload, vu.fp4_scales, n0, n, L0, L1);
   fp8_gemv::stage_activations<1>(x + static_cast<size_t>(t) * x_stride, x_stride, k, sx);
   __syncthreads();
   float acc_g[fp4_gemv::kSteps][1], acc_u[fp4_gemv::kSteps][1];
-  fp4_gemv::warp_row_dots_pair_issued<K, 1, kGroup, kFp4SlotStreaming>(
+  fp4_gemv::warp_row_dots_pair_issued<K, 1, kGroup, kStream>(
       L0, L1, vg.payload, vg.fp4_scales, vu.payload, vu.fp4_scales, sx, n0, n, acc_g, acc_u);
   // MXFP4 (kGroup 32) has no global: the dots stand undivided.
   const float gg = kGroup == fp4_gemv::kGroup ? *vg.fp4_global : 1.f;
@@ -2058,6 +2284,14 @@ __global__ void moe_slot_gate_up_swiglu_mixed_kernel(
   }
 }
 
+// The down kernel's look-ahead (see the kernel): on, and the prefetch piece.
+#ifndef DGPP_FP4_SLOT_DOWN_LOOKAHEAD
+#define DGPP_FP4_SLOT_DOWN_LOOKAHEAD 1
+#endif
+constexpr int kSlotDownDepth = DGPP_FP4_SLOT_DOWN_LOOKAHEAD;  // units ahead; 0: none
+constexpr int kSlotDownQueue = kSlotDownDepth > 0 ? kSlotDownDepth : 1;  // units held past the current one
+constexpr size_t kSlotDownPiece = 512;
+
 template <int K, bool kSharedFp4, int kGroup = fp4_gemv::kGroup>
 __global__ void moe_slot_down_fp4_kernel(
     const uint16_t* __restrict__ act, size_t act_stride,
@@ -2066,7 +2300,7 @@ __global__ void moe_slot_down_fp4_kernel(
     int n_shared, int k_shared, const uint8_t* __restrict__ sh_payload,
     const float* __restrict__ sh_scales, float* __restrict__ out,
     int out_stride, int slots, int top_k, int shared_view_base, int sh_rs, int sh_cs,
-    int tiles, int* __restrict__ tile_counter) {
+    int tiles, int* __restrict__ tile_counter, int live_slots) {
   dgpp_pdl_wait();
   using G = fp4_gemv::Geom<K>;
   extern __shared__ __align__(16) uint16_t sx[];
@@ -2079,16 +2313,36 @@ __global__ void moe_slot_down_fp4_kernel(
   // chain whoever takes it: bitwise the static grid. The counter pair
   // (units taken, blocks done) is zero at rest: the last block out
   // resets both for the next launch, so no other kernel zeroes it.
+  // THE LOOK-AHEAD (2026-11-10): a block takes its next unit before it
+  // computes the one it holds and prefetches that unit's rows into L2,
+  // one bulk prefetch a 512-byte piece a thread. Without it every byte of
+  // a unit was requested at the unit's start and nothing was in flight
+  // while the block computed, synchronized its warps and took the next
+  // unit: at the DeepSeek-V4.1 down projection the memory idled a third
+  // of the kernel (128 to 140 GB/s on the bytes at one to five rows,
+  // against a pure stream's 208 to 227). The unit's own loads then find
+  // the lines in L2 or in flight. The units, the chain and the counter's
+  // protocol are unchanged (every block still takes exactly one unit past
+  // the end): bitwise.
   __shared__ int s_unit;
-  const int total = tiles * slots;
+  // (live_slots: the order's first positions that hold work — every slot,
+  // or the routed ones of a launch without the shared expert)
+  const int total = tiles * live_slots;
+  // The units this block holds: q[0] the one it computes next, q[1..] the
+  // ones ahead of it, already prefetched.
+  int q[kSlotDownQueue + 1];
+#pragma unroll
+  for (int i = 0; i <= kSlotDownQueue; ++i) q[i] = total;
+  __syncthreads();
+  if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, 1);
+  __syncthreads();
+  q[0] = s_unit;
+  bool first = true;
   for (;;) {
-    __syncthreads();  // the previous unit's readers of sx and s_unit are done
-    if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, 1);
-    __syncthreads();
-    const int unit = s_unit;
-    if (unit >= total) {
-      // Every block takes one unit past the end before it leaves, so the
-      // last block done knows every fetch has happened.
+    const int cur = q[0];
+    if (cur >= total) {
+      // The counter only grows, so every unit this block still holds is
+      // past the end too; the last block done resets the pair.
       if (threadIdx.x == 0) {
         __threadfence();
         if (atomicAdd(tile_counter + 1, 1) == static_cast<int>(gridDim.x) - 1) {
@@ -2099,47 +2353,118 @@ __global__ void moe_slot_down_fp4_kernel(
       }
       return;
     }
-    const int slot_ix = unit / tiles;
-    const int n0 = (unit - slot_ix * tiles) * G::rows_per_block;
+    const int slot_ix = cur / tiles;
+    const int n0 = (cur - slot_ix * tiles) * G::rows_per_block;
     const int slot = order ? order[slot_ix] : slot_ix;
     const int t = slot / (top_k + 1);
     const int j = slot - t * (top_k + 1);
     const bool shared = j == top_k;
     const int n = shared ? n_shared : n_routed;
     const int k = (shared && !kSharedFp4) ? k_shared : K;
-    if (n0 >= n) continue;
-    float* out_row = out + static_cast<size_t>(slot) * out_stride;
-    if (shared && !kSharedFp4) {
-      fp8_gemv::stage_activations<1>(act + static_cast<size_t>(slot) * act_stride,
-                                     act_stride, k, sx);
-      __syncthreads();
-      fp8_gemv::block_rows_multi<1, G::rows_per_warp>(
-          sh_payload, sh_scales, sx, n0, n, k, out_row, static_cast<size_t>(out_stride), sh_rs, sh_cs);
-      continue;
-    }
-    const int base = (kSharedFp4 && shared) ? shared_view_base
-                                            : ids[static_cast<size_t>(t) * top_k + j] * 3;
-    const MoeExpertView v = views[static_cast<size_t>(base) + 2];
-    const float g = kGroup == fp4_gemv::kGroup ? *v.fp4_global : 1.f;
-    // The first pass's weight loads in flight before the activations are
-    // staged (fp4_gemv.cuh: PassLoads); the epilogue is block_rows's.
+    const bool fp8_unit = shared && !kSharedFp4;
+    const bool live = n0 < n;
+    // 1. This unit's own loads first (fp4_gemv.cuh: PassLoads): they are
+    //    ahead of the look-ahead's prefetches in the memory's queue.
     fp4_gemv::PassLoads<G::pass_chunks(0)> L0;
-    fp4_gemv::issue_pass<K, 0, G::pass_chunks(0), kGroup, kFp4SlotStreaming>(v.payload, v.fp4_scales, n0, n, L0);
-    fp8_gemv::stage_activations<1>(act + static_cast<size_t>(slot) * act_stride, act_stride, k, sx);
-    __syncthreads();
-    float acc[fp4_gemv::kSteps][1];
-    fp4_gemv::warp_row_dots_issued<K, 1, kGroup, kFp4SlotStreaming>(L0, v.payload, v.fp4_scales, sx, n0, n, acc);
+    MoeExpertView v;
+    if (live && !fp8_unit) {
+      const int base = (kSharedFp4 && shared) ? shared_view_base
+                                              : ids[static_cast<size_t>(t) * top_k + j] * 3;
+      v = views[static_cast<size_t>(base) + 2];
+      fp4_gemv::issue_pass<K, 0, G::pass_chunks(0), kGroup, kFp4SlotStreaming>(v.payload, v.fp4_scales, n0, n, L0);
+    }
+    // 2. The look-ahead: the block's first turn takes kSlotDownDepth units,
+    //    every later turn one, and prefetches them.
+    if constexpr (kSlotDownDepth > 0) {
+      const int take = first ? kSlotDownDepth : 1;
+      __syncthreads();  // the previous unit's readers of sx and s_unit are done
+      if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, take);
+      __syncthreads();
+      const int taken = s_unit;
 #pragma unroll
-    for (int st = 0; st < fp4_gemv::kSteps; ++st) {
-      bool mine = false;
-      const int row = fp4_gemv::owned_row<K>(n0, st, mine);
-      if (mine && row < n) {
-        if constexpr (kGroup == fp4_gemv::kGroup)
-          fp4_gemv::store_dot(out_row + row, __fdiv_rn(acc[st][0], g));
-        else
-          fp4_gemv::store_dot(out_row + row, acc[st][0]);
+      for (int i = 0; i < kSlotDownDepth; ++i) {
+        if (i >= take) break;
+        const int next = taken + i;
+        q[first ? i + 1 : kSlotDownDepth] = next;
+        if (next >= total) continue;
+        const int p_ix = next / tiles;
+        const int p_n0 = (next - p_ix * tiles) * G::rows_per_block;
+        const int p_slot = order ? order[p_ix] : p_ix;
+        const int p_t = p_slot / (top_k + 1);
+        const int p_j = p_slot - p_t * (top_k + 1);
+        const bool p_shared = p_j == top_k;
+        const int p_n = p_shared ? n_shared : n_routed;
+        const int p_rows = min(G::rows_per_block, p_n - p_n0);
+        const bool p_fp8 = p_shared && !kSharedFp4;
+        // The payload's pieces, then the scales' (the unit's loads read both).
+        const size_t pay_row = p_fp8 ? static_cast<size_t>(k_shared) : static_cast<size_t>(G::row_bytes);
+        const size_t pay_bytes = p_rows > 0 ? static_cast<size_t>(p_rows) * pay_row : 0;
+        const size_t sc_row = static_cast<size_t>(K / kGroup);  // the fp4 scales: one byte a group (the fp8 grid is a line or two: left to the loads)
+        const size_t sc_bytes = (p_rows > 0 && !p_fp8) ? static_cast<size_t>(p_rows) * sc_row : 0;
+        const size_t pay_pieces = (pay_bytes + kSlotDownPiece - 1) / kSlotDownPiece;
+        const size_t piece = threadIdx.x;
+        if (piece < pay_pieces + (sc_bytes + kSlotDownPiece - 1) / kSlotDownPiece) {
+          const uint8_t* pbase;
+          size_t bytes;
+          if (p_fp8) {
+            pbase = sh_payload + static_cast<size_t>(p_n0) * pay_row;
+            bytes = pay_bytes;
+          } else {
+            const int vb = (kSharedFp4 && p_shared) ? shared_view_base : ids[static_cast<size_t>(p_t) * top_k + p_j] * 3;
+            const MoeExpertView pv = views[static_cast<size_t>(vb) + 2];
+            const bool pay = piece < pay_pieces;
+            pbase = pay ? pv.payload + static_cast<size_t>(p_n0) * pay_row : pv.fp4_scales + static_cast<size_t>(p_n0) * sc_row;
+            bytes = pay ? pay_bytes : sc_bytes;
+          }
+          const size_t off = (piece < pay_pieces ? piece : piece - pay_pieces) * kSlotDownPiece;
+          // A 16-byte-aligned span inside the piece (the instruction's unit).
+          const uintptr_t lo = (reinterpret_cast<uintptr_t>(pbase) + off + 15) & ~static_cast<uintptr_t>(15);
+          const uintptr_t end = reinterpret_cast<uintptr_t>(pbase) + (off + kSlotDownPiece < bytes ? off + kSlotDownPiece : bytes);
+          if (end >= lo + 16) {
+            const unsigned sz = static_cast<unsigned>((end - lo) & ~static_cast<uintptr_t>(15));
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(lo), "r"(sz) : "memory");
+          }
+        }
+      }
+    } else {
+      __syncthreads();
+      if (threadIdx.x == 0) s_unit = atomicAdd(tile_counter, 1);
+      __syncthreads();
+      q[1] = s_unit;  // (depth 0 keeps one slot: the next unit, not prefetched)
+    }
+    first = false;
+    // 3. The unit itself.
+    if (live) {
+      float* out_row = out + static_cast<size_t>(slot) * out_stride;
+      if (fp8_unit) {
+        fp8_gemv::stage_activations<1>(act + static_cast<size_t>(slot) * act_stride,
+                                       act_stride, k, sx);
+        __syncthreads();
+        fp8_gemv::block_rows_multi<1, G::rows_per_warp>(
+            sh_payload, sh_scales, sx, n0, n, k, out_row, static_cast<size_t>(out_stride), sh_rs, sh_cs);
+      } else {
+        const float g = kGroup == fp4_gemv::kGroup ? *v.fp4_global : 1.f;
+        fp8_gemv::stage_activations<1>(act + static_cast<size_t>(slot) * act_stride, act_stride, k, sx);
+        __syncthreads();
+        float acc[fp4_gemv::kSteps][1];
+        fp4_gemv::warp_row_dots_issued<K, 1, kGroup, kFp4SlotStreaming>(L0, v.payload, v.fp4_scales, sx, n0, n, acc);
+#pragma unroll
+        for (int st = 0; st < fp4_gemv::kSteps; ++st) {
+          bool mine = false;
+          const int row = fp4_gemv::owned_row<K>(n0, st, mine);
+          if (mine && row < n) {
+            if constexpr (kGroup == fp4_gemv::kGroup)
+              fp4_gemv::store_dot(out_row + row, __fdiv_rn(acc[st][0], g));
+            else
+              fp4_gemv::store_dot(out_row + row, acc[st][0]);
+          }
+        }
       }
     }
+    // The queue moves up one.
+#pragma unroll
+    for (int i = 0; i < kSlotDownQueue; ++i) q[i] = q[i + 1];
+    q[kSlotDownQueue] = total;
   }
 }
 
@@ -3525,11 +3850,8 @@ constexpr int kPrefetchLines = 1;  // weight-row lines (128 B = 4 stages) prefet
 constexpr int A_PAD = BK + 8;                          // 144-byte rows: ldmatrix conflict-free
 constexpr int kRawStride = 48;                         // bytes per raw code row (32 used; 16-aligned, conflict-free LDS.64)
 constexpr int kGroupsPerRow = BK / 16;                 // 4 scale bytes per row per stage
-constexpr size_t kABytes = size_t(BM) * A_PAD * 2;     // 9,216
 constexpr size_t kCodeBytes = size_t(BN) * kRawStride; // 6,144
 constexpr size_t kScaleBytes = size_t(BN) * kGroupsPerRow;  // 512
-constexpr size_t kSlotBytes = kABytes + kCodeBytes + kScaleBytes;  // 15,872
-constexpr size_t kSmem = kStages * kSlotBytes;         // 47,616: two blocks per SM
 static_assert(BM * (BK / 8) == 2 * kThreads, "two activation chunks per thread");
 static_assert(BN * 2 == kThreads, "one 16-byte code copy per thread (two per row)");
 static_assert(A_PAD * 2 % 16 == 0 && kRawStride % 16 == 0, "16-byte aligned rows");
@@ -3576,15 +3898,17 @@ __device__ __forceinline__ uint32_t decode_pair_bf16_mx(uint32_t byte, float s) 
 // finished dot), 32 = MXFP4 (e8m0 per 32, no global; DeepSeek-V4.1-Flash's
 // routed experts, 2026-09-14). A stage's 64 k spans 4 or 2 scale bytes per
 // row; the ring keeps 4 bytes per row either way.
-template <typename OutT, int kGroup>
+template <typename OutT, int kGroup, int TileRows>
 __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_kernel(
     const uint16_t* __restrict__ act, size_t act_stride, int act_vec,
-    const int32_t* __restrict__ act_rows,
-    const MoeSegment* __restrict__ segs, const MoeExpertView* __restrict__ views,
-    int which, OutT* __restrict__ out, size_t out_stride, int n, int k,
-    int m_tiles) {
+    const int32_t* __restrict__ act_rows, const MoeSegment* __restrict__ segs,
+    const MoeExpertView* __restrict__ views, int which, OutT* __restrict__ out, size_t out_stride,
+    int n, int k, int m_tiles) {
   dgpp_pdl_wait();
   using namespace fp4_ldm;
+  static_assert(TileRows == 16 || TileRows == 64);
+  constexpr size_t tile_a_bytes = size_t(TileRows) * A_PAD * 2;
+  constexpr size_t tile_slot_bytes = tile_a_bytes + kCodeBytes + kScaleBytes;
   static_assert(kGroup == 16 || kGroup == 32, "the fp4 scale group");
   constexpr int kGroupsPerStage = BK / kGroup;  // scale bytes per row per stage: 4 or 2
   using fp4_pipe3::cp_async;
@@ -3592,16 +3916,16 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
   using fp4_pipe3::wait;
   extern __shared__ __align__(16) uint8_t smem[];
   const MoeSegment seg = segs[blockIdx.y];
-  // One 64-row m-tile per block, the m-tile the FASTEST grid index: a long
+  // One m-tile per block, the m-tile the FASTEST grid index: a long
   // segment's m-tiles are launched together and re-read its weight slice
   // through L2 (with z as the m-tile they ran a whole grid apart and the
   // slice came from DRAM each time: 8K tokens, 2026-09-08); its n-tiles
   // are m_tiles blocks apart and still co-resident for the activations.
   const int m_tile = static_cast<int>(blockIdx.x) % m_tiles;
   const int n_tile = static_cast<int>(blockIdx.x) / m_tiles;
-  const int z0 = m_tile * BM;
+  const int z0 = m_tile * TileRows;
   if (z0 >= seg.rows) return;  // beyond this segment's rows (no barrier yet)
-  const int z1 = min(seg.rows, z0 + BM);
+  const int z1 = min(seg.rows, z0 + TileRows);
   const MoeExpertView v = views[seg.expert * 3 + which];
   const float g = kGroup == kFp4Group ? *v.fp4_global : 1.f;
   const int n0 = n_tile * BN;
@@ -3609,7 +3933,7 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
   const size_t scale_stride = static_cast<size_t>(k) / kGroup;
   const int tid = static_cast<int>(threadIdx.x);
   const int warp = tid / 32, lane = tid % 32;
-  // Warps 1 (m64) x 8 (n16): a warp owns two n8 tiles over all 64 rows, so
+  // Warps 1 (m) x 8 (n16): a warp owns two n8 tiles over all tile rows, so
   // every B fragment is decoded once per block and feeds four MMAs.
   const int wn = warp;
   const int r = lane / 4, cc = (lane % 4) * 2;
@@ -3633,25 +3957,27 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
   const bool scales4 = kGroup == kFp4Group && (scale_stride % 4) == 0;  // MX: two bytes, plain loads
 
   auto slotA = [&](int slot) {
-    return reinterpret_cast<uint16_t*>(smem + static_cast<size_t>(slot) * kSlotBytes);
+    return reinterpret_cast<uint16_t*>(smem + static_cast<size_t>(slot) * tile_slot_bytes);
   };
-  auto slotCodes = [&](int slot) { return smem + static_cast<size_t>(slot) * kSlotBytes + kABytes; };
+  auto slotCodes = [&](int slot) {
+    return smem + static_cast<size_t>(slot) * tile_slot_bytes + tile_a_bytes;
+  };
   auto slotScales = [&](int slot) {
-    return smem + static_cast<size_t>(slot) * kSlotBytes + kABytes + kCodeBytes;
+    return smem + static_cast<size_t>(slot) * tile_slot_bytes + tile_a_bytes + kCodeBytes;
   };
 
-  for (int m0 = z0; m0 < z1; m0 += BM) {
-    const int m_rows = min(BM, z1 - m0);
+  for (int m0 = z0; m0 < z1; m0 += TileRows) {
+    const int m_rows = min(TileRows, z1 - m0);
     // m16 slabs past the segment's end are never stored: their MMAs are
     // skipped (block-uniform), the loads and barriers kept.
     const int live_slabs = (m_rows + 15) / 16;
-    float acc[4][2][4];
+    float acc[TileRows / 16][2][4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < TileRows / 16; ++i)
 #pragma unroll
       for (int j = 0; j < 2; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
 
-    // Stage s into ring slot `slot`: two 16-byte activation chunks per
+    // Stage s into ring slot `slot`: up to two 16-byte activation chunks per
     // thread (rows tid/8 and tid/8 + 32, 8-element chunk tid%8), one 16-byte
     // code copy, and the row's scale bytes. Absent rows and k past the end
     // arrive as zeros (src-size 0). A misaligned activation base takes a
@@ -3660,8 +3986,11 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
       const int k0 = s * BK;
       uint16_t* a = slotA(slot);
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
+      for (int i = 0; i < (TileRows + 31) / 32; ++i) {
         const int mm = tid / 8 + 32 * i, kq = (tid % 8) * 8;
+        if constexpr (TileRows < 32) {
+          if (mm >= TileRows) continue;
+        }
         const int gk = k0 + kq;
         const bool in = mm < m_rows && gk < k;
         uint16_t* dst = a + static_cast<size_t>(mm) * A_PAD + kq;
@@ -3787,7 +4116,7 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
           }
         }
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < TileRows / 16; ++i) {
           if (i >= live_slabs) break;
           uint32_t af[4];
           const int arow = i * 16 + (lane % 16);
@@ -3807,9 +4136,9 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
     wait<0>();
     __syncthreads();  // the ring is free for the next m-tile's prologue
 
-    // Epilogue: the warp's [64 x 16] slice; ÷g once per finished dot.
+    // Epilogue: the warp's [TileRows x 16] slice; ÷g once per finished dot.
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < TileRows / 16; ++i) {
       const int row_lo = i * 16 + r;
 #pragma unroll
       for (int j = 0; j < 2; ++j) {
@@ -3829,14 +4158,17 @@ __global__ __launch_bounds__(fp4_ldm::kThreads, 2) void moe_grouped_mma_fp4_ldm_
   }
 }
 
-template <typename OutT>
-void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride,
-                                    const int32_t* act_rows, const MoeSegment* segs,
-                                    int n_segs, int max_rows, int rows_per_block,
-                                    const MoeExpertView* views, int which, OutT* out,
-                                    size_t out_stride, int n, int k, cudaStream_t stream,
+template <typename OutT, int TileRows = 64>
+void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride, const int32_t* act_rows,
+                                    const MoeSegment* segs, int n_segs, int max_rows,
+                                    int rows_per_block, const MoeExpertView* views, int which,
+                                    OutT* out, size_t out_stride, int n, int k, cudaStream_t stream,
                                     int fp4_group = kFp4Group) {
   using namespace fp4_ldm;
+  static_assert(TileRows == 16 || TileRows == 64);
+  constexpr size_t tile_a_bytes = size_t(TileRows) * A_PAD * 2;
+  constexpr size_t tile_slot_bytes = tile_a_bytes + kCodeBytes + kScaleBytes;
+  constexpr size_t tile_smem = kStages * tile_slot_bytes;
   if (n_segs <= 0 || n <= 0) return;
   if (!act || !segs || !views || !out)
     throw std::invalid_argument("moe grouped mma fp4 ldm: null pointer");
@@ -3844,19 +4176,19 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride,
     throw std::invalid_argument("moe grouped mma fp4 ldm: the fp4 scale group must be 16 or 32");
   check_fp4_mma_shape(k, "moe grouped mma fp4 ldm", fp4_group);
   // rows_per_block is accepted for the family's signature; this kernel
-  // always runs one 64-row m-tile per block (see the kernel).
+  // always runs one m-tile per block (see the kernel).
   (void)rows_per_block;
   if (max_rows <= 0) throw std::invalid_argument("moe grouped mma fp4 ldm: max_rows");
-  const int m_tiles = (max_rows + BM - 1) / BM;
+  const int m_tiles = (max_rows + TileRows - 1) / TileRows;
   const int act_vec =
       (reinterpret_cast<uintptr_t>(act) % 16 == 0 && (act_stride % 8) == 0) ? 1 : 0;
   static bool opted_in[2] = {false, false};  // the dynamic smem opt-in, once per OutT and group
   const int gi = fp4_group == kFp4Group ? 0 : 1;
   if (!opted_in[gi]) {
-    DGPP_CUDA_OK(cudaFuncSetAttribute(gi == 0 ? moe_grouped_mma_fp4_ldm_kernel<OutT, kFp4Group>
-                                              : moe_grouped_mma_fp4_ldm_kernel<OutT, kMxfp4Group>,
-                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      static_cast<int>(kSmem)));
+    DGPP_CUDA_OK(cudaFuncSetAttribute(
+        gi == 0 ? moe_grouped_mma_fp4_ldm_kernel<OutT, kFp4Group, TileRows>
+                : moe_grouped_mma_fp4_ldm_kernel<OutT, kMxfp4Group, TileRows>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tile_smem)));
     opted_in[gi] = true;
   }
   const unsigned n_tiles = static_cast<unsigned>((n + BN - 1) / BN);
@@ -3864,11 +4196,13 @@ void launch_moe_grouped_mma_fp4_ldm(const uint16_t* act, size_t act_stride,
     throw std::invalid_argument("moe grouped mma fp4 ldm: grid too large");
   const dim3 grid(n_tiles * static_cast<unsigned>(m_tiles), static_cast<unsigned>(n_segs), 1u);
   if (gi == 0)
-    moe_grouped_mma_fp4_ldm_kernel<OutT, kFp4Group><<<grid, kThreads, kSmem, stream>>>(
-        act, act_stride, act_vec, act_rows, segs, views, which, out, out_stride, n, k, m_tiles);
+    moe_grouped_mma_fp4_ldm_kernel<OutT, kFp4Group, TileRows>
+        <<<grid, kThreads, tile_smem, stream>>>(act, act_stride, act_vec, act_rows, segs, views,
+                                                which, out, out_stride, n, k, m_tiles);
   else
-    moe_grouped_mma_fp4_ldm_kernel<OutT, kMxfp4Group><<<grid, kThreads, kSmem, stream>>>(
-        act, act_stride, act_vec, act_rows, segs, views, which, out, out_stride, n, k, m_tiles);
+    moe_grouped_mma_fp4_ldm_kernel<OutT, kMxfp4Group, TileRows>
+        <<<grid, kThreads, tile_smem, stream>>>(act, act_stride, act_vec, act_rows, segs, views,
+                                                which, out, out_stride, n, k, m_tiles);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -4591,15 +4925,24 @@ void check_fp4_mma_shape(int k, const char* who, int fp4_group) {
 // 9.58). Bitwise the reference on both shapes (the bench's checks and
 // glm_moe_test's segment pin).
 template <typename OutT>
-void launch_moe_grouped_mma_fp4(const uint16_t* act, size_t act_stride,
-                                const int32_t* act_rows,
+void launch_moe_grouped_mma_fp4(const uint16_t* act, size_t act_stride, const int32_t* act_rows,
                                 const MoeSegment* segs, int n_segs, int max_rows,
-                                int rows_per_block, const MoeExpertView* views,
-                                int which, OutT* out, size_t out_stride, int n,
-                                int k, cudaStream_t stream, int fp4_group) {
-  launch_moe_grouped_mma_fp4_ldm<OutT>(act, act_stride, act_rows, segs, n_segs, max_rows,
-                                       rows_per_block, views, which, out, out_stride, n, k,
-                                       stream, fp4_group);
+                                int rows_per_block, const MoeExpertView* views, int which,
+                                OutT* out, size_t out_stride, int n, int k, cudaStream_t stream,
+                                int fp4_group, int tile_rows = 64) {
+  // MiniMax can use a smaller activation ring for short expert segments.
+  // Each dot retains the same ascending-k16 MMA chain and final division.
+  const auto launch = [&]<int Rows>() {
+    launch_moe_grouped_mma_fp4_ldm<OutT, Rows>(act, act_stride, act_rows, segs, n_segs, max_rows,
+                                               rows_per_block, views, which, out, out_stride, n, k,
+                                               stream, fp4_group);
+  };
+  if (tile_rows == 16)
+    launch.template operator()<16>();
+  else if (tile_rows == 64)
+    launch.template operator()<64>();
+  else
+    throw std::invalid_argument("moe grouped mma fp4: tile_rows must be 16 or 64");
 }
 
 // The retired 64 x 128 x 32 two-stage cp.async kernel (bench variant 14).
@@ -4732,27 +5075,24 @@ void launch_moe_grouped_gemv_fp4_bf16(const uint16_t* act, size_t act_stride,
 
 void moe_set_fp8_ldm(bool on) { g_fp8_ldm_enabled = on; }
 
-void launch_moe_grouped_mma_fp4_bf16(const uint16_t* act, size_t act_stride,
-                                     const MoeSegment* segs, int n_segs,
-                                     int max_rows, int rows_per_block,
-                                     const MoeExpertView* views, int which,
-                                     uint16_t* out, size_t out_stride, int n,
-                                     int k, cudaStream_t stream,
-                                     const int32_t* act_rows, int fp4_group) {
-  launch_moe_grouped_mma_fp4<uint16_t>(act, act_stride, act_rows, segs, n_segs,
-                                       max_rows, rows_per_block, views, which, out,
-                                       out_stride, n, k, stream, fp4_group);
+void launch_moe_grouped_mma_fp4_bf16(const uint16_t* act, size_t act_stride, const MoeSegment* segs,
+                                     int n_segs, int max_rows, int rows_per_block,
+                                     const MoeExpertView* views, int which, uint16_t* out,
+                                     size_t out_stride, int n, int k, cudaStream_t stream,
+                                     const int32_t* act_rows, int fp4_group, int tile_rows) {
+  launch_moe_grouped_mma_fp4<uint16_t>(act, act_stride, act_rows, segs, n_segs, max_rows,
+                                       rows_per_block, views, which, out, out_stride, n, k, stream,
+                                       fp4_group, tile_rows);
 }
 
-void launch_moe_grouped_mma_fp4_f32(const uint16_t* act, size_t act_stride,
-                                    const MoeSegment* segs, int n_segs,
-                                    int max_rows, int rows_per_block,
-                                    const MoeExpertView* views, int which,
-                                    float* out, size_t out_stride, int n, int k,
-                                    cudaStream_t stream, const int32_t* act_rows, int fp4_group) {
-  launch_moe_grouped_mma_fp4<float>(act, act_stride, act_rows, segs, n_segs,
-                                    max_rows, rows_per_block, views, which, out,
-                                    out_stride, n, k, stream, fp4_group);
+void launch_moe_grouped_mma_fp4_f32(const uint16_t* act, size_t act_stride, const MoeSegment* segs,
+                                    int n_segs, int max_rows, int rows_per_block,
+                                    const MoeExpertView* views, int which, float* out,
+                                    size_t out_stride, int n, int k, cudaStream_t stream,
+                                    const int32_t* act_rows, int fp4_group, int tile_rows) {
+  launch_moe_grouped_mma_fp4<float>(act, act_stride, act_rows, segs, n_segs, max_rows,
+                                    rows_per_block, views, which, out, out_stride, n, k, stream,
+                                    fp4_group, tile_rows);
 }
 
 void launch_moe_grouped_mma_fp4_ref_bf16(const uint16_t* act, size_t act_stride,
@@ -4824,11 +5164,15 @@ void launch_moe_slot_gate_up_swiglu_fp4(
     const float* sh_gate_scales, const uint8_t* sh_up_payload,
     const float* sh_up_scales, uint16_t* act, int act_stride, int slots,
     int top_k, float limit, cudaStream_t stream, int shared_view_base, int fp4_group,
-    int sh_rs, int sh_cs) {
+    int sh_rs, int sh_cs, bool streaming, int live_slots) {
   if (slots <= 0) return;
   check_fp4_slot_args(x, ids, views, act, n_routed, k_routed, n_shared, k_shared,
                       shared_view_base, "moe_slot_gate_up_fp4", fp4_group);
-  const bool shared_fp4 = shared_view_base >= 0;
+  if (live_slots < 0) live_slots = slots;
+  if (live_slots > slots) throw std::invalid_argument("moe_slot_gate_up_fp4: live_slots above slots");
+  // No shared expert in the launch: the instantiation without the fp8
+  // shared branch (its registers are the routed path's alone).
+  const bool shared_fp4 = shared_view_base >= 0 || n_shared == 0;
   if (n_shared > 0 && !shared_fp4 &&
       (!sh_gate_payload || !sh_gate_scales || !sh_up_payload || !sh_up_scales ||
        !fp8_gemv::shape_ok(sh_gate_payload, 1, k_shared) ||
@@ -4843,19 +5187,26 @@ void launch_moe_slot_gate_up_swiglu_fp4(
     constexpr int K = decltype(kc)::value;
     constexpr int G = decltype(gc)::value;
     constexpr int rpb = fp4_gemv::Geom<K>::rows_per_block;
-    const dim3 grid((max_n + rpb - 1) / rpb, static_cast<unsigned>(slots));
-    if (shared_fp4)
-      moe_slot_gate_up_swiglu_fp4_kernel<K, true, G>
-          <<<grid, fp8_gemv::kThreads, fp8_gemv::smem_bytes(1, max_k), stream>>>(
-              x, x_stride, ids, order, views, n_routed, n_shared, k_shared,
-              sh_gate_payload, sh_gate_scales, sh_up_payload, sh_up_scales, act,
-              act_stride, slots, top_k, limit, shared_view_base, sh_rs, sh_cs);
+    // (the order's first live_slots positions hold the launch's work)
+    const dim3 grid((max_n + rpb - 1) / rpb, static_cast<unsigned>(live_slots));
+    const size_t smem = fp8_gemv::smem_bytes(1, max_k);
+    // The four forms of one kernel: the shared expert's format by the loads' cache policy.
+    if (shared_fp4 && streaming)
+      moe_slot_gate_up_swiglu_fp4_kernel<K, true, G, true><<<grid, fp8_gemv::kThreads, smem, stream>>>(
+          x, x_stride, ids, order, views, n_routed, n_shared, k_shared, sh_gate_payload, sh_gate_scales, sh_up_payload,
+          sh_up_scales, act, act_stride, slots, top_k, limit, shared_view_base, sh_rs, sh_cs);
+    else if (shared_fp4)
+      moe_slot_gate_up_swiglu_fp4_kernel<K, true, G, false><<<grid, fp8_gemv::kThreads, smem, stream>>>(
+          x, x_stride, ids, order, views, n_routed, n_shared, k_shared, sh_gate_payload, sh_gate_scales, sh_up_payload,
+          sh_up_scales, act, act_stride, slots, top_k, limit, shared_view_base, sh_rs, sh_cs);
+    else if (streaming)
+      moe_slot_gate_up_swiglu_fp4_kernel<K, false, G, true><<<grid, fp8_gemv::kThreads, smem, stream>>>(
+          x, x_stride, ids, order, views, n_routed, n_shared, k_shared, sh_gate_payload, sh_gate_scales, sh_up_payload,
+          sh_up_scales, act, act_stride, slots, top_k, limit, -1, sh_rs, sh_cs);
     else
-      moe_slot_gate_up_swiglu_fp4_kernel<K, false, G>
-          <<<grid, fp8_gemv::kThreads, fp8_gemv::smem_bytes(1, max_k), stream>>>(
-              x, x_stride, ids, order, views, n_routed, n_shared, k_shared,
-              sh_gate_payload, sh_gate_scales, sh_up_payload, sh_up_scales, act,
-              act_stride, slots, top_k, limit, -1, sh_rs, sh_cs);
+      moe_slot_gate_up_swiglu_fp4_kernel<K, false, G, false><<<grid, fp8_gemv::kThreads, smem, stream>>>(
+          x, x_stride, ids, order, views, n_routed, n_shared, k_shared, sh_gate_payload, sh_gate_scales, sh_up_payload,
+          sh_up_scales, act, act_stride, slots, top_k, limit, -1, sh_rs, sh_cs);
     DGPP_CUDA_OK(cudaGetLastError());
   };
   if (fp4_group == fp4_gemv::kMxGroup)
@@ -4913,12 +5264,16 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
                               const uint8_t* sh_payload, const float* sh_scales,
                               float* out, int out_stride, int slots, int top_k,
                               cudaStream_t stream, int shared_view_base, int fp4_group,
-                              int sh_rs, int sh_cs, int* tile_counter) {
+                              int sh_rs, int sh_cs, int* tile_counter, int live_slots) {
   if (slots <= 0) return;
   if (tile_counter == nullptr) throw std::invalid_argument("moe_slot_down_fp4: the stealing counter pair is required");
   check_fp4_slot_args(act, ids, views, out, n_routed, k_routed, n_shared, k_shared,
                       shared_view_base, "moe_slot_down_fp4", fp4_group);
-  const bool shared_fp4 = shared_view_base >= 0;
+  if (live_slots < 0) live_slots = slots;
+  if (live_slots > slots) throw std::invalid_argument("moe_slot_down_fp4: live_slots above slots");
+  // No shared expert in the launch: the instantiation without the fp8
+  // shared branch (the gate/up launcher's note).
+  const bool shared_fp4 = shared_view_base >= 0 || n_shared == 0;
   if (n_shared > 0 && !shared_fp4 && (!sh_payload || !sh_scales || !fp8_gemv::shape_ok(sh_payload, 1, k_shared)))
     throw std::invalid_argument(
         "moe_slot_down_fp4: shared payload must be 16B-aligned with k % 16 == 0");
@@ -4942,7 +5297,7 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
     constexpr int rpb = fp4_gemv::Geom<K>::rows_per_block;
     const int tiles = (max_n + rpb - 1) / rpb;
     if (tiles <= 0) return;
-    const int total = tiles * slots;
+    const int total = tiles * live_slots;
     static int occ_k[2] = {-1, -1}, occ_blocks[2] = {0, 0};
     const int which = shared_fp4 ? 1 : 0;
     if (occ_k[which] != max_k) {
@@ -4958,11 +5313,11 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
     if (shared_fp4)
       moe_slot_down_fp4_kernel<K, true, G><<<grid, fp8_gemv::kThreads, smem, stream>>>(
           act, act_stride, ids, order, views, n_routed, n_shared, k_shared,
-          sh_payload, sh_scales, out, out_stride, slots, top_k, shared_view_base, sh_rs, sh_cs, tiles, tile_counter);
+          sh_payload, sh_scales, out, out_stride, slots, top_k, shared_view_base, sh_rs, sh_cs, tiles, tile_counter, live_slots);
     else
       moe_slot_down_fp4_kernel<K, false, G><<<grid, fp8_gemv::kThreads, smem, stream>>>(
           act, act_stride, ids, order, views, n_routed, n_shared, k_shared,
-          sh_payload, sh_scales, out, out_stride, slots, top_k, -1, sh_rs, sh_cs, tiles, tile_counter);
+          sh_payload, sh_scales, out, out_stride, slots, top_k, -1, sh_rs, sh_cs, tiles, tile_counter, live_slots);
     DGPP_CUDA_OK(cudaGetLastError());
   };
   if (fp4_group == fp4_gemv::kMxGroup)

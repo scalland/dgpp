@@ -77,7 +77,13 @@ struct ChatMarker {
 // tag token is an id (a special one: the service's decode skips it) and
 // every bracket and tag name is text; the block opens at the tag token
 // after a "<" and closes at the text "</｜DSML｜ calls>", parsed then.
-enum class ToolFormat { kNone, kGlmMarkers, kQwenXml, kDsml };
+// Inkling 2 writes its whole reply as typed blocks, each
+// "[<|message_model|>NAME]<|content_KIND|>BODY<|end_message|>" with every
+// marker a single special id: a thinking block is the reasoning, a text
+// block the answer, and an invoke_tool_json block one call whose body is
+// the JSON object {"name": NAME, "args": {...}}, parsed when the block
+// closes.
+enum class ToolFormat { kNone, kGlmMarkers, kQwenXml, kDsml, kMiniMax, kInkling };
 
 // The DSML dialect (kDsml): the two DeepSeek encoders share the ｜DSML｜ tag
 // token and the block's grammar but not its spelling, so the tokenizer
@@ -101,6 +107,15 @@ struct ChatMarkers {
   ChatMarker arg_value_open;    // "<arg_value>"    (GLM)
   ChatMarker arg_value_close;   // "</arg_value>"   (GLM)
   ChatMarker dsml;              // "｜DSML｜"        (DeepSeek-V4.1 / V4: the tool-call tag token)
+  ChatMarker minimax_namespace;  // "]<]minimax[>[" (recursive MiniMax XML)
+  // Inkling 2's typed blocks (kInkling).
+  ChatMarker message_model;      // "<|message_model|>": a block's header, a name may follow
+  ChatMarker content_thinking;   // "<|content_thinking|>"
+  ChatMarker content_text;       // "<|content_text|>"
+  ChatMarker content_tool_json;  // "<|content_invoke_tool_json|>"
+  ChatMarker content_tool_text;  // "<|content_invoke_tool_text|>" (read as text)
+  ChatMarker content_tool_error; // "<|content_tool_error|>"       (read as text)
+  ChatMarker end_message;        // "<|end_message|>": closes every block
   // The DSML spelling (kDsml only). from_tokenizer leaves the default — the
   // two tokenizers carry the same tag token — so a DeepSeek-V4 frontend (and
   // the grammar vocabulary built beside it) sets kV4 explicitly.
@@ -180,13 +195,20 @@ struct ChatMarkers {
     return true;
   }
 
-  // The reasoning split needs </think>; tool calls need the six GLM
-  // markers, the two Qwen ones, or DeepSeek's tag token.
-  bool reasoning_available() const { return think_close.available(); }
+  // The reasoning split needs </think> or Inkling's thinking block; tool
+  // calls need the six GLM markers, the two Qwen ones, DeepSeek's tag token
+  // or Inkling's block markers.
+  bool inkling_blocks() const {
+    return message_model.available() && content_text.available() && content_tool_json.available() &&
+           content_thinking.available() && end_message.available();
+  }
+  bool reasoning_available() const { return think_close.available() || inkling_blocks(); }
   ToolFormat tool_format() const {
-    if (tool_call_open.available() && tool_call_close.available() &&
-        arg_key_open.available() && arg_key_close.available() &&
-        arg_value_open.available() && arg_value_close.available())
+    if (inkling_blocks()) return ToolFormat::kInkling;
+    if (minimax_namespace.available() && tool_call_open.available() && tool_call_close.available())
+      return ToolFormat::kMiniMax;
+    if (tool_call_open.available() && tool_call_close.available() && arg_key_open.available() &&
+        arg_key_close.available() && arg_value_open.available() && arg_value_close.available())
       return ToolFormat::kGlmMarkers;
     if (tool_call_open.available() && tool_call_close.available())
       return ToolFormat::kQwenXml;
@@ -222,9 +244,12 @@ class ToolSchemas {
     return types_.count(function) != 0;
   }
   Type type_of(const std::string& function, const std::string& key) const;
+  // Owned recursive schema for formats whose containers are not JSON text.
+  const std::string& parameters(const std::string& function) const;
 
  private:
   std::map<std::string, std::map<std::string, Type>> types_;
+  std::map<std::string, std::string> parameters_;
 };
 
 class ToolCallParser {
@@ -325,6 +350,15 @@ class ToolCallParser {
   bool parse_dsml_block(const std::string& text);
   void complete_dsml_block(std::vector<Event>* out);
   void abort_dsml_block(std::vector<Event>* out);
+  // Inkling 2: one id through the typed-block state machine, the closed
+  // call block into an event (false when its body is not a call: the
+  // caller shows it as content), and the header's held name text.
+  void inkling_feed(int64_t id, std::vector<Event>* out);
+  bool inkling_complete_call(std::vector<Event>* out);
+  void inkling_flush_header(std::vector<Event>* out);
+  void minimax_append(int64_t id, std::vector<Event>* out);
+  void minimax_flush(size_t bytes, std::vector<Event>* out);
+  bool parse_minimax_block(const std::string& text, std::vector<Call>* calls) const;
   std::string typed_value(const std::string& function, const std::string& key,
                           const std::string& text) const;
 
@@ -334,7 +368,8 @@ class ToolCallParser {
   Options options_;
 
   State state_ = State::kContent;
-  Run run_;  // the current DSML content run
+  Run run_;          // the current DSML content run
+  Run minimax_run_;  // held namespace prefix or complete recursive XML block
 
   // The open block.
   Sub sub_ = Sub::kName;
@@ -359,6 +394,12 @@ class ToolCallParser {
   std::string dsml_held_;
   std::vector<Event::TokenSpan> dsml_held_tokens_;
   std::vector<Call> dsml_calls_;
+
+  // Inkling 2: the open block. A header holds its ids until a content
+  // marker names the block (the name is not answer text).
+  enum class InkBlock { kNone, kHeader, kThinking, kText, kToolJson };
+  bool inkling_ = false;
+  InkBlock ink_block_ = InkBlock::kNone;
 
   int calls_ = 0;
 };

@@ -1,6 +1,8 @@
 #include "serve/generation_service.hpp"
 #include "serve/image_inputs.hpp"
 #include "text/dsv41_prompt.hpp"
+#include "text/inkling_tool_grammar.hpp"
+#include "text/minimax_tool_grammar.hpp"
 
 #include <mutex>
 #include <unordered_set>
@@ -406,11 +408,11 @@ std::string text_completion_body(const std::string& id, int64_t created,
 // The model object, with the served surfaces as extensions: the sampling
 // defaults (what an omitted field becomes), whether stochastic requests
 // are executable on this engine at all, and the tool/reasoning surface.
-std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
-                         int64_t created, bool sampling_available,
-                         const sample::Params& d, bool tools_available,
-                         bool constraints_available,
-                         bool reasoning_in_content, const ModelFrontend& frontend, bool images_available) {
+std::string model_object(const ServiceConfig& scfg, const std::string& model_id, int64_t created,
+                         bool sampling_available, const sample::Params& d, bool tools_available,
+                         bool constraints_available, bool reasoning_in_content,
+                         const ModelFrontend& frontend, bool images_available,
+                         bool video_available) {
   std::string out;
   out.append("{\"id\":");
   append_json_string(&out, model_id);
@@ -463,6 +465,7 @@ std::string model_object(const ServiceConfig& scfg, const std::string& model_id,
   out.append(scfg.default_chat_template_kwargs);
   out.append(",\"input_modalities\":[\"text\"");
   if (images_available) out.append(",\"image\"");
+  if (video_available) out.append(",\"video\"");
   out.append("]");
   // The rope ramp in force, under the names the deployment JSON uses, so
   // what an operator set is what a client reads, plus the three values the
@@ -565,6 +568,11 @@ GenerationService::GenerationService(const ServiceConfig& cfg,
   std::sort(boundary_ids_.begin(), boundary_ids_.end());
   boundary_ids_.erase(std::unique(boundary_ids_.begin(), boundary_ids_.end()),
                       boundary_ids_.end());
+  turn_marker_id_ = frontend_->self_opened_turn_marker();
+  if (turn_marker_id_ >= 0 &&
+      !std::binary_search(boundary_ids_.begin(), boundary_ids_.end(), turn_marker_id_))
+    throw std::invalid_argument(
+        "GenerationService: the self-opened turn marker is not one of the frontend's boundary tokens");
   const auto defaults = minijson::parse(cfg_.default_chat_template_kwargs);
   if (!defaults.root.is_object() ||
       cfg_.default_chat_template_kwargs.find_first_not_of(" \t\r\n", defaults.consumed) !=
@@ -591,8 +599,9 @@ GenerationService::GenerationService(const ServiceConfig& cfg,
   default_chat_template_kwargs_ = defaults.root;
   if (sched_.prefix_slots() > 0)
     DGPP_LOG_INFO(
-        "serve: prefix cache on — {} snapshot slots, {} boundary token(s)",
-        sched_.prefix_slots(), boundary_ids_.size());
+        "serve: prefix cache on — {} snapshot slots, {} boundary token(s){}",
+        sched_.prefix_slots(), boundary_ids_.size(),
+        turn_marker_id_ >= 0 ? ", turns cut one token before the next speaker's marker" : "");
   // The sampling surface: the defaults must be a valid spec (an operator
   // error otherwise), and an engine that cannot draw serves GREEDY defaults
   // — loudly — rather than a stochastic mode it would silently ignore.
@@ -1389,8 +1398,28 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
         // the keyword path, a non-strict one leaves that value free.
         std::vector<std::string> warnings, notes;
         try {
+          // The formats whose arguments are not GLM's typed values keep
+          // every property's schema: MiniMax's recursive XML and Inkling
+          // 2's JSON call body.
+          const bool inkling = markers_.tool_format() == dgpp::text::ToolFormat::kInkling;
           g.tools.push_back(
-              dgpp::text::grammar_tool_from_function(def, &warnings, &notes));
+              dgpp::text::grammar_tool_from_function(def, &warnings, &notes,
+                markers_.tool_format() == dgpp::text::ToolFormat::kMiniMax || inkling));
+          if (inkling) {
+            GrammarSpec one;
+            one.mode = GrammarSpec::Mode::kAuto;
+            one.tools.push_back(g.tools.back());
+            // Refuse a schema the call grammar cannot compile at the
+            // request boundary, before a worker or a peer rank configures it.
+            dgpp::text::InklingToolGrammar validate(nullptr, one);
+          }
+          if (markers_.tool_format() == dgpp::text::ToolFormat::kMiniMax) {
+            GrammarSpec one;
+            one.tools.push_back(g.tools.back());
+            // Refuse unrepresentable XML schemas at the request boundary,
+            // before a worker or a peer rank configures its grammar.
+            dgpp::text::MiniMaxToolGrammar validate(nullptr, one);
+          }
         } catch (const std::invalid_argument& e) {
           const std::string prefix =
               "tools[" + std::to_string(i) + "]" + (fn != nullptr ? ".function." : ".");
@@ -1562,8 +1591,7 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
       // GLM-5.3-Flash's never does — thinking is always on there.
       if (!frontend_->template_reads("enable_thinking"))
         return refuse(
-            "this template has no enable_thinking knob — thinking is always "
-            "on (the generation prompt opens <think>); use reasoning_effort",
+            "this template has no enable_thinking knob; use reasoning_effort",
             where, "unsupported_parameter");
       if (!m.value.is_bool()) return refuse(where + " must be a boolean", where);
       extra.push_back(m);
@@ -1573,8 +1601,7 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
       // for that stack turns thinking off here too.
       if (!frontend_->template_reads("enable_thinking"))
         return refuse(
-            "this template has no thinking knob — thinking is always on "
-            "(the generation prompt opens <think>); use reasoning_effort",
+            "this template has no thinking knob; use reasoning_effort",
             where, "unsupported_parameter");
       if (!m.value.is_bool()) return refuse(where + " must be a boolean", where);
       Member alias = m;
@@ -1673,12 +1700,20 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
           saw_thinking = true;
           continue;
         }
-        if (type->as_string() == "image_url") {
-          if (r != "user") return refuse("images require a user message", at + ".type", "unsupported_content_type");
-          if (!frontend_->supports_images() || !engine_->supports_images())
-            return refuse("the served model does not support image inputs", at + ".type", "unsupported_content_type");
-          const auto* image = part.find("image_url");
-          if (!image || !image->is_object()) return refuse("image_url must be an object", at + ".image_url");
+        if (type->as_string() == "image_url" || type->as_string() == "video_url") {
+          const bool video = type->as_string() == "video_url";
+          const std::string field = video ? "video_url" : "image_url";
+          if (r != "user")
+            return refuse("media inputs require a user message", at + ".type",
+                          "unsupported_content_type");
+          if (video ? (!frontend_->supports_video() || !engine_->supports_video())
+                    : (!frontend_->supports_images() || !engine_->supports_images()))
+            return refuse(video ? "the served model does not support video inputs"
+                                : "the served model does not support image inputs",
+                          at + ".type", "unsupported_content_type");
+          const auto* image = part.find(field);
+          if (!image || !image->is_object())
+            return refuse(field + " must be an object", at + "." + field);
           parts.push_back(part);
           continue;
         }
@@ -2060,7 +2095,8 @@ bool GenerationService::validate_chat_parameters(const minijson::Value& body, Pr
   const std::unordered_set<std::string> unsupported = {
       "web_search_options", "functions", "function_call", "prompt_cache_options"};
   const std::unordered_set<std::string> nullable_unsupported = {
-      "audio", "prediction", "moderation", "prompt_cache_retention", "verbosity"};
+      "audio",     "prediction",     "moderation", "prompt_cache_retention",
+      "verbosity", "prompt_logprobs"};
   std::unordered_set<std::string> seen;
   for (const auto& m : body.members()) {
     if (!seen.insert(m.key).second) return refuse(m.key, "duplicate request parameter", "invalid_parameter");
@@ -2322,9 +2358,12 @@ void GenerationService::prepare_chat_completions(const HttpRequest& req,
     auto input = frontend_->prepare_chat(plan.globals);
     prompt = std::move(input.tokens);
     images = std::move(input.images);
-    validate_image_inputs(images, prompt.size());
+    validate_image_inputs(images, prompt.size(),
+                          frontend_->supports_video() && engine_->supports_video());
   } catch (const ImageInputError& e) {
-    respond_error(w, 400, e.what(), "invalid_request_error", e.param, "invalid_image");
+    respond_error(
+        w, 400, e.what(), "invalid_request_error", e.param,
+        e.param.find(".video_url") != std::string::npos ? "invalid_video" : "invalid_image");
     return;
   } catch (const std::exception& e) {
     respond_error(w, 400,
@@ -2488,6 +2527,14 @@ void GenerationService::prepare_completions(const HttpRequest& req,
                   "invalid_request_error", "model", "model_not_found");
     return;
   }
+  std::unordered_set<std::string> seen;
+  for (const auto& m : body.members()) {
+    if (!seen.insert(m.key).second) {
+      respond_error(w, 400, "duplicate request parameter", "invalid_request_error", m.key,
+                    "invalid_parameter");
+      return;
+    }
+  }
   const dgpp::minijson::Value* prompt = body.find("prompt");
   if (prompt == nullptr || !prompt->is_string()) {
     respond_error(w, 400,
@@ -2561,6 +2608,11 @@ void GenerationService::prepare_completions(const HttpRequest& req,
     sampling.logprobs = logprobs;
   }
 
+  if (optional_field(body, "prompt_logprobs")) {
+    respond_error(w, 400, "'prompt_logprobs' is not supported by this server",
+                  "invalid_request_error", "prompt_logprobs", "unsupported_parameter");
+    return;
+  }
   const char* unsupported[] = {"echo", "suffix", "top_logprobs",
                               "n",    "best_of", "user"};
   for (const char* param : unsupported) {
@@ -2655,21 +2707,24 @@ void GenerationService::route_models(const HttpRequest& req,
                                      HttpResponseWriter& w) {
   const int64_t created = std::time(nullptr);
   if (req.path == "/v1/models") {
-    w.respond(200, "application/json",
-              "{\"object\":\"list\",\"data\":[" +
-                  model_object(cfg_, cfg_.model_id, created, sampling_available_,
-                               cfg_.sampling_defaults, tool_calls_available(),
-                               constraints_available(),
-                               cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()) +
-                  "]}");
+    w.respond(
+        200, "application/json",
+        "{\"object\":\"list\",\"data\":[" +
+            model_object(cfg_, cfg_.model_id, created, sampling_available_, cfg_.sampling_defaults,
+                         tool_calls_available(), constraints_available(), cfg_.reasoning_in_content,
+                         *frontend_, frontend_->supports_images() && engine_->supports_images(),
+                         frontend_->supports_video() && engine_->supports_video()) +
+            "]}");
     return;
   }
   const std::string id = req.path.substr(std::string("/v1/models/").size());
   if (id == cfg_.model_id) {
-    w.respond(200, "application/json",
-              model_object(cfg_, id, created, sampling_available_,
-                           cfg_.sampling_defaults, tool_calls_available(),
-                           constraints_available(), cfg_.reasoning_in_content, *frontend_, frontend_->supports_images() && engine_->supports_images()));
+    w.respond(
+        200, "application/json",
+        model_object(cfg_, id, created, sampling_available_, cfg_.sampling_defaults,
+                     tool_calls_available(), constraints_available(), cfg_.reasoning_in_content,
+                     *frontend_, frontend_->supports_images() && engine_->supports_images(),
+                     frontend_->supports_video() && engine_->supports_video()));
     return;
   }
   respond_error(w, 404, "the model '" + id + "' does not exist",
@@ -2911,6 +2966,8 @@ void GenerationService::route_metrics_prometheus(HttpResponseWriter& w) {
   out.gauge("dgpp_prefix_cache_pinned", "Entries a prompt_cache_key pins against eviction.", static_cast<int64_t>(m.prefix_pinned));
   out.gauge("dgpp_prefix_cache_snapshot_bytes", "Bytes per arena snapshot.", pe.snapshot_bytes);
   out.counter("dgpp_prefix_cache_hits_total", "Admissions that attached to an entry.", m.prefix_hits);
+  out.counter("dgpp_prefix_cache_partial_hits_total", "Of the hits, admissions that attached inside an entry.",
+              m.prefix_partial_hits);
   out.counter("dgpp_prefix_cache_misses_total", "Admissions that found no entry.", m.prefix_misses);
   out.counter("dgpp_prefix_cache_queries_total", "Prefix-cache lookups (hits plus misses).",
               m.prefix_hits + m.prefix_misses);
@@ -3171,6 +3228,8 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
   append_json_int(&out, sched_.admission_policy().prefix_min_tokens);
   out.append(sched_.admission_policy().prefix_head_snapshots ? ",\"head_cuts\":true"
                                                                : ",\"head_cuts\":false");
+  out.append(sched_.admission_policy().prefix_partial_hits ? ",\"partial_hits_on\":true"
+                                                             : ",\"partial_hits_on\":false");
   out.append(",\"entries\":");
   append_json_int(&out, m.prefix_entries);
   out.append(",\"hits\":");
@@ -3179,6 +3238,8 @@ void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meter
   append_json_int(&out, m.prefix_misses);
   out.append(",\"tokens_saved\":");
   append_json_int(&out, m.prefix_tokens_saved);
+  out.append(",\"partial_hits\":");
+  append_json_int(&out, m.prefix_partial_hits);
   out.append(",\"snapshots\":");
   append_json_int(&out, m.prefix_snapshots);
   out.append(",\"head_snapshots\":");
@@ -3606,9 +3667,31 @@ std::vector<int64_t> GenerationService::prompt_boundaries(
     const std::vector<int64_t>& prompt) const {
   std::vector<int64_t> out;
   if (boundary_ids_.empty()) return out;
-  for (size_t i = 1; i < prompt.size(); ++i)
-    if (std::binary_search(boundary_ids_.begin(), boundary_ids_.end(), prompt[i]))
-      out.push_back(static_cast<int64_t>(i));
+  const auto marker = [&](int64_t id) {
+    return std::binary_search(boundary_ids_.begin(), boundary_ids_.end(), id);
+  };
+  if (turn_marker_id_ < 0) {
+    for (size_t i = 1; i < prompt.size(); ++i)
+      if (marker(prompt[i])) out.push_back(static_cast<int64_t>(i));
+    return out;
+  }
+  // The model opens its own turn. A prompt that ends "…<end of message>"
+  // is answered from its last token on, and an answer's cached state stops
+  // at its end-of-sampling token, which is never fed. Both are one token
+  // before the marker of the speaker that follows, so that is where a
+  // change of speaker cuts. A marker that continues the same speaker (the
+  // blocks of one turn, a system prompt's parts) cuts at itself.
+  const auto push = [&](int64_t at) {
+    if (at >= 1 && (out.empty() || at > out.back())) out.push_back(at);
+  };
+  int64_t speaker = !prompt.empty() && marker(prompt[0]) ? prompt[0] : -1;
+  for (size_t i = 1; i < prompt.size(); ++i) {
+    if (!marker(prompt[i])) continue;
+    push(static_cast<int64_t>(i) - (prompt[i] != speaker ? 1 : 0));
+    speaker = prompt[i];
+  }
+  // The end of a chat prompt the model answers: its marker comes next.
+  if (speaker >= 0 && speaker != turn_marker_id_) push(static_cast<int64_t>(prompt.size()) - 1);
   return out;
 }
 

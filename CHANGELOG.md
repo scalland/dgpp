@@ -5,6 +5,545 @@ project procedures and design guidance live in `docs/`.
 
 ## Unreleased
 
+- **Inkling 2 Mini** (`thinkingmachines/Inkling-2-Mini`, `inkling2_loop`): a
+  new family on the shared engine, served as shipped on one, two and four
+  nodes. The model is a looped transformer: 24 layers of weights with layers
+  6 to 17 walked three times, attention residuals over blocks of six in place
+  of a residual stream, loop messages blended by low-rank controllers, a
+  learned relative bias with a sink column and a gated output in attention,
+  short causal convolutions on four streams of every visit, and NVFP4 and
+  MXFP8 routed experts. `engine.activations` selects the expert input recipe:
+  `native` is the checkpoint's own (NVFP4 inputs with the four-over-six block
+  scale choice, MXFP8 inputs on the last four layers) and `bf16` is the
+  arithmetic of the transformers reference. Every visit owns a plane of the
+  K/V pool, convolution inputs live in a ring indexed by position so a
+  rolled-back row copies nothing, and a prefix snapshot carries the three
+  positions before its cut. Prefill attention is query-tiled on the tensor
+  cores and the NVFP4 experts of prefill rows run with both operands in four
+  bits. The text side reads the release's tokenizer and chat template
+  (float and dict literals, list concatenation, `float`, `dictsort` and the
+  `json.dumps` arguments of `tojson` are new to the template engine), parses
+  the model's typed reply blocks into reasoning, content and tool calls, and
+  constrains `tool_choice` and `response_format` over the same blocks. The
+  template writes no generation prompt, so the prefix cache cuts one token
+  before every change of speaker and at a prompt's last token
+  (`ModelFrontend::self_opened_turn_marker`), which is where a repeated
+  prompt and the next turn attach. The bundled draft model runs on the
+  shared block drafter (`engine.mtp`, on in the templates): seven proposals
+  a step from a three-layer model that reads four of the target's states,
+  with a recurrent head that corrects the whole vocabulary step by step and
+  stops once no later proposal could be verified, a verify depth scheduled
+  from a calibrated acceptance estimate that may verify nothing
+  (`engine.mtp_schedule_min_depth` 0), and verify passes of several requests
+  that read each attention matrix once (`"bf16_weights": "bf12+bf16"`). A
+  verify row is the plain step at its position bit for bit through a
+  request's eight rows, so greedy output is the same with and without the
+  draft. The vision tower is served: an image
+  keeps its size at one token per 40 x 40 pixel cell, and its rows take the
+  place of the placeholder tokens' embeddings. Templates
+  `deploy/cluster_inkling-2-mini_nvfp4-mxfp8_w{1,2,4}.example.json`, notes in
+  `docs/model_cards/Inkling-2-Mini.md` and `docs/inkling2_mini_plan.md`.
+- **The packed tensor-core GEMV takes widths with a tail**
+  (`kernels/mma_gemv`): the 12-bit form's launches read a matrix whose width
+  is whole 1,024-value blocks followed by whole 256-column steps (2,304,
+  2,560), bit for bit the BF16 launch. The GEMM interface's own rule is
+  unchanged, whole blocks only, because the form pays on a matrix whose
+  stream dominates the launch: Inkling 2 uses it for its vocabulary head
+  from nine to 32 rows, 2.9 ms against 4.0. A gated launch
+  (`launch_mma_gemv_bf16_f32_gated`) and a gate on `dflash2_topk_f32` let a
+  recorded pass skip a step whose result nothing will read.
+- **Padding rows read no experts** (`launch_moe_segment`'s `positions`):
+  given the rows' positions, the device-side segment builder leaves a
+  padding row (a closed slot's rows in a row batch, a row past the context)
+  in no expert's row list, so an expert only padding rows selected is not
+  read. Inkling 2 passes them: with five or seven requests decoding on one
+  node, plain decoding gained 10 to 13 percent and decoding with the draft 3
+  to 7 percent. The other routed-expert families do not pass positions yet.
+- **A schedule's minimum depth may be zero for a block drafter**
+  (`engine.mtp_schedule_min_depth`): a step then feeds the pending token
+  alone when its first proposal is not worth a verify row.
+- **A recorded copy takes any size and alignment**
+  (`kernels/device_copy.hpp`): the kernel copy every family's decode graph
+  uses moved out of `kernels/glm_spec` and picks 16-byte units, 4-byte words
+  or bytes from the span it is given. The verify snapshot of a sampled
+  request copied whole 16-byte units only, which an odd number of logits rows
+  of a vocabulary that is not a multiple of four values is not: a scheduled
+  verify depth on Inkling 2's 200,058 ids refused to capture.
+- **A scheduled step verifies only the drafts its request holds, with a
+  single scheduled depth too** (issue #193): with
+  `engine.mtp_schedule_options` 1 the policy's only option is the full
+  block, and under `engine.mtp_schedule_max_live` a step past the limit
+  drafts `engine.mtp_schedule_min_depth` tokens only. The first step a
+  request took back under the limit capped its depth at the drafts it held
+  and then rounded up to the next option, which was the full block, so it
+  verified rows its last replay had not drafted. A greedy request decided
+  the same tokens (such a row holds a token that stands only when it is the
+  model's own pick) and paid a verify row for nothing. A sampled request
+  could test a draft against a proposal the draft was not drawn from: after
+  a row-batched narrow step when the older proposal's token was id 0, and
+  after scalar narrow steps on the older draft itself. The option set now
+  carries a refill option beside a single policy option, the minimum depth
+  verified and the whole block drafted. The step after a narrow one takes
+  it and the full depth follows. For every set the chosen option is bounded
+  by the drafts the request holds, and the engine refuses a choice past
+  them. A set with two or more options, the default, chooses exactly as it
+  did. `verify_schedule_test` builds every option set of a 2 to 7 draft
+  block and checks every choice, `glm_dsa_engine_test` holds the issue's
+  sequence to one refill step
+  (`scheduled_verify_depth_single_option_refills_after_the_narrow_batch`)
+  and runs seeded random arrivals of greedy and sampled requests against
+  its own count of the drafts each slot holds
+  (`scheduled_verify_depth_random_walks_verify_only_the_drafts_held`).
+- **A chat template's names belong to the scope that assigns them, as in
+  the reference**: jinja2 decides from the syntax tree which scope owns a
+  name. A scope that assigns a name owns it for its whole extent, and when
+  the assignment is the scope's first mention of the name and is not under
+  an `if`, the name is undefined there until the assignment runs. The
+  interpreter looked a name up in the frames assigned so far and then in the
+  globals, so a nested scope that read the name before the assignment saw
+  the render's global where the reference sees nothing. With `label`
+  supplied,
+  `{% for b in xs %}[{{ label }}]{% endfor %}{% set label = 'local' %}`
+  rendered `[global]` and the reference renders `[]`. The same held for a
+  generation block, the body of a block set and a macro in place of the
+  loop. The interpreter now resolves ownership once at compile, for the top
+  level, a for body, a macro body, the body of a block set and a generation
+  block, and each scope starts with the names it owns that way undefined.
+  The body of a block set is a scope of its own, so what it assigns ends
+  with it, and a `break` inside one ends the enclosing loop. A macro
+  parameter's default is evaluated in the macro's scope, where it reads the
+  parameters before it and the top level, not the caller's names. `reads()`
+  follows the same ownership. A render differs only for a template that
+  re-binds a name the render supplies after a nested scope has read it, a
+  shape none of the supported templates has. The cases of
+  `chat_template_scope_owns_the_names_it_assigns_from_its_first_statement`,
+  `chat_template_block_set_and_macro_bodies_are_scopes` and
+  `chat_template_scope_ownership_decides_the_global_reads` are the
+  reference's strings, and `chat_template_generator_test` holds the
+  generator's environment, its generation block included, to the same
+  strings.
+- **The chat template interpreter reads transformers' `{% generation %}`
+  block**: the `Qwen/Qwen3.8-Flash-Next-FP8` repository's template now wraps
+  the assistant turn in `{% generation %}` ... `{% endgeneration %}`,
+  transformers' marker for the span an assistant turn generates (the source
+  of its assistant-token mask). The interpreter refused the template at load
+  with `unsupported statement 'generation'`, so a checkpoint downloaded since
+  that change did not get past the template. The block now parses and renders
+  as the reference does. A render takes the body as written. The reference
+  parses the block as a call block, so the body reads the enclosing scope,
+  its own assignments end with it, a namespace attribute stays set, and a
+  break may not leave it. The new template renders what the previous one
+  did: regenerating `tests/data/qwen_chat_template_goldens.jsonl` against it
+  changes the header's template hash and none of the 20 cases, renders and
+  token ids alike. The reference environment of
+  `tools/gen_chat_template_goldens.py` carries the same block and matches
+  transformers' own environment on every case.
+  `chat_template_generation_block_renders_its_body_in_its_own_scope` and
+  `chat_template_generation_block_scopes_the_global_reads` hold the
+  interpreter to the reference's strings and refusals.
+- **A prefill boundary's adapter rows fold in one bulk collective and
+  project a block of rows at a time**: two costs of a runtime adapter on a
+  long prompt, both bit for bit what they replace.
+  The fold. A runtime adapter's correction needs the ranks' FP32 rank-space
+  rows summed before B is applied, and they travel as byte digits through the
+  bf16 all-reduce (`adapters/bus_sum.hpp`). The eager walk sent them as
+  latency collectives, one slot at a time, each a host-driven collective of
+  its own. A decode step's rows are a fraction of a slot. A prefill
+  boundary's are not: 1,024 rows at rank 50 are 819,200 digits, six
+  294,912-byte slots, and the six collectives took 1.9 ms a boundary, as long
+  as the boundary's own 12.6 MB partial takes through the bulk machine. On
+  the full GLM-5.3 with a rank-50 adapter that was 8.3 % of a cold prefill's
+  kernel time. Past two latency slots the digits now take the bulk machine in
+  one collective, the rule a boundary's partial follows. Every element is one
+  rank's digit plus zeros, so the sum is the same bits on either machine, and
+  up to two slots (a decode step, a short prompt, a mixed walk's rows)
+  nothing changes. A bulk collective of fewer stripes than ranks folds
+  correctly, which the comment that kept these rows off it had doubted.
+  The projection. `low_rank_project` ran a block a value: 128 threads read
+  the row of x and the row of A from global memory, so a boundary of 1,024
+  rows at rank 50 was 51,200 blocks, each row of x read 50 times and all of A
+  read once a row. For 16 rows and more, while a block's rows of x fit the
+  default shared memory, a block is now four rows of x staged once against
+  every factor (`project_tile`): four lanes of 128 threads take the factors
+  in turn and run each factor's terms down the block's rows. A value is the
+  same chain over the same inputs in the same order and the same tree over
+  the 128 partials. A decode step's few rows keep a block a value.
+  `runtime_adapter_native_test`: `transport_sizes_check` runs the eager fold
+  at five sizes on worlds of two and four (half a latency slot, two slots
+  less a value, two slots plus a value where not every rank owns a stripe,
+  4,099 values and 70,001), each the FP32 rank-order sum bit for bit, and
+  `kernel_check` holds the tiled projection to the digit-writing one at the
+  two production widths, a last block of two rows, inputs that leave the
+  chains unequal or empty, a rank below the block's lanes and inputs too wide
+  for a tile.
+  Four nodes, GLM-5.3 Mixed346 with the rank-50 adapter on production's
+  recipe, one request, against master before and after in the same window,
+  cold prefill in seconds, master / the fold / the fold and the projection:
+  17.18, 17.32, 17.28 / 16.14 / 15.93 at 7.7K tokens; 54.60, 54.77, 54.71 /
+  51.23 / 50.25 at 24K; 160.88 / 150.86 / 150.89 at 65K; 17.51, 17.53, 17.55
+  / 16.29 / 16.10 and 23.69, 23.77, 23.65 / 22.05 / 21.81 on two repository
+  prompts. Together 6.2 to 8.1 % off the nearest baseline, of which the
+  projection is 1.1 to 1.9 % up to 24K and nothing at 65K. Decode level (78.5
+  to 79.0 ms a pass at 7.7K and 24K, 81.1 to 81.5 at 65K). Chat transcripts
+  identical on every prompt. Raw completions with the prefill controller
+  pinned, four prompts of 7.7K to 24K tokens, 300 tokens each with every
+  token's logprobs: equal to master's at every token, bit for bit.
+- **A request's head rows and mask rows follow the request, not the last
+  batch** (issue #182): two defects of concurrent requests on engines with
+  compacted batches, both from state a batch left behind for the request that
+  went on alone.
+  The server exit. The AutoRound hybrid's int8 plane head
+  (`kernels/packq_head`) reads only the argmax candidates for the rows of a
+  plain greedy slot and leaves every other logit `-inf`. Which slot a row
+  belonged to was derived from the last batch family's capture state
+  (`request_map[row / rows_per_request]`), and that state outlived the batch:
+  a slot's scalar graph captured after the families, every eager one-row
+  verify, a slot-prefix batch and the one-row-per-request chain of a batched
+  draft read the flag of whichever slot the last batched replay had put
+  first, or of slot 0. A closed slot is plain greedy. So when two sampled
+  requests decoded together and the one the batch listed first retired, the
+  survivor's rows came back in the argmax form: its draws came from the
+  argmax candidates alone, and a grammar-constrained request whose mask
+  excluded those candidates had no logit left. The sampled fallback's fold
+  threw `glm_sample: non-finite slice log-sum-exp` and the server exited. The
+  head now takes each row's slot from the walk's own per-row request table
+  (`PackqHeadMode::row_slots`), the one attention and the recurrent state
+  read and every decode-shaped walk already stages, so a row's flag no longer
+  depends on the shape of the call or on what was captured before it.
+  The leaked mask. A batch stages its token masks by position
+  (`stage_masks_compact`), and a request's position is not its slot when the
+  requests joined on different ticks (the round robin steps the later
+  arrival first). A request without a grammar never restaged its own rows, so
+  after a constrained neighbour retired it decoded alone under that
+  neighbour's last mask: a free answer beside a finished `json_object`
+  request trailed off into tabs and ended. An unconstrained slot now writes
+  zero headers into its own rows on every replay, a slot's host masks are
+  reset with its grammar, and the fallback's eagerly re-run rows take a mask
+  only from a slot that has a grammar.
+  Gates: `packq_head_test` (`packq_head_row_table_names_each_rows_slot`: the
+  slot each row reads for a lone slot's one and two rows, one row a request,
+  slots that are not a prefix, padding rows and a chunk boundary inside a
+  request), `qwen_engine_test`
+  (`qwen_engines_argmax_head_never_changes_a_transcript`: one seeded workload
+  of plain greedy and sampled requests on two engines over the hybrid
+  fixture, one with the head flags and one reading every row in full, every
+  transcript equal, at one and three drafts, over compacted and slot-prefix
+  batches and under the scheduled verify depth) and `glm_tp_test`
+  (`glm_tp_serving_graph_free_request_keeps_its_vocabulary_beside_a_constrained_one`:
+  free, JSON, schema and tool-constrained requests arriving together or
+  staggered, against the eager engine). Before the change the Qwen gate
+  reports 4 of 29 requests changed and a sampled slot's eager row holding 2
+  of 512 logits, and the GLM gate a free request repeating the one token its
+  neighbour's mask allowed. Seeded runs of both: 200 engine pairs (16,630
+  requests) and 5,280 transcripts against the eager engine, no difference.
+  One Spark, the hybrid at one draft (the report's settings) and at the
+  template's three, the report's pairs of strict `json_schema` requests at
+  temperature 1: master exits on pair 4 with the report's error after the
+  survivor's fallbacks (3 and 12 of about 21 steps), the change runs 330
+  pairs (strict and `json_object`) with every output valid, no fallback in
+  28,155 sampled steps and no engine failure. A free prose request beside a
+  `json_object` request: cut after 4 to 27 tokens in 14 of 14 runs before,
+  its full 200 tokens in 16 of 16 after. A fuzz of 1,403 mixed requests in
+  550 waves (greedy and sampled, free, `json_object`, strict schemas and
+  tools, one to four at a time): the server up throughout and every
+  constrained answer valid. Greedy requests still read the argmax form: four
+  prompts at three drafts decode at 40.1, 65.1, 53.1 and 63.6 tok/s before
+  and after (53 to 54 ms a pass) with identical transcripts.
+- **The rows of a request score against one staging of each index tile**: the
+  decode selection (`select_decode_kernel`) gave each block one row's stripe
+  of the context, so the rows of a request — a decode step's token and its
+  drafts, a token apart in the same context — each staged the whole index
+  from memory: three rows at 65K tokens were three passes over the same 8 MB
+  a launch, 22 launches a pass on the full GLM-5.3. Consecutive rows of one
+  request now share their blocks. A group of up to four such rows (two at 64
+  heads: a row's q and histogram are the block's shared memory) splits the
+  request's context between the rows' blocks, and a block stages a tile once
+  and scores every row of the group against it. A row's score is the same
+  instructions on the same operands, so the keys and the selection are bit
+  for bit what they were whatever rows share a launch
+  (`dsa_select_decode_rows_of_a_request_share_their_tiles`: eight rows as one
+  request, as runs of three, one, two and two, and as a request a row, with
+  a short context and a padding row inside a group). Rows of different
+  requests score as before.
+  The kernel alone (`dsa_select_bench --layers 24`: every launch's index
+  cold), us a launch at the full model's geometry: three rows 50.8 -> 48.3 at
+  24K tokens and 112.1 -> 101.3 at 65K; eight rows 78.9 -> 61.5 and 189.3 ->
+  137.6; level at 8K. At 64 heads, four rows: 121 -> 117 and 296 -> 268.
+  Four nodes, GLM-5.3 Mixed346 with a runtime adapter on production's recipe
+  (two drafts scheduled: three rows the common pass), one request, against
+  master before and after in the same window (the legs carried the staged
+  prefill attention as well, which does not run in decode): a pass at 65K
+  tokens of context 83.1 / 82.0 -> 81.1 ms (three readings, 81.1 to 81.2;
+  33.4 / 33.8 -> 34.2 tok/s); level at 24K (79.4 / 79.1 -> 79.1), at 7.7K, on
+  short prompts and at two and eight requests. Raw completions with the
+  prefill controller pinned, six prompts of 7.7K to 65K tokens, 300 tokens
+  each with every token's logprobs: equal to master's at every token, bit for
+  bit. GLM-5.3-Flash NVFP4-FP8 and DeepSeek-V4.1-Flash-1017: level,
+  transcripts identical.
+- **A prefill tile attends from one decoded copy of its distinct cache rows**:
+  past a prompt's first 2,048 tokens a query row attends to the tokens its
+  selection listed, and a prefill tile is 128 consecutive rows of one
+  request, whose lists mostly agree. On the full GLM-5.3 a tile's 257,000
+  (row, token) pairs name 11,500 distinct tokens on average and 38,000 at
+  most (prompts of 8K to 65K tokens). The listed kernel gathered and
+  dequantized a cache row once a pair, and it is a fifth of a cold prefill
+  (20.7 % at 24K tokens). `dsa_attn_listed_staged` puts three small launches
+  ahead of the attention's: every listed token's bit in a bitmap of the
+  request's tokens, the set bits numbered in token order, and each numbered
+  token's cache row through the format's own decode into a contiguous bf16
+  copy. The attention kernel (a staged instantiation of `attn_flash_kernel`)
+  resolves a list entry to its row in the copy and fetches bf16. The copy
+  holds the bits the decode produces, so the partials are bit for bit the
+  launch from the cache (`dsa_listed_attention_from_the_staged_copy_is_the_listed_attention`,
+  every quantized format). The host does not know a tile's distinct count (a
+  chunk is enqueued without a readback), so the copy is a fixed 40 MB of
+  rows and the kernel itself reads the cache, as before, for a tile that
+  lists more: one launch in a thousand here. The size is measured, not
+  derived: 19, 24, 32 and 40 MB held 77, 88, 98 and 99.9 % of the launches
+  and each step was level or better. The rule is the shared layers': the GLM
+  layers at the listed kernel's geometries over a quantized cache, and
+  DeepSeek-V4.1's two sources (the window's fp8_block rows, the compressed
+  fp4_block entries). A bf16 cache (DeepSeek-V4) is its own decoded copy and
+  keeps the launch from the cache. A model logs at shutdown how many
+  launches read the copy and how many the cache.
+  The kernel alone (`dsa_attn_tile_bench`, 512 + 64 over an fp8 cache, 128
+  rows of 2,048 tokens, every launch's cache cold), us a tile with the three
+  staging launches included: 841 -> 656 at 6,400 distinct rows, 843 -> 697 at
+  11,400, 841 -> 733 at 16,000, 844 -> 764 at 21,600; level at 30,000 and 3 %
+  behind at 38,000 over uniformly random lists, an edge the model's own lists
+  did not show on the fabric. The decode's launches are unchanged (the same
+  times at one to eight rows).
+  Four nodes, GLM-5.3 Mixed346 with a runtime adapter on production's recipe,
+  one request, against master before and after in the same window (the legs
+  carried the selection's shared index tiles as well, which do not run in
+  prefill): cold prefill 17.9 / 17.9 -> 17.3 s at 7.7K tokens, 56.7 / 56.5 ->
+  54.8 at 24K, 165.5 / 164.6 -> 161.4 at 65K, and 18.5 / 18.2 -> 17.6 and 24.7
+  / 24.6 -> 23.7 s on two repository prompts: 2.0 to 3.6 % off the nearer
+  baseline. 66,684 launches read the copy and 68 the cache. Short prompts and
+  two and eight requests level. Raw completions with the prefill controller
+  pinned, six prompts of 7.7K to 65K tokens, 300 tokens each with every
+  token's logprobs: equal to master's at every token, bit for bit.
+  DeepSeek-V4.1-Flash-1017 staged every launch (2,200 distinct rows on
+  average) and measured level, 8.74 -> 8.67 s at 24K tokens: its listed
+  attention is a small part of its prefill. GLM-5.3-Flash NVFP4-FP8 keeps a
+  bf16 cache: level, as it should be.
+
+- **The decode selection scores with the prefill select's arithmetic**: the
+  kernel that chooses a query's attended tokens (`select_decode_kernel`)
+  scores every token of the context for every query row. For the 32-head
+  indexers (GLM-5.3, GLM-5.3-Flash, DeepSeek-V4) that was a scalar chain,
+  128 separate multiply-adds a head a lane: 146 us of a 191 us launch at 32K
+  tokens and two rows, 22 launches a pass on GLM-5.3, the part of a decode
+  pass that grows with the context. The 32-head form is now the prefill
+  select's fused scoring, instruction for instruction
+  (`mma.m16n8k32` on the e4m3 codes, each head's dot times `w * scale`, the
+  same head-sum fold), over the blocked cache. A decode step scores an entry
+  to the same bits as a prefill tile does
+  (`dsa_select_decode_keys_are_the_prefill_select_keys`); until now the two
+  were different roundings of the same sums. Against the chain a score
+  agrees to the fp32 sums' rounding, not bit for bit (both within 1.3e-7 of
+  a row's score range of the exact logit), so two entries that tie that
+  closely at the selection's boundary can trade places. The selection's two
+  passes over a row's keys ask for eight keys a thread together. Alone, us a
+  launch at two rows: 61 -> 23 at 8K tokens, 191 -> 48 at 32K, 357 -> 80 at
+  65K, 705 -> 155 at 131K; at eight rows 715 -> 91 at 32K. The decode-select
+  tests hold every score to its exact (fp64) logit and the selection bitwise
+  to the top of the kernel's own keys, which are bitwise the same at another
+  grid and with other rows beside the row. The 64-head form
+  (DeepSeek-V4-Flash) is unchanged.
+  Four nodes, GLM-5.3 Mixed346 with a runtime adapter on production's recipe
+  (two drafts scheduled, the limit at one live request), one request, against
+  the same tree without this change: 79.1 -> 78.5 ms a pass at 7.7K tokens of
+  context, 84.1 -> 79.6 at 24K, 95.8 -> 83.3 at 65K (28.9 -> 33.3 tok/s);
+  decode on 8-21K prompts 30.7 -> 31.4, 30.1 -> 30.7 and 28.5 -> 29.9 tok/s;
+  short prompts, two and eight requests level. Against master every chat
+  transcript is identical (eight context probes to 65K, three long prompts of
+  640 tokens, the short classes). Raw completions of four long prompts, 300
+  tokens each with every token's logprobs: three equal master's at every
+  token, bit for bit; one (7.9K tokens) moves two of its first 28 tokens, by
+  up to 0.14 nat, and takes the other of two candidates 0.15 nat apart at the
+  28th. GLM-5.3-Flash NVFP4-FP8 and DeepSeek-V4.1-Flash-1017: level,
+  transcripts identical.
+
+- **The decode's attention over the selected tokens asks for its rows ahead
+  and runs three rows in one round of blocks**: the listed form of
+  `attn_flash_kernel` runs a block of two slabs (sixteen row-heads each) per
+  split of a row's selection. At an odd count of slabs the last block of
+  every split was half empty: three rows of sixteen local heads at 32 splits
+  were 64 blocks where 48 SMs hold one each, so the launch ran as two rounds
+  (alone: 46 us at two rows, 66 at three, 69 at four, 71 at six), and the
+  scheduled verify depth makes three rows the common pass at one request. An
+  odd count of slabs now pairs each slab's two consecutive splits in a block
+  (48 blocks at three rows). A slab also asks for a tile's rows four tiles
+  before it fetches them (`prefetch.global.L2`): a selected row is wherever
+  the selection put it, and the block, alone on its SM, had nothing to run
+  while it waited on DRAM. A slab's arithmetic is its own rows and its own
+  split's tokens either way: every partial is bit for bit the same. Alone,
+  2,048 selected tokens a row from DRAM: two rows 46.5 -> 42.8 us a launch,
+  three 66.2 -> 40.8, four 68.2 -> 59.6.
+  Four nodes, GLM-5.3 Mixed346 with a runtime adapter on production's recipe
+  (two drafts scheduled, the limit at one live request), one request: 80.5 ->
+  79.1 ms a pass at 7.7K tokens of context, 85.3 -> 84.1 at 24K (83.9 with
+  this change alone), 96.2 -> 95.8 at 65K; decode on 8-21K prompts 30.5 ->
+  30.7, 29.7 -> 30.1 and 28.2 -> 28.5 tok/s; short prompts, two and eight
+  requests, and cold prefill level. Every transcript is identical, and every
+  token's logprobs are equal on raw completions of four long prompts. (The
+  legs but the one named carried the adapter's tiled prefill add as well,
+  which does not run in decode.) GLM-5.3-Flash NVFP4-FP8 and
+  DeepSeek-V4.1-Flash-1017: level, transcripts identical.
+
+- **A runtime adapter's correction on a prefill tile's rows runs from shared
+  memory**: `low_rank_add` took the kernel written for a row at a time, in
+  which every thread read its column's `rank` values of B and its row's
+  `rank` values of z from global memory: 630 million loads and 1.6 ms a
+  launch at a 1,024-row tile of rank 50, 8.3 % of a cold prefill's kernel
+  time on GLM-5.3 Mixed346 with its adapter. From 16 rows up it is a tiled
+  kernel: a block is 128 columns by a tile of rows, its slice of B and its
+  rows of z go to shared memory once, and a thread runs its column's chains
+  from there in the same order, so every value is bit for bit the same.
+  Four nodes, GLM-5.3 Mixed346 with its runtime adapter, cold prefill: 19.3 ->
+  17.9 s at 7.7K tokens and 61.1 -> 56.9 s at 24K; 177.4 -> 164.8 s at 65K and
+  19.6 -> 18.2, 26.4 -> 24.7, 53.4 -> 49.7 s on 8K, 10.5K and 21K prompts
+  (those with the listed attention's change beside it, which measured no
+  prefill change alone). Decode level; every transcript identical, and every
+  token's logprobs equal on raw completions of four long prompts.
+
+- **The scheduled verify depth can stop at one live request**:
+  `engine.mtp_schedule_max_live` (`--mtp-schedule-max-live`, default 0: no
+  limit). Past that many live requests a step takes a new narrow replay
+  that verifies and drafts only `engine.mtp_schedule_min_depth` tokens, the
+  pass a fixed depth of that minimum runs. A reduced depth otherwise still
+  drafts the whole block, and a chained draft is a forward of the draft
+  layer and its head (2.0-2.2 ms a pass on GLM-5.3 at one request); with
+  several requests sharing a pass the deeper verify measured -6 % to +2 %
+  at two requests and -3 % to +1 % at eight against one draft. The step
+  after a narrow one verifies what that replay drafted. Chained drafters
+  only. Four nodes, GLM-5.3 Mixed346 with a runtime adapter, two drafts
+  scheduled with the limit at 1 against one draft: one request 29.2-32.0 ->
+  30.1-36.8 tok/s by class and 28.3, 27.9, 27.0 -> 30.4, 29.5, 28.1 on
+  8-21K prompts; two requests 40.8-47.2 -> 41.1-47.1; eight 59.8-66.7 ->
+  60.4-67.5; transcripts identical with the prefill controller pinned.
+
+- **The decode selection writes its token ids in order**: the kernel that
+  chooses a query's attended tokens (`select_decode_kernel`, GLM-5.3,
+  GLM-5.3-Flash and DeepSeek-V4) gathered the chosen keys in the order their
+  threads arrived and then rank-sorted the ids, n^2 / 256 compares a thread.
+  The sort was sized for GLM-5.3-Flash's 512 selected pools; at the full
+  model's 2,048 selected tokens it was 108 us of every launch at any context
+  over 2K, and it also ran on a context short enough to select every token.
+  The gather now marks the selection in a per-row bitmap (a warp's 32
+  consecutive keys are one ballot, one word) and writes the ids out by a
+  prefix count, in order by construction: the same ids, bitwise the same
+  list. Four nodes, GLM-5.3 Mixed346 with a runtime adapter, one request:
+  65.5 -> 63.6 ms a pass at 1.5K tokens of context, 68.5 -> 66.3 at 7.7K,
+  71.7 -> 69.4 at 24K; decode on 8-21K prompts 27.5 -> 28.5, 27.1 -> 28.1 and
+  24.9 -> 25.8 tok/s; short prompts, GLM-5.3-Flash and DeepSeek-V4.1 level;
+  every transcript identical. Alone, at two rows: 182 -> 78 us a launch at
+  10.5K tokens, 257 -> 148 at 24K, 127 -> 11 at 2,048. `dsa_select_bench`
+  takes `--kpool` and `--heads`: it only ran Flash's geometry, which is how
+  the sort went unmeasured.
+
+- **Prefix cache hits inside an entry**: a prompt that shares its first
+  tokens with a cached entry and differs from it before any stored position
+  opens on the shared tokens and prefills only the rest. A request used to
+  attach only where an entry stood at one of its own cuts, so a prompt with
+  an edit in the middle of a long message reused nothing. The request opens
+  one token short of the point where the prompts part, takes the entry's
+  complete KV blocks by reference and copies the block the position falls in.
+  The change applies to the model families whose snapshot holds nothing but
+  KV rows: GLM-5.3, GLM-4.7, MiMo without its native draft, Flint and Dory.
+  `engine.prefix_partial_hits` (default true) turns it off, and the suffix of
+  such a hit walks prefill chunks a cold prompt would not. On four nodes with
+  GLM-5.3 Mixed346 and a runtime adapter, twelve prompts of 4K to 12K tokens
+  shaped like a production log reuse 69 percent of their tokens where they
+  reused 24 percent, and their summed time to the first token falls from
+  198 s to 85 s. A prompt with one line changed 7K tokens into its 8K waits
+  3.0 s where it waited 20.5 s. Every answer names its own prompt's code
+  word. On one node with Dory 1.0 4B NVFP4 the same prompts reuse 69 percent
+  where they reused 54. A repeated prompt can be worded differently from its
+  first answer when one of the two opened inside an entry, 6 of 47 repeats in
+  the cold-tier fuzz, and `serve_nvme_cache_fuzz.py` reports those without
+  failing on such a world. The configuration digest that ranks compare at
+  startup carries the NVMe cache settings again, which a format string one
+  field short had dropped.
+  [Prefix reuse](docs/prefix-cache.md#hits-inside-an-entry) describes the
+  rule.
+
+- **A runtime adapter's boundary in one collective**: in graph execution a
+  rank's projection writes its rank-space values as byte digits directly
+  behind the boundary's BF16 partial, the boundary's collective folds both as
+  one message, and one kernel behind it sums the digits and adds the
+  correction. The collective releases that kernel once its own data is
+  staged, and the kernel reads its columns of B during the network round
+  trip. The adapter's rank-space rows live in device memory and its dot
+  products issue their loads sixteen at a time. The GLM RMSNorm kernels issue
+  a row's loads together and ask for their weights ahead of the first pass.
+  No value changes. On four nodes the GLM-5.3 Mixed346 decode step with a
+  runtime adapter is 4.7 percent shorter at one request, and the adapter adds
+  under 2 percent to a step where it added 6. Its decode rate at eight
+  requests is 1 percent higher and its cold prefill 4 percent shorter from 2K
+  to 32K tokens. Without an adapter GLM-5.3 Mixed346, GLM-5.3-Flash NVFP4-FP8
+  and DeepSeek-V4.1-Flash-1017 are unchanged. Transcripts are identical.
+  [Runtime adapters](docs/runtime-adapters.md) describes the boundary.
+
+- **bf16 rounding with one instruction in device code**: device kernels
+  round a float to bf16 with the GPU's conversion instruction, where they ran
+  an eight-instruction integer sequence, and the two FP8 dequantization loops
+  (the FP8 GEMV core and the tensor-core GEMV) round two weights with one
+  pack instruction. Every value that is not a NaN keeps its bits, checked on
+  all 2^32 floats, and a NaN stays a NaN. The shared expert's own launches
+  run one block per SM and issue no prefetch requests. On four nodes the
+  DeepSeek-V4.1-Flash-1017 decode step is 4 to 5 percent shorter at one
+  request and its cold prefill 3 to 4 percent shorter at 8K and 32K tokens.
+  GLM-5.3-Flash NVFP4-FP8 decode is 2 percent shorter and GLM-5.3 Mixed346
+  is unchanged. Transcripts are identical. The
+  [DeepSeek-V4.1 model card](docs/model_cards/DeepSeek-V4.1-Flash-1017.md)
+  has the measurements.
+
+- **The shared expert computed once for the rows of a decode pass**: a
+  decode launch of two rows or more computes the FP8 shared expert in two
+  launches of its own beside the router, each weight row decoded once for up
+  to four rows, and the routed expert launches run without it. The FP4 down
+  launch issues a block's own loads before its look-ahead. No value changes.
+  On four nodes the DeepSeek-V4.1-Flash-1017 decode step is 2 to 3 percent
+  shorter at one request and the decode rate 5 to 12 percent higher at eight
+  requests. GLM-5.3-Flash NVFP4-FP8 is 0.5 percent shorter and GLM-5.3
+  Mixed346 is unchanged. Transcripts are identical. The
+  [DeepSeek-V4.1 model card](docs/model_cards/DeepSeek-V4.1-Flash-1017.md)
+  has the measurements.
+
+- **Faster decode expert launches on every MoE family**: the shared
+  expert's slots run beside the first routed slots instead of as each
+  launch's tail, in every family that computes the shared expert in the slot
+  launches. The FP4 down launch prefetches a block's next unit while the
+  block computes the current one, and a one-row launch reads its routed gate
+  and up weights as streaming lines. No value changes. On four nodes at one
+  request the decode step is 7 to 8 percent shorter on
+  DeepSeek-V4.1-Flash-1017, 3 to 5 percent shorter on GLM-5.3-Flash
+  NVFP4-FP8 and 3 percent shorter on GLM-5.3 Mixed346, with identical
+  transcripts. The
+  [DeepSeek-V4.1 model card](docs/model_cards/DeepSeek-V4.1-Flash-1017.md)
+  has the measurements.
+
+- **Correct MiniMax DSpark predictions and native activations**: predict from
+  the anchor row and use seven draft queries for seven proposals, while
+  retaining eight target verification rows. The previous mask-only convention
+  shifted every proposal and depressed acceptance. DSpark's MXFP8 projections
+  now honor the native activation setting, including context K/V and fused
+  SwiGLU quantization. The invalid DSpark performance comparison is withdrawn;
+  see the [implementation record](docs/minimax_m31_flash_plan.md).
+
+- **MiniMax M3.1 Flash**: native text, image and MP4/WebM video input,
+  recursive tool calls and the bundled seven-proposal DSpark on the shared
+  engine. The loader preserves the published NVFP4 expert and MXFP8 dense
+  weights; the serving recipe uses native MXFP8/NVFP4 activations, Q8KV4
+  attention and FP32 routing, with BF16 controls available. Parallel decode
+  pages, tensor-core vocabulary projections and reusable conversation and
+  visual prefixes reduce repeated work. The four-node
+  deployment passes native reference and serving validation; see the
+  [model card](docs/model_cards/MiniMax-M3.1-Flash.md) and
+  [numerical evidence](docs/minimax_m31_flash_plan.md).
+
 - **Keep an existing NVMe cache across upgrades**: set
   `nvme_cache.reuse_binding` to the previous cache's 16-character binding to
   bypass automatic build/settings invalidation. This selects the existing

@@ -23,6 +23,7 @@
 // CONTRACT: k % 16 == 0 and 16-byte-aligned weight rows (a 16B chunk then
 // lies inside one 128-wide scale block, 128 % 16 == 0). The activation rows
 // are staged bf16 in shared memory by the caller (kRows * k elements).
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -65,6 +66,26 @@ __device__ __forceinline__ float dequant(float w, float s) {
   return bf16_bits_to_float(float_to_bf16_bits(w * s));
 }
 
+// The same rounding for two weights through the float-to-bf16 pack
+// instruction (round to nearest even): bf16(w.x * s) in the low half,
+// bf16(w.y * s) in the high half, one instruction for the pair. The integer
+// form of float_to_bf16_bits was eight instructions a weight here, 130 of
+// the 330 a 16-byte chunk cost, and the core is instruction-bound whenever
+// its bytes come from L2. Every product that is not a NaN gives the integer
+// form's bits (scale_gemm_test checks every float).
+// A NaN product comes out as the instruction's NaN, 0x7FFF, where the
+// integer form gives the quiet NaN with the product's sign. No output can
+// tell: the value only feeds an FMA or the tensor-core multiply, and
+// neither carries a NaN operand's payload or sign into its result.
+// scale_gemm_test holds consume_chunk's accumulators to the integer form's
+// with NaN codes and scales that are not finite. (A test for the NaN after
+// each pair, to restore the integer form's pattern, cost 37 percent of a
+// shared-expert launch.)
+__device__ __forceinline__ uint32_t dequant_bf16x2(float2 w, float s) {
+  const __nv_bfloat162 b = __floats2bfloat162_rn(w.x * s, w.y * s);
+  return static_cast<uint32_t>(__bfloat16_as_ushort(b.x)) | (static_cast<uint32_t>(__bfloat16_as_ushort(b.y)) << 16);
+}
+
 // One 16-byte weight chunk (columns [c0, c0+16) of a row, scale s) into
 // kRows accumulators — the core's arithmetic, factored so
 // row_dots and block_rows_multi run the same code: a row's chain is the
@@ -91,8 +112,11 @@ __device__ __forceinline__ void consume_chunk(const uint4& wchunk, float s,
     // Weights q*4 .. q*4+3 of the chunk.
     const float2 w01 = e4m3x2_to_float2(static_cast<uint16_t>(word & 0xFFFFu));
     const float2 w23 = e4m3x2_to_float2(static_cast<uint16_t>(word >> 16));
-    const float d0 = dequant(w01.x, s), d1 = dequant(w01.y, s);
-    const float d2 = dequant(w23.x, s), d3 = dequant(w23.y, s);
+    const uint32_t b01 = dequant_bf16x2(w01, s), b23 = dequant_bf16x2(w23, s);
+    const float d0 = bf16_bits_to_float(static_cast<uint16_t>(b01 & 0xFFFFu));
+    const float d1 = bf16_bits_to_float(static_cast<uint16_t>(b01 >> 16));
+    const float d2 = bf16_bits_to_float(static_cast<uint16_t>(b23 & 0xFFFFu));
+    const float d3 = bf16_bits_to_float(static_cast<uint16_t>(b23 >> 16));
 #pragma unroll
     for (int r = 0; r < kRows; ++r) {
       // Activation elements q*4..q*4+3: words q*2, q*2+1 of the 16-elem run.
@@ -236,11 +260,13 @@ __device__ __forceinline__ void block_rows(const uint8_t* __restrict__ w,
 // down kernel's 224 GB/s against gate_up's 295. Each row's chunks are
 // consumed in k order into its own accumulator through consume_chunk, so
 // every row's result is bitwise block_rows'.
+// `live_rows`: the staged rows that are stored (the others' accumulators
+// are dropped: a run of fewer rows than kRows).
 template <int kRows, int R, typename OutT>
 __device__ __forceinline__ void block_rows_multi(
     const uint8_t* __restrict__ w, const float* __restrict__ scales,
     const uint16_t* __restrict__ sx, int n0, int n, int k,
-    OutT* __restrict__ out, size_t out_stride, int rs = 7, int cs = 7) {
+    OutT* __restrict__ out, size_t out_stride, int rs = 7, int cs = 7, int live_rows = kRows) {
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
   const int row0 = n0 + warp * R;
@@ -284,7 +310,7 @@ __device__ __forceinline__ void block_rows_multi(
     if (lane == 0) {
 #pragma unroll
       for (int a = 0; a < kRows; ++a)
-        store_dot(out + static_cast<size_t>(a) * out_stride + row0 + r, acc[r][a]);
+        if (a < live_rows) store_dot(out + static_cast<size_t>(a) * out_stride + row0 + r, acc[r][a]);
     }
   }
 }

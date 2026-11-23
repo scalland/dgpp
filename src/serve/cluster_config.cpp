@@ -280,6 +280,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           e.prefill_activations = text(x, ek, what);
           if (e.prefill_activations != "bf16" && e.prefill_activations != "native")
             fail(what, "'" + ek + "' must be \"bf16\" or \"native\"");
+        } else if (p.key == "activations") {
+          e.activations = text(x, ek, what);
+          if (e.activations != "bf16" && e.activations != "native")
+            fail(what, "'" + ek + "' must be \"bf16\" or \"native\"");
         } else if (p.key == "prefill_attention") {
           e.prefill_attention = text(x, ek, what);
           if (e.prefill_attention != "bf16" && e.prefill_attention != "fp8")
@@ -391,6 +395,13 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "admission_gather_ms") e.admission_gather_ms = static_cast<int>(integer(x, ek, what, 0, 1000));
         else if (p.key == "max_connections") e.max_connections = static_cast<int>(integer(x, ek, what, 1, 1 << 20));
         else if (p.key == "no_eos") e.no_eos = boolean(x, ek, what);
+        else if (p.key == "heretic_research") e.heretic_research = boolean(x, ek, what);
+        else if (p.key == "runtime_adapters")
+          e.runtime_adapters = boolean(x, ek, what);
+        else if (p.key == "runtime_adapter_verify_weights")
+          e.runtime_adapter_verify_weights = boolean(x, ek, what);
+        else if (p.key == "runtime_adapter_path")
+          e.runtime_adapter_path = expand_home(text(x, ek, what));
         else if (p.key == "decode_graph") e.decode_graph = boolean(x, ek, what);
         else if (p.key == "mtp") e.mtp = boolean(x, ek, what);
         else if (p.key == "dflash_model") e.dflash_model = text(x, ek, what);
@@ -424,7 +435,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "dflash_draft_batch") e.dflash_draft_batch = boolean(x, ek, what);
         else if (p.key == "dflash_depth") e.dflash_depth = static_cast<int>(integer(x, ek, what, 0, 7));
         else if (p.key == "mtp_depth") {
-          e.mtp_depth = static_cast<int>(integer(x, ek, what, 1, 5));  // the MTP families' chains; the DFlash2 block is its checkpoint's
+          e.mtp_depth = static_cast<int>(
+              integer(x, ek, what, 1, 7));  // The loaded family validates its own draft width.
           e.mtp_depth_set = true;
         } else if (p.key == "compact_batches")
           e.compact_batches = boolean(x, ek, what);
@@ -439,8 +451,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         } else if (p.key == "mtp_schedule_lambda") {
           e.mtp_schedule_lambda = number(x, ek, what);
           if (!(e.mtp_schedule_lambda >= 0.0)) fail(what, "'" + ek + "' must be >= 0 (0: the reservation rate)");
-        } else if (p.key == "mtp_schedule_min_depth") e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 1, 5));
+        } else if (p.key == "mtp_schedule_min_depth")
+          e.mtp_schedule_min_depth = static_cast<int>(integer(x, ek, what, 0, 7));
         else if (p.key == "mtp_schedule_options") e.mtp_schedule_options = static_cast<int>(integer(x, ek, what, 0, 6));
+        else if (p.key == "mtp_schedule_max_live") e.mtp_schedule_max_live = static_cast<int>(integer(x, ek, what, 0, 64));
         else if (p.key == "mtp_schedule_adapt") e.mtp_schedule_adapt = boolean(x, ek, what);
         else if (p.key == "mtp_schedule_sampled_scale") {
           e.mtp_schedule_sampled_scale = number(x, ek, what);
@@ -492,6 +506,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "prefix_pin_max_pct")
           e.prefix_pin_max_pct = static_cast<int>(integer(x, ek, what, 0, 100));
         else if (p.key == "prefix_head_snapshots") e.prefix_head_snapshots = boolean(x, ek, what);
+        else if (p.key == "prefix_partial_hits") e.prefix_partial_hits = boolean(x, ek, what);
         else if (p.key == "admission") {
           e.admission = text(x, ek, what);
           if (e.admission != "full" && e.admission != "grow")
@@ -526,6 +541,11 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "path") {
           n.path = text(p.value, nk, what);
           if (n.path.empty()) fail(what, "'" + nk + "' must not be empty");
+        } else if (p.key == "required_mount") {
+          n.required_mount = text(p.value, nk, what);
+          if ((!n.required_mount.empty() && n.required_mount.front() != '/') ||
+              n.required_mount.find('\0') != std::string::npos)
+            fail(what, "'" + nk + "' must be empty or an absolute mountpoint path");
         } else if (p.key == "capacity_gib") {
           n.capacity_gib = number(p.value, nk, what);
           if (n.capacity_gib < 0.0) fail(what, "'" + nk + "' must be >= 0");
@@ -571,6 +591,23 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
     fail(what, "'ports.fabric' and 'ports.journal' must differ");
   if (c.metrics_port != 0 && (c.metrics_port == c.fabric_port || c.metrics_port == c.journal_port))
     fail(what, "'ports.metrics' must differ from 'ports.fabric' and 'ports.journal'");
+  if (!c.engine.runtime_adapter_path.empty() && !c.engine.runtime_adapters)
+    fail(what, "engine.runtime_adapter_path requires engine.runtime_adapters=true");
+  if (c.engine.runtime_adapter_verify_weights && !c.engine.runtime_adapters)
+    fail(what, "engine.runtime_adapter_verify_weights requires engine.runtime_adapters=true");
+  if (c.engine.runtime_adapters &&
+      ((c.engine.kv_dtype != "bf16" && c.engine.kv_dtype != "fp8") ||
+       (c.engine.bf16_weights != "checkpoint" && c.engine.bf16_weights != "bf12") ||
+       c.engine.attention_weights != "checkpoint"))
+    fail(what,
+         "engine.runtime_adapters requires BF16/FP8 KV, checkpoint/BF12 weights and "
+         "checkpoint attention weights");
+  if (c.engine.runtime_adapters &&
+      (c.engine.prefill_bf16_partials || c.engine.prefill_fold_scales ||
+       c.engine.expert_gemm != "wide" || c.engine.expert_gemm_prefetch != 3 ||
+       !c.engine.expert_tile_list || c.engine.expert_gemm_pair ||
+       c.engine.collective_transport != "write"))
+    fail(what, "engine.runtime_adapters requires the default expert/prefill/transport recipe");
   return c;
 }
 

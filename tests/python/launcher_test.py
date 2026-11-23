@@ -78,6 +78,28 @@ class LauncherScanTest(unittest.TestCase):
         return subprocess.run([sys.executable, str(LAUNCHER), *argv], env=self.environ,
                               text=True, capture_output=True, timeout=120)
 
+    def test_fabric_refuses_running_long_executable_name(self):
+        # Linux truncates comm to 15 bytes. A full-name pgrep silently misses
+        # minimax_forward_check and would admit a second diagnostic world.
+        app = self.root / ("dg" + self.root.name[-8:] + "_forward_check")
+        shutil.copy2(shutil.which("sleep"), app)
+        process = subprocess.Popen([str(app), "60"])
+        try:
+            config = self.root / "probe.json"
+            config.write_text(json.dumps({"model": "fixture", "world_size": 1}))
+            env = dict(self.environ, DGPP_CLUSTER_CONFIG=str(config))
+            result = subprocess.run(
+                [str(ROOT / "scripts/fabric_run.sh"), "--app", str(app),
+                 "--timeout", "5", "--log-dir", str(self.root / "probe-logs"), "--", "0"],
+                env=env, text=True, capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("already runs here", result.stderr)
+            self.assertNotIn("longer than 15 characters", result.stderr)
+            self.assertIsNone(process.poll(), "preflight must not stop the existing process")
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
     def test_down_without_config_stops_every_running_deployment(self):
         running = self.namespace("aaaa", "org/running")
         also = self.namespace("bbbb", "org/also-running", record_source=False)
@@ -423,6 +445,38 @@ class LauncherScanTest(unittest.TestCase):
                     self.assertFalse(path.exists(), f"stale operation stream survived: {path}")
                 for path in preserved:
                     self.assertEqual(path.read_text(), "previous run\n")
+
+    def test_runtime_adapter_stages_only_with_explicit_opt_in(self):
+        cluster = self.cluster(self.namespace("adapter", "org/model"), peers=1)
+        source = self.root / "source adapter"
+        source.mkdir()
+        (source / "dgpp_adapter.json").write_text('{"fixture":1}')
+        (source / "adapter_model.safetensors").write_bytes(b"factors")
+        cluster.cfg["engine"] = {"runtime_adapter_path": str(source)}
+        with self.assertRaisesRegex(ValueError, "runtime_adapters=true"), patch.object(cluster, "ssh") as ssh:
+            cluster.stage()
+        ssh.assert_not_called()
+        cluster.cfg["engine"]["runtime_adapters"] = True
+        with patch.object(cluster, "ssh", return_value=True), patch.object(cluster, "scp_to", return_value=True) as scp:
+            self.assertTrue(cluster.stage())
+        staged = json.loads(Path(cluster.config_path).read_text())["engine"]["runtime_adapter_path"]
+        self.assertNotEqual(staged, str(source))
+        self.assertEqual(cluster.cfg["engine"]["runtime_adapter_path"], str(source))
+        self.assertEqual((Path(staged) / "adapter_model.safetensors").read_bytes(), b"factors")
+        self.assertTrue(any(call.args[1] == str(Path(staged) / "adapter_model.safetensors") for call in scp.call_args_list))
+
+    def test_long_startup_timeout_requires_explicit_weight_verification(self):
+        cluster = self.cluster(self.namespace("verify", "org/model"))
+        for settings, expected in (({}, 600), ({"runtime_adapters": True}, 600),
+                                   ({"runtime_adapters": True,
+                                     "runtime_adapter_verify_weights": True}, 1200)):
+            with self.subTest(settings=settings):
+                cluster.cfg["engine"] = settings
+                with patch.object(cluster, "boot_head", return_value=object()), \
+                        patch.object(cluster, "wait_log", return_value=True) as wait, \
+                        redirect_stdout(io.StringIO()):
+                    self.assertEqual(cluster.start_ranks(), 0)
+                self.assertEqual(wait.call_args.args[2], expected)
 
     def test_peer_staging_cleans_stale_streams_in_bash(self):
         self.check_peer_staging(["bash"])

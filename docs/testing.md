@@ -1,5 +1,27 @@
 # Tests
 
+`scheduler_prefixCache_cancelledHistoryRandomizedReplay` replays 512 fixed
+seeds twice across speculative batch cuts, delivered-tail truncation, edited
+histories, lookahead identity and small arenas. The NVMe cancellation tests
+check that retained snapshots stay reclaimable during another request's
+growth, remain reusable in memory and leave normal completion spills intact.
+`serve_cancel_prefix_check_test` tests the diagnostic client's SSE transport,
+Unicode/whitespace preservation, disconnect retirement and cold controls.
+Run `scripts/serve_cancel_prefix_check.py` on an idle serving world to compare
+actual rerendered interrupted histories with cold replies; pass the source
+revision, binary hash and an output path for its detailed JSON report.
+`--thinking` uses the template's native reasoning mode, including always-on
+templates, and `--require-answer-hit` requires at least one cancelled reply
+to produce a deeper hit. The report distinguishes
+answer-prefix hits from earlier prompt hits; retained state may sit at no
+cut of the resubmitted history, especially with one-token snapshot alignment.
+The probe requires exact cached/cold text, finish reasons and completion-token
+counts, and retains its partial report on failure. DSA models can differ when
+cached decode state and cold prefill use different arithmetic shapes; see
+[greedy transcripts and chunk shape](numerics.md#greedy-transcripts-and-chunk-shape).
+Pin admission budgets for comparisons and use a base-revision normal-completion
+control to distinguish existing numerical differences from a retention regression.
+
 `nvme_cache_test` checks reuse of an existing binding after build/settings
 changes, adoption and exact-token lookup through the host disk index, legacy
 index encoding, and non-destructive refusal of missing or incompatible files.
@@ -8,6 +30,24 @@ index encoding, and non-destructive refusal of missing or incompatible files.
 The persistence section of `qwen_decode_test` also restores GPU state with
 explicit reuse and verifies that rejected reuse and world disagreement leave
 the selected files unchanged. Run GPU checks on idle hardware.
+
+`cache_storage_test` checks NVMe storage placement, including randomized
+mountinfo parsing, escaped mountpoint names, missing paths, symlinks,
+non-destructive refusals and unconditional tmpfs rejection. Two cases require
+real mounts and are reported as skipped in the ordinary host run. Run them
+in a private mount namespace with:
+
+```sh
+sudo python3 tests/python/nvme_storage_mount_check.py --binary build-ci/cache_storage_test
+```
+
+The driver creates temporary bind, read-only, nested, OverlayFS, tmpfs and
+ramfs mounts, checks startup planning, and verifies refusal after unmounting
+the required destination. It unmounts them before deleting its fixture; the
+private namespace also limits mount lifetime if interrupted. Container
+replacement/adoption and multi-rank serving remain separate integration
+checks. Keep the binary, model, effective settings and cache binding stable
+when testing replacement, so a compatibility change does not mask placement.
 
 `chat_template_generator_test` exercises the Python golden generator's Jinja
 sandbox without a checkpoint or GPU. It checks private-attribute restrictions,
@@ -208,6 +248,37 @@ to cover the synchronous path. `scheduler_test` covers first-hop skips,
 preserved older snapshots and their later attachment, failed replacements,
 and inconsistent or missing outcomes releasing the rolling slot.
 
+The reduced-depth sampling regressions run with
+`DGPP_TEST_FILTER=scheduled_fallback` in `glm_tp_test`. A maximum-depth-three
+graph verifies one draft per replay, using both token and block verification.
+The two-rank scalar and batched runs force exact-gather fallbacks and compare
+live transcripts, RNG counters and acceptance counts with an independent
+depth-one sampled speculator. Run with `DGPP_PIPELINE=0` as well to cover
+the synchronous path. `DGPP_TEST_FILTER=sampled_` in `dsv4_engine_test`
+exercises both verification rules through every native confidence-scheduled
+depth, including two sampled slots and slot reuse.
+
+The argmax-only head regression runs with `DGPP_TEST_FILTER=argmax_head` in
+`qwen_engine_test`. One seeded workload of plain greedy and sampled requests
+runs on two engines over the hybrid fixture. One engine keeps the per-slot
+head flags and the other reads every head row in full, and every transcript
+must match. The workload holds a sampled request decoding alone in a slot
+past a closed one, batches that mix greedy and sampled requests, holes and
+reused slots. It runs at one and three drafts, over compacted and slot-prefix
+batches and under the scheduled verify depth, with sampled steps decided on
+the device and by the host fallback. `DGPP_TEST_ARGMAX_HEAD_SEEDS` and
+`DGPP_TEST_ARGMAX_HEAD_ROUNDS` lengthen the run. `packq_head_test` pins the
+slot each row reads for every launch shape.
+
+The mask staging regression runs with `DGPP_TEST_FILTER=free_request_keeps`
+in `glm_tp_test`. Requests without a grammar decode beside JSON, schema and
+tool-constrained ones and go on alone after them, with the constrained
+request arriving after, before or together with the free one, over
+slot-prefix and compacted batches. Every transcript must equal the eager
+engine's and every constrained one must stay inside its grammar.
+`DGPP_TEST_FREE_BESIDE_ROUNDS` and `DGPP_TEST_FREE_BESIDE_SEED` add seeded
+random pairs.
+
 The long-document prefix-cache regression is covered by `scheduler_test`
 (changed tails, lookahead identity, small arenas and cleanup), `qwen_decode_test`
 and `glm_tp_test` (two snapshots, resumed target/draft logits and budget changes).
@@ -245,14 +316,18 @@ sockets), `qwen_decode_test`'s tier block (spill and restore bitwise on the
 fixture, attach parity, a corrupted page detected, the slab across a
 restart and across a crash with content-bound adoption, the lock, damaged
 files, the op timeout and injected I/O failures), `nvme_tier_families_test`
-(spill, restore, attach and step bitwise on the MiMo, Flint and Qwen3.5
-tiny checkpoints) and `dflash2_integration_test`'s `prefix_tier` cases (a
+(spill, restore, attach and step bitwise on the MiMo, Flint, Inkling 2 and
+Qwen3.5 tiny checkpoints) and `dflash2_integration_test`'s `prefix_tier` cases (a
 drafter world's entry spilled and restored with its draft K/V context
 intact on both Qwen families). On a booted world,
 `scripts/serve_nvme_cache_check.py` drives the whole flow and
 `scripts/serve_nvme_cache_fuzz.py` drives random workloads with pins,
 opt-outs, concurrent clients, mid-flight cancels, clean restarts and rank
-crashes, checking every repeated answer against its first.
+crashes, checking every repeated answer against its first. On a world that
+attaches inside cached entries the repeated answers are reported without
+failing the run, because such a hit walks other prefill chunks than the
+first answer did. Set `engine.prefix_partial_hits` to false in the template
+for the strict comparison.
 
 The Qwen fixture's duplicate-open cases check slab size and bytes before
 releasing ownership, then check stale-content clearing with persistence both
@@ -591,7 +666,8 @@ build. The suites cover:
   fixed depth 5 split past the widest family), `dsv4_tokenizer_test` and
   `dsv4_prompt_test` against the snapshot's own tokenizer and
   `encoding_dsv4.py`; `dsa_test`'s 64-head release-shape decode select
-  certified against fp64 logits, `mma_gemv_test`'s dense bf16-weight tile
+  certified against fp64 logits (the 32-head indexers' scenarios hold every
+  score to them as well), `mma_gemv_test`'s dense bf16-weight tile
   kernel (oracle budget, row-invariant across chunkings, the gated ring
   form bitwise the plain rows), `glm_moe_test`'s
   early shared-slot order bitwise the default one and the phased prefill
@@ -603,6 +679,72 @@ build. The suites cover:
   `tools/dsv4_torch_reference.py`); the fp4 GEMV
   core at every compiled K (the MXFP4 set 2048 / 4096 included) and the
   MoE layer's NVFP4 shared expert.
+- the Inkling 2 chain. `unit_tests` parses the release's own config and
+  binds every tensor of both checkpoint files. `inkling2_kernels_test` holds
+  the row kernels to host statements: the two activation quantizers bit for
+  bit, the convolution ring across split, single-row and decode launches,
+  and a ring restored from a prefix snapshot. `inkling2_quantizers_reference`
+  repeats the quantizer comparison against the NumPy reference.
+  `inkling2_forward_test` compares the engine with
+  `tools/inkling2_reference_dump.py` visit by visit, each reference visit
+  starting from the engine's own state, under both settings of
+  `engine.activations`. Under the native setting the reference also takes the
+  engine's expert input, because the activation quantizers turn a difference
+  of one unit in the last place into whole quantization steps.
+  `inkling2_tp_test` runs loopback worlds of 2 and 4 on ports 30042 to 30054:
+  every rank's states are bitwise identical, and rank 0 is held to a reference
+  that follows that world's partial sums and activation slices.
+  `inkling2_decode_test` covers the session surface: prefill equal to the
+  forward bitwise, per-step snapshots, verify rows equal to scalar steps
+  bitwise through the eight rows of one request, rollback, interleaved slots,
+  prefix snapshots
+  resumed bitwise at a prefill cut and mid-decode, and the window's exact
+  reach through the cache and the rings. The fixture's random layers amplify
+  rounding differences, so its decode rows are judged against the re-forward
+  at the first visit, on a fixture whose first layer is local and on one
+  whose first layer attends over the whole context. With
+  `--checkpoint-dir` the same test judges a greedy decode against the
+  re-forward on the release, and `--verify-diag T` compares one verify of T
+  rows with T scalar steps on the release, visit by visit and logit by logit,
+  in a slot another request has used. `inkling2_engine_test` holds the graph engine's
+  scalar and row-batched replays to the eager engine's transcripts bitwise on
+  a loopback world of 2 (ports 30060 and 30061). `inkling2_draft_test` covers
+  the draft model: the target's rows bitwise the plain model's at every
+  accepted length, the memory plan, stacked blocks equal to the slots' own,
+  the recurrent head stopping at its floor, and the eager engine committing
+  the plain engine's tokens with it. Its `--dump` mode writes the tapped
+  states, the stored context keys and values, the block's rows and the
+  proposals of six contexts at worlds 1, 2 and 4 (ports 30072 and 30074), and
+  `tools/inkling2_reference_dump.py check-draft` recomputes each stage from
+  the engine's own input to it. With `--checkpoint-dir` the same pair runs on
+  the release, and `--ids FILE --steps N` decodes it with and without the
+  draft, reports the accepted lengths and fails if the two transcripts
+  differ. Adding `--graph DEPTH` runs that comparison the way a serving world
+  decodes: recorded passes, the device-side pick, a warm capture and the
+  resumable prefill with `--warm`, `--slots` request slots, and `--before
+  FILE` for a request through the slot first. A draft must never change the
+  committed tokens, so run it on the release after any change to a decode
+  kernel or to the rows a pass may hold. `dflash2_integration_test` runs the
+  shared drafter's cases on this family too: prefix snapshots and the NVMe
+  tier carry the draft's planes, two-rank graph replays of two, four and
+  eight slots record the proposals the eager draft makes, and one request at
+  a time through recorded passes of every depth commits the tokens of the
+  same world without the draft. `inkling2_vision_test`
+  compares the vision tower stage by stage with
+  `tools/inkling2_vision_reference.py` on a synthetic tower, and
+  `inkling2_image_prefill_test` holds an image prefill to the text prefill's
+  guarantees: hot equal to cold, slots equal to each other, and an
+  interleaved cursor walk equal to its solo walk. `inkling2_kernels_test`
+  also covers the kernel copy on spans that are not whole 16-byte units,
+  which three logits rows of this vocabulary are. `inkling2_tokenizer_test`
+  and `inkling2_chat_template_test` compare the tokenizer and the template
+  renders with the reference libraries on the snapshot, round-trip every
+  assistant turn through the typed-block parser, and walk each mode of the
+  constrained-decoding grammar over the real vocabulary. `unit_tests` repeats
+  the parser and grammar cases over a synthetic vocabulary at every token
+  split, and `serve_test` holds the prefix cache's cuts for a template
+  without a generation prompt
+  (`serve_prefixCache_cutsAtTurnEndsWhenTheModelOpensItsTurn`).
 - the KDA operator suite: conv/recurrent kernel parity against host
   fp32/fp64 references, chunked-vs-unchunked bitwise equivalence, decode
   graph replay, snapshot round-trip, head-slice TP readiness, and
@@ -611,9 +753,19 @@ build. The suites cover:
   bitwise via hard-max gates (including multi-token decode == single-token),
   a 1,100-case bitwise pooled top-k fuzz around pool boundaries plus
   exact-tie and 512th-boundary constructions, the fused decode select (MTP
-  multi-row, grid-size invariance, 100k-pool long-context stripes, graph
-  capture/replay with changed position), split-KV absorbed attention against
-  the host oracle at TP1/TP4 with empty-row and head-group coverage,
+  multi-row, 100k-pool long-context stripes, graph capture/replay with
+  changed position: each score within the fp32 sums' rounding of its exact
+  logit and the selection bitwise the top of the kernel's own keys; the keys
+  bitwise the prefill select's, and the same at another grid, with other
+  rows beside them and whichever of those rows share its request and so its
+  staged index tiles), split-KV absorbed attention against
+  the host oracle at TP1/TP4 with empty-row and head-group coverage (the
+  listed kernel's rows bitwise the same at every row count from one to
+  eight, where an odd count pairs a row's splits in a block; a prefill
+  tile's listed attention from the staged copy of its distinct cache rows
+  bitwise the launch from the cache in every quantized format, with the copy
+  large enough and too small, and a layer's prefill output bitwise with and
+  without it),
   latent/gather block-table round trip, the quantized latent cache (the
   fp8/fp4 append bitwise against the host codec at 512/256/32 wide; the
   split, listed-flash and dense-flash attention kernels over an fp8/fp4

@@ -362,6 +362,7 @@ void test_settings_handshake() {
   sent.mtp_schedule_row_ms = 3.7;
   sent.mtp_schedule_base_ms = 24.3;
   sent.mtp_schedule_sampled_scale = 0.9;
+  sent.mtp_schedule_max_live = 1;
   sent.prefill_dense = "streaming";
   sent.prefill_fold_overlap = false;
   sent.decode_pdl = false;
@@ -385,12 +386,12 @@ void test_settings_handshake() {
   sent.rendezvous_timeout_ms = 120000;
   sent.stats_interval_s = 10.0;
   {
-    dgpp::serve::JournalWriter writer(29938);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     dgpp::serve::WorldSettings got;
     bool ok = false;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29938, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       ok = dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got,
                                               "0.1.0+gtest");
     });
@@ -401,6 +402,7 @@ void test_settings_handshake() {
     require(got.fp8_head == "mma", "rank 0 overrides the peer default head mode");
     require(got.draft_head == "screen" && got.draft_head_blocks == 48, "the draft head's read travels with the settings");
     require(got.mtp_draft == "greedy", "the sampled requests' draft rule travels with the settings");
+    require(got.mtp_schedule_max_live == 1, "the schedule's live-request limit must cross the wire");
     require(got.mtp_schedule && got.mtp_schedule_sampled_scale == 0.9,
             "the sampled requests' schedule scale travels with the settings");
     require(got.prefill_dense == "streaming", "the prefill dense form travels with the settings");
@@ -415,11 +417,11 @@ void test_settings_handshake() {
   }
   {
     // A peer of another version refuses: a mixed-version world cannot form.
-    dgpp::serve::JournalWriter writer(29941);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     std::string violation;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29941, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       dgpp::serve::WorldSettings got;
       try {
         (void)dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got,
@@ -437,12 +439,12 @@ void test_settings_handshake() {
             "a different version refuses naming both: " + violation);
   }
   {
-    dgpp::serve::JournalWriter writer(29939);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     bool ended = true;
     std::string violation;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29939, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       dgpp::serve::WorldSettings got;
       try {
         ended = !dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got);
@@ -457,11 +459,11 @@ void test_settings_handshake() {
             "a first record that is not the settings is a protocol violation: " + violation);
   }
   {
-    dgpp::serve::JournalWriter writer(29940);
+    dgpp::serve::JournalWriter writer(0);
     std::atomic<bool> stop{false};
     bool ended = false;
     std::thread peer([&] {
-      dgpp::serve::JournalReader reader("127.0.0.1", 29940, 5000, 1);
+      dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
       dgpp::serve::WorldSettings got;
       ended = !dgpp::serve::wait_journal_settings(&reader, [&] { return stop.load(); }, &got);
     });
@@ -561,12 +563,13 @@ void test_journal_codec() {
     entry_policy.prefix_min_tokens = 1024;
     entry_policy.prefix_head_snapshots = true;
     entry_policy.prefix_pin_max_pct = 25;
+    entry_policy.prefix_partial_hits = true;
     const auto entry_warm =
         dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_warm(entry_policy));
     require(entry_warm.admission == entry_policy && fixed_warm.admission.prefix_min_tokens == 0 &&
-                !fixed_warm.admission.prefix_head_snapshots,
-            "the prefix entry floor and the head cut round-trip; old records carry neither");
-    for (const std::string bad : {R"("pmin":-1)", R"("phead":2)", R"("ppin":101)"}) {
+                !fixed_warm.admission.prefix_head_snapshots && !fixed_warm.admission.prefix_partial_hits,
+            "the prefix entry floor, the head cut and the hit inside an entry round-trip; old records carry none");
+    for (const std::string bad : {R"("pmin":-1)", R"("phead":2)", R"("ppin":101)", R"("ppart":2)"}) {
       bool rejected = false;
       try {
         (void)dgpp::serve::decode_journal_line(R"({"op":"warm","adm":0,"win":256,)" + bad + "}");
@@ -633,6 +636,7 @@ void test_journal_codec() {
     ws.prefill_early_admission = true;
     ws.prefix_min_tokens = 1024;
     ws.prefix_head_snapshots = true;
+    ws.prefix_partial_hits = true;
     ws.bulk_pace_gbps = 28.333333333333332;
     ws.bulk_inflight = 4;
     ws.rendezvous_timeout_ms = 120000;
@@ -641,6 +645,7 @@ void test_journal_codec() {
     ws.kv_dtype = "fp8";
     ws.prefill_attention = "fp8";
     ws.decode_attention = "fp8";
+    ws.activations = "native";
     ws.bf16_weights = "bf12";
     ws.compact_batches = true;
     ws.fp8_head = "mma";
@@ -701,11 +706,14 @@ void test_journal_codec() {
       auto plain = ws;
       plain.prefix_min_tokens = 0;
       plain.prefix_head_snapshots = false;
+      plain.prefix_partial_hits = false;
       const std::string line = dgpp::serve::encode_journal_settings(plain);
-      require(line.find("\"pmin\"") == std::string::npos && line.find("\"phead\"") == std::string::npos,
+      require(line.find("\"pmin\"") == std::string::npos && line.find("\"phead\"") == std::string::npos &&
+                  line.find("\"ppart\"") == std::string::npos,
               "codec: the entry policy's keys are absent when it is off");
       const auto decoded = dgpp::serve::decode_journal_line(line);
-      require(decoded.world_settings.prefix_min_tokens == 0 && !decoded.world_settings.prefix_head_snapshots,
+      require(decoded.world_settings.prefix_min_tokens == 0 && !decoded.world_settings.prefix_head_snapshots &&
+                  !decoded.world_settings.prefix_partial_hits,
               "codec: absent entry policy decodes to off");
     }
     for (const std::optional<bool> early : {std::optional<bool>{}, std::optional<bool>{false},
@@ -738,6 +746,28 @@ void test_journal_codec() {
           dgpp::serve::encode_journal_settings(settings));
       require(decoded.world_settings.prefill_budget_tokens == budget,
               "automatic, disabled and explicit prefill budgets survive the settings handshake");
+    }
+    for (const std::string mode : {"bf16", "native"}) {
+      auto recipe = ws;
+      recipe.activations = mode;
+      const auto line = dgpp::serve::encode_journal_settings(recipe);
+      require(dgpp::serve::decode_journal_line(line).world_settings.activations == mode,
+              "target activation recipe survives the rank handshake");
+      auto legacy = line;
+      const auto key = std::string(",\"act\":\"") + mode + "\"";
+      const size_t at = legacy.find(key);
+      require(at != std::string::npos, "target activation recipe encoded");
+      legacy.erase(at, key.size());
+      require(dgpp::serve::decode_journal_line(legacy).world_settings.activations == "bf16",
+              "legacy settings preserve BF16 target activations");
+    }
+    {
+      auto bad = ws;
+      bad.activations = "fp4";
+      bool refused = false;
+      try { (void)dgpp::serve::decode_journal_line(dgpp::serve::encode_journal_settings(bad)); }
+      catch (const std::runtime_error&) { refused = true; }
+      require(refused, "bad activation recipe rejected before joining the world");
     }
     for (const std::string mode : {"gemv", "mma"}) {
       auto head = ws;
@@ -1428,12 +1458,19 @@ int64_t sample_of(const std::string& text, const std::string& series) {
 }
 
 void test_rank_metrics(FabricRig& rig) {
-  const std::string r0 = scrape_metrics(rig.port());
+  // The reply can reach HTTP before the engine publishes the pass's meters.
+  // Wait for rank 0's snapshot, just as we wait for the peers below.
+  std::string r0;
+  int64_t tokens = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  do {
+    r0 = scrape_metrics(rig.port());
+    tokens = sample_of(
+        r0, "dgpp_rank_generation_tokens_total{model_name=\"glm-5.3-flash-fp8\",rank=\"0\"}");
+  } while (tokens <= 0 && std::chrono::steady_clock::now() < deadline);
   require(r0.find("dgpp_rank_info{model_name=\"glm-5.3-flash-fp8\",rank=\"0\",world_size=\"3\",version=\"v\","
                   "git_sha=\"g\"} 1\n") != std::string::npos,
           "rank 0's identity: " + r0);
-  const int64_t tokens =
-      sample_of(r0, "dgpp_rank_generation_tokens_total{model_name=\"glm-5.3-flash-fp8\",rank=\"0\"}");
   require(tokens > 0, "rank 0 counted its generated tokens");
   require(r0.find("dgpp_rank_ticks_total") == std::string::npos, "rank 0 follows no journal");
   for (size_t i = 0; i < rig.peers.size(); ++i) {
@@ -2043,6 +2080,55 @@ DGPP_TEST(journal_disk_commit_collector_waits_for_every_rank) {
   require(threw, "a rank reporting twice is a divergence");
 }
 
+DGPP_TEST(journal_research_binary_roundtrip_is_rank_ordered_and_bounded) {
+  dgpp::serve::JournalWriter writer(0);
+  dgpp::serve::JournalReader second("127.0.0.1", writer.port(), 5000, 2);
+  dgpp::serve::JournalReader first("127.0.0.1", writer.port(), 5000, 1);
+  writer.accept_peers(3, 5000);
+  std::string a(1048576, '\0'), b(65537, '\xff');
+  a[8193] = '\n';
+  bool ok1 = false, ok2 = false;
+  std::jthread t1([&] { ok1 = first.send_payload(a, 5000); });
+  std::jthread t2([&] { ok2 = second.send_payload(b, 5000); });
+  const auto values = writer.gather_peer_payloads(2 * 1048576, 5000);
+  t1.join();
+  t2.join();
+  require(ok1 && ok2 && values.size() == 2, "binary gather completes");
+  require(values[0] == std::make_pair(1, a) && values[1] == std::make_pair(2, b),
+          "rank order and binary bytes");
+  require(first.send_payload({}, 5000) && second.send_payload({}, 5000), "empty barrier replies");
+  require(writer.gather_peer_payloads(16, 5000).size() == 2, "second phase has no leftover bytes");
+  require(second.send_payload(std::string(17, 'x'), 5000), "oversized reply writes");
+  bool refused = false;
+  try {
+    (void)writer.gather_peer_payloads(16, 5000);
+  } catch (const std::runtime_error& e) {
+    refused = std::string(e.what()).find("exceeds budget") != std::string::npos;
+  }
+  require(refused, "oversized reply rejected before body allocation");
+}
+
+DGPP_TEST(journal_research_binary_deadline_and_truncation) {
+  for (bool truncate : {false, true}) {
+    dgpp::serve::JournalWriter writer(0);
+    auto raw = dgpp::net::TcpConn::connect("127.0.0.1", writer.port(), 5000);
+    require(raw.write_all("hello 1\n", 8), "raw hello");
+    writer.accept_peers(2, 5000);
+    const unsigned char partial[] = {10, 0, 0, 0, 'a'};
+    require(raw.write_all(partial, sizeof(partial)), "partial body");
+    if (truncate) raw.close();
+    const auto begin = std::chrono::steady_clock::now();
+    bool refused = false;
+    try {
+      (void)writer.gather_peer_payloads(1024, 100);
+    } catch (const std::runtime_error&) {
+      refused = true;
+    }
+    require(refused && std::chrono::steady_clock::now() - begin < std::chrono::seconds(2),
+            "truncated or stalled reply must fail within its deadline");
+  }
+}
+
 DGPP_TEST(journal_return_path_carries_peer_status_lines) {
   // A writer and one peer over loopback: the peer's status line reaches
   // the writer's poll without blocking; the death watch is undisturbed.
@@ -2135,6 +2221,32 @@ int main() {
     }
     std::puts("ok 10 - the NVMe cold tier: spill, evict, restore and attach through the "
               "journal's return path, identical on every rank");
+    {
+      g_fake_arena_slots = 4;
+      g_fake_disk_pages = 64;
+      FabricRig rig;
+      test_disconnect_cancel(rig);
+      require(rig.oplog.text().find("X close ") != std::string::npos,
+              "disconnect retains its committed snapshot on every rank");
+      require(rig.oplog.text().find("X spill ") == std::string::npos,
+              "disconnect does not start an NVMe spill");
+      Client next(rig.port());
+      next.send_all(post_request("/v1/chat/completions",
+          R"({"model":"glm-5.3-flash-fp8","messages":[{"role":"user","content":"abcdefgh-more"}],"max_tokens":1})"));
+      const std::string reply = next.read_until("\"cached_tokens\":8", 5000);
+      require(reply.find("200 OK") != std::string::npos &&
+                  reply.find("\"cached_tokens\":8") != std::string::npos,
+              "the follow-up reports the reused prefix");
+      wait_metrics(rig, "\"tokens_saved\":8");
+      rig.stop();
+      rig.require_oplogs_agree("cancelled snapshot reuse");
+      require(rig.oplog.text().find("X attach ") != std::string::npos,
+              "the follow-up reuses the cancelled snapshot through the journal");
+      for (const auto& peer : rig.peers) require(peer->error.empty(), peer->error);
+      g_fake_arena_slots = 0;
+      g_fake_disk_pages = 0;
+    }
+    std::puts("ok 11 - cancelled snapshots retain, reuse and stay out of spills identically on every rank");
     std::puts("fabric_serve_test: ALL PASS");
     return 0;
   } catch (const std::exception& e) {
@@ -2207,6 +2319,48 @@ DGPP_TEST(journal_images_roundtrip_and_validation) {
   require(threw, "mismatched pixel dimensions rejected");
 }
 
+// A padded canvas (Inkling 2's 40-pixel grid): the content region travels
+// with the pixels, an image without one keeps the six-field entry, and a
+// region outside the canvas or short of the last grid row is refused.
+DGPP_TEST(journal_image_content_region_roundtrips_and_is_validated) {
+  dgpp::serve::GenerationService::PassEvents events;
+  dgpp::sched::SchedulerRequest r;
+  r.id = "padded";
+  r.prompt = {7, 200054, 200054, 8};
+  dgpp::ImageInput im;
+  im.offset = 1;
+  im.tokens = 2;
+  im.width = 80;
+  im.height = 40;
+  im.grid = 40;
+  im.valid_width = 53;
+  im.valid_height = 31;
+  im.rgb.assign(80 * 40 * 3, 9);
+  r.images.push_back(im);
+  events.submits.push_back(r);
+  const auto line = dgpp::serve::encode_journal_tick(events);
+  require(line.find("[1,2,80,40,40,[53,31],") != std::string::npos, "the content region is on the wire: " + line.substr(0, 200));
+  const auto back = dgpp::serve::decode_journal_line(line).submits[0].images[0];
+  require(back.grid == 40 && back.valid_width == 53 && back.valid_height == 31 && back.rgb == im.rgb,
+          "grid, content region and pixels reach the peer");
+  events.submits[0].images[0].valid_width = events.submits[0].images[0].valid_height = 0;
+  const auto plain = dgpp::serve::encode_journal_tick(events);
+  require(plain.find("[1,2,80,40,40,\"") != std::string::npos, "an image without a region keeps its entry");
+  require(dgpp::serve::decode_journal_line(plain).submits[0].images[0].valid_width == 0, "no region on the peer");
+  for (const char* region : {"[81,31]", "[53,41]", "[40,31]", "[53,0]", "[53]"}) {
+    auto bad = line;
+    const auto at = bad.find("[53,31]");
+    bad.replace(at, 7, region);
+    bool threw = false;
+    try {
+      (void)dgpp::serve::decode_journal_line(bad);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    require(threw, std::string("a bad content region is refused: ") + region);
+  }
+}
+
 DGPP_TEST(journal_image_history_exceeds_old_count_and_token_caps) {
   dgpp::serve::GenerationService::PassEvents events;
   dgpp::sched::SchedulerRequest request;
@@ -2221,6 +2375,35 @@ DGPP_TEST(journal_image_history_exceeds_old_count_and_token_caps) {
     const auto& image = decoded.submits[0].images[i];
     require(image.offset == i * 1024 && image.tokens == 1024 && image.rgb.back() == i,
             "ordered image pixels and context positions roundtrip");
+  }
+}
+
+DGPP_TEST(journal_video_segments_preserve_frames_spans_and_pixels) {
+  dgpp::serve::GenerationService::PassEvents events;
+  dgpp::sched::SchedulerRequest request;
+  request.id = "video";
+  request.prompt.assign(40, 200026);
+  request.images.push_back(
+      {5, 8, 56, 56, std::vector<uint8_t>(56 * 56 * 3 * 4, 123), 28, 4, {5, 20}});
+  events.submits.push_back(request);
+  const auto wire = dgpp::serve::encode_journal_tick(events);
+  const auto decoded = dgpp::serve::decode_journal_line(wire);
+  const auto& im = decoded.submits[0].images.at(0);
+  require(im.frames == 4 && im.frame_offsets == std::vector<int64_t>{5, 20} && im.offset == 5 &&
+              im.tokens == 8 && im.rgb == request.images[0].rgb,
+          "video admission changed across ranks");
+  for (const auto* spans : {"[5]", "[5,7]", "[5,20,30]", "[5,-1]", "[5,20.5]"}) {
+    auto bad = wire;
+    const auto at = bad.find("[5,20]");
+    require(at != std::string::npos, "video spans present in wire format");
+    bad.replace(at, 6, spans);
+    bool threw = false;
+    try {
+      (void)dgpp::serve::decode_journal_line(bad);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    require(threw, "malformed video span admitted from journal");
   }
 }
 
@@ -2390,4 +2573,42 @@ DGPP_TEST(fabric_serve_peer_requires_and_replays_leader_budget) {
     require(sched.meters().prefill_adaptive_limit_tokens == (missing ? 0 : 12),
             "peer executes leader's limit, regardless of its local estimate");
   }
+}
+
+DGPP_TEST(fabric_serve_binary_broadcast_preserves_buffered_lines) {
+  dgpp::serve::JournalWriter writer(0);
+  dgpp::serve::JournalReader reader("127.0.0.1", writer.port(), 5000, 1);
+  writer.accept_peers(2, 5000);
+  const std::string payload("binary\nwith\0bytes", 17);
+  writer.broadcast("begin");
+  writer.broadcast_payload(payload, 1000);
+  writer.broadcast("after");
+  std::string line;
+  require(reader.read_line([] { return false; }, &line) && line == "begin", "payload announcement");
+  require(reader.read_payload(payload.size(), 1000) == payload, "coalesced binary bytes preserved");
+  require(reader.read_line([] { return false; }, &line) && line == "after",
+          "following line preserved");
+  bool timed_out = false;
+  try {
+    (void)reader.read_payload(1, 10);
+  } catch (const std::runtime_error&) {
+    timed_out = true;
+  }
+  require(timed_out, "incomplete binary payload obeys deadline");
+}
+
+DGPP_TEST(fabric_serve_runtime_adapter_settings_identity) {
+  dgpp::serve::WorldSettings settings;
+  settings.runtime_adapter_id = std::string(64, 'a');
+  // Fill the standard required capacity fields used by the settings decoder.
+  settings.version = "test";
+  settings.world = 2;
+  settings.fabric_port = 29970;
+  settings.max_concurrency = 1;
+  settings.kv_capacity = 128;
+  settings.admission = "full";
+  const auto wire = dgpp::serve::encode_journal_settings(settings);
+  const auto decoded = dgpp::serve::decode_journal_line(wire);
+  require(decoded.world_settings.runtime_adapter_id == settings.runtime_adapter_id,
+          "runtime adapter identity survives settings handshake");
 }

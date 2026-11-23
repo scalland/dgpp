@@ -52,6 +52,139 @@ the bounded prefill (the model's own SWA-replay recipe), the full
 1M-token context. The tokenizer, prompt renderer (`encoding/encoding.py`,
 no Jinja template) and DSML tool-call format are V4.1-Flash's.
 
+## The expert slot launches (2026-11-10)
+
+A decode pass computes each row's six routed experts and the shared expert
+as slots of two launches, gate and up then down. Three changes to how those
+launches use the memory shorten the pass, and none of them changes a value.
+
+**The shared expert's slots run beside the routed stream.** The slots ran in
+expert order with the shared expert's last, so its blocks ran alone at the
+end of each launch, over weights the routed stream had by then pushed out of
+L2. Every family that computes its shared expert in the slots now interleaves
+them with the first routed slots (`GlmMoeConfig::shared_slots_early`), where
+they compute while the memory streams the routed experts. The EXL3 pack keeps
+the expert order, because its launches compute the shared expert once for all
+rows.
+
+**The down launch keeps the memory busy.** A block of the down launch takes
+a unit of rows, reads it and computes it. It now takes its next unit first
+and prefetches that unit's rows into L2, so the memory streams while the
+block computes.
+
+**One-row launches read the routed gate and up weights as streaming lines.**
+That keeps the prefetched shared expert in L2 under the routed traffic. With
+more rows the launch keeps plain loads, because an expert two rows share is
+served to its second slot from L2.
+
+Measured on four nodes at one request against the same tree without the
+three, in bracketed legs, on the engine's decode steps:
+
+| Class | Pass before | Pass after | Decode tok/s |
+|---|---|---|---|
+| Prose | 35.9 ms | 33.1 ms | 54.7 → 59.2 (+8.3 %) |
+| Chat | 37.8 ms | 35.0 ms | 56.9 → 61.6 (+8.2 %) |
+| Code | 43.7 ms | 40.4 ms | 81.1 → 87.8 (+8.3 %) |
+| JSON | 46.7 ms | 43.1 ms | 89.6 → 97.1 (+8.3 %) |
+| Math | 42.2 ms | 39.1 ms | 86.3 → 93.2 (+8.0 %) |
+| Plain decode, one row | 24.3 ms | 22.6 ms | 41.2 → 44.4 (+7.6 %) |
+
+The accepted rows per pass and the transcripts are identical in every class.
+The streaming loads account for 0.8 percent of the one-row pass. The EXL3
+pack's passes are unchanged.
+
+## The shared expert's own launches (2026-11-12)
+
+The shared expert's weights are the same for every row of a pass. A decode
+launch of two rows or more computes it in two launches of its own instead of
+in a slot per row. The first computes its gate, up and SwiGLU and the second
+its down projection, each for runs of up to four rows that decode every
+weight row once. The layer forks them at its input on a side stream, so they
+start beside the router, and joins them before the expert sum. The routed
+gate, up and down launches then cover the routed slots alone and run the
+kernel forms without the shared expert's branch. One row keeps its shared
+slot beside the routed stream, where it costs almost nothing.
+
+The FP4 down launch also issues a block's own loads before its look-ahead
+takes and prefetches the next unit, which shortens the launch at every row
+count.
+
+No value changes. The shared runs use the same per-row arithmetic as the
+slot form, and `glm_moe_test` holds the two bitwise at two, three, five and
+eighty rows.
+
+Measured on four nodes against the same tree without the two changes, in
+bracketed legs, on the engine's decode steps:
+
+| Load | Before | After | Change |
+|---|---|---|---|
+| One request, prose | 33.2 ms a pass | 32.4 ms | 59.1 → 60.5 tok/s (+2.3 %) |
+| One request, chat | 34.9 ms | 34.2 ms | 61.6 → 62.9 tok/s (+2.1 %) |
+| One request, code | 40.4 ms | 39.3 ms | 87.8 → 90.2 tok/s (+2.7 %) |
+| One request, JSON | 43.0 ms | 41.9 ms | 97.3 → 99.9 tok/s (+2.7 %) |
+| One request, math | 39.1 ms | 38.1 ms | 93.3 → 95.8 tok/s (+2.6 %) |
+| Plain decode, one row, five classes | 22.4 to 22.7 ms | 22.2 ms | +1.2 to +2.2 % |
+| Eight requests, five classes | 93 to 126 tok/s | 103 to 136 tok/s | +5 to +12 % |
+
+The transcripts are identical in every class of every leg. The gain grows
+with the rows a pass carries, because the slot form computed the shared
+expert once per row. At one request the shared launches still cost part of
+what they save: they share the processors with the router and delay the
+routed launch's start by 20 to 30 microseconds a layer.
+
+## The bf16 rounding in device code (2026-11-12)
+
+Dequantizing an FP8 weight rounds the product of its code and its block
+scale to bf16. Device code does that rounding with the GPU's float-to-bf16
+conversion instruction. The FP8 GEMV core, which computes the shared expert,
+and the tensor-core GEMV, which computes the attention projections, round
+two weights with one pack instruction. Host code keeps the integer form of
+the same rounding. The two agree on every float that is not a NaN, and
+`scale_gemm_test` compares them on all 2^32 bit patterns. A NaN stays a NaN
+with the instruction's bit pattern. In the two dequantization loops that
+pattern does not reach an output: the rounded weight only feeds a
+multiply-add or the tensor-core multiply, which return the same NaN
+whatever the operand's pattern was, and `scale_gemm_test` holds the loop's
+accumulators to the integer form's with NaN weights.
+
+The integer form is eight instructions per value. In the FP8 GEMV core that
+was about 130 of the 330 instructions a 16-byte chunk of weights cost, and
+the core is bound by instruction issue whenever its weights come from L2.
+With its weights in L2 the shared expert's first launch takes 11.6
+microseconds at two rows, against 16.4 with the integer form. The prefill
+expert kernels round every weight through the same helper. The prefill gain
+below appears with the instruction in every device kernel and not with the
+two dequantization loops alone.
+
+The shared expert's two launches run one block per SM, which leaves room on
+each SM for the routed launches' blocks, and they issue no prefetch requests
+of their own. Lines requested with the bulk L2 prefetch instruction do not
+stay in L2. A launch 10 microseconds behind the requests found most of them
+gone.
+
+Measured on four nodes against the same tree without these changes, in
+bracketed legs, on the engine's decode steps:
+
+| Load | Before | After | Change |
+|---|---|---|---|
+| One request, prose | 32.5 ms a pass | 30.9 ms | 60.4 → 63.5 tok/s (+5.1 %) |
+| One request, chat | 34.3 ms | 32.8 ms | 62.7 → 65.7 tok/s (+4.8 %) |
+| One request, code | 39.3 ms | 37.5 ms | 90.2 → 94.4 tok/s (+4.6 %) |
+| One request, JSON | 42.0 ms | 40.0 ms | 99.5 → 104.5 tok/s (+5.1 %) |
+| One request, math | 38.1 ms | 36.4 ms | 95.5 → 100.0 tok/s (+4.7 %) |
+| Plain decode, one row, five classes | 22.3 ms | 21.5 to 21.6 ms | +3.2 to +3.7 % |
+| Eight requests, five classes | 96 to 137 tok/s | 104 to 143 tok/s | +0.3 to +7.8 % |
+
+Cold prefill, engine time, the same binaries:
+
+| Prompt | Before | After | Change |
+|---|---|---|---|
+| 2K tokens | 1.08 s | 1.07 s | −1.4 % |
+| 8K tokens | 3.25 s | 3.14 s | −3.4 % |
+| 32K tokens | 12.77 s | 12.24 s | −4.1 % |
+
+The transcripts are identical in every class of every leg.
+
 ## Decode levers (2026-10-18)
 
 **The L2 prefetch windows.** The decode step is one serial chain of

@@ -631,15 +631,17 @@ DGPP_TEST(mma_gemv_split_k_small_n_sites) {
 // The bf12 form (the lm head's 12-bit companion under the tensor-core
 // chain): bitwise the bf16 launch at every decode width, f32 and bf16
 // outputs, on a matrix with escapes and rows the encoder kept raw; a
-// partial last block; k of one and five super-blocks. The form declines a
-// tail (k not whole super-blocks) and the widths above the decode forms.
+// partial last block; k of one and five super-blocks, and k with each tail
+// of whole steps (a full unit: 2304; a pair unit: 2560; both: 1792), which
+// the launches take and the GEMM interface's own rule does not. The form
+// declines a tail with a partial step and the widths above the decode forms.
 DGPP_TEST(mma_gemv_bf12_form_is_bitwise_the_bf16_form) {
   std::mt19937_64 rng(2026);
   std::uniform_real_distribution<float> uf(-1.f, 1.f);
   std::uniform_int_distribution<int> ex(-4, 4);
   std::uniform_int_distribution<int> outlier(0, 199);
   std::uniform_real_distribution<float> mag(0.5f, 1.f);
-  for (auto [n, k] : std::vector<std::pair<int, int>>{{1032, 1024}, {4104, 5120}}) {
+  for (auto [n, k] : std::vector<std::pair<int, int>>{{1032, 1024}, {4104, 5120}, {2056, 2304}, {1032, 2560}, {520, 1792}}) {
     std::vector<uint16_t> w(size_t(n) * k);
     // Nine exponents inside the row's fifteen-code window, one element in
     // two hundred far outside it: escapes on most rows, under the row budget.
@@ -666,7 +668,8 @@ DGPP_TEST(mma_gemv_bf12_form_is_bitwise_the_bf16_form) {
     DGPP_CUDA_OK(cudaMalloc(&o1, size_t(32) * n * 4)); DGPP_CUDA_OK(cudaMalloc(&o2, size_t(32) * n * 4));
     DGPP_CUDA_OK(cudaMalloc(&b1, size_t(32) * n * 2)); DGPP_CUDA_OK(cudaMalloc(&b2, size_t(32) * n * 2));
     for (int m : {1, 3, 8, 16, 17, 32}) {
-      require(dgpp::mma_gemv_bf12_accepts(pm, m), "bf12 form: accepts the decode width");
+      require(dgpp::mma_gemv_bf12_accepts(pm, m) == (k % 1024 == 0),
+              "bf12 form: the interface's rule takes whole super-blocks at the decode widths, and only those");
       DGPP_CUDA_OK(cudaMemset(o2, 0xFF, size_t(32) * n * 4)); DGPP_CUDA_OK(cudaMemset(b2, 0xFF, size_t(32) * n * 2));
       dgpp::launch_mma_gemv_bf16_f32(da, k, dw, o1, m, n, k, n, nullptr);
       require(dgpp::launch_mma_gemv_bf12_f32(da, k, pm, o2, m, n, k, n, nullptr), "bf12 form: the f32 launch applies");
@@ -686,11 +689,15 @@ DGPP_TEST(mma_gemv_bf12_form_is_bitwise_the_bf16_form) {
     cudaFree(o1); cudaFree(o2); cudaFree(b1); cudaFree(b2);
   }
   {
-    // A companion with a tail (k = 2560: two super-blocks and 512 columns) is declined.
-    dgpp::Bf12Matrix pm; pm.n = 64; pm.k = 2560;
+    // A companion whose tail ends in a partial step (k = 1344: a super-block, a full step and 64 columns) is declined.
+    dgpp::Bf12Matrix pm; pm.n = 64; pm.k = 1344;
     pm.packed = reinterpret_cast<const uint8_t*>(1); pm.rows = reinterpret_cast<const uint32_t*>(1);
     pm.esc = reinterpret_cast<const uint32_t*>(1); pm.raw = reinterpret_cast<const uint16_t*>(1);
-    require(!dgpp::mma_gemv_bf12_accepts(pm, 4), "bf12 form: declines a tail");
+    require(!dgpp::mma_gemv_bf12_accepts(pm, 4), "bf12 form: declines a partial step");
+    uint16_t* da; float* o2;
+    DGPP_CUDA_OK(cudaMalloc(&da, size_t(4) * 1344 * 2)); DGPP_CUDA_OK(cudaMalloc(&o2, size_t(4) * 64 * 4));
+    require(!dgpp::launch_mma_gemv_bf12_f32(da, 1344, pm, o2, 4, 64, 1344, 64, nullptr), "bf12 form: a partial step is not launched");
+    cudaFree(da); cudaFree(o2);
   }
 }
 
@@ -751,7 +758,11 @@ DGPP_TEST(mma_gemv_fp8_e8m0_grid_is_bitwise_the_f32_grid) {
   std::vector<float> sf(sb8.size());
   uint32_t x = 0x9E3779B9u;
   auto rnd = [&] { x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x; };
-  for (auto& b : w8) b = static_cast<uint8_t>(rnd() & 0x7F);  // non-NaN e4m3
+  // Positive e4m3 codes. 0x7F is the NaN code and stays in the sample: a NaN
+  // code is held to NaN below (device code rounds with the conversion
+  // instruction, whose NaN pattern is not the host's canonical one), every
+  // other code to the host's bits.
+  for (auto& b : w8) b = static_cast<uint8_t>(rnd() & 0x7F);
   for (size_t i = 0; i < sb8.size(); ++i) {
     sb8[i] = static_cast<uint8_t>(118 + rnd() % 14);  // 2^-9 .. 2^4
     sf[i] = std::ldexp(1.0f, static_cast<int>(sb8[i]) - 127);
@@ -786,10 +797,34 @@ DGPP_TEST(mma_gemv_fp8_e8m0_grid_is_bitwise_the_f32_grid) {
   DGPP_CUDA_OK(cudaMemcpy(a.data(), deq_f, a.size() * 2, cudaMemcpyDeviceToHost));
   DGPP_CUDA_OK(cudaMemcpy(b.data(), deq_b, b.size() * 2, cudaMemcpyDeviceToHost));
   if (std::memcmp(a.data(), b.data(), a.size() * 2) != 0) throw std::runtime_error("e8m0 dequant differs from the f32 dequant");
-  // The values are the exact bf16(e4m3 x 2^k).
+  // The values are the exact bf16(e4m3 x 2^k), and a NaN code stays a NaN.
+  size_t nan_codes = 0;
   for (size_t i = 0; i < 4096; ++i) {
     const float want = dgpp::fp8_e4m3_bits_to_float(w8[i]) * sf[(i / k) * sb + (i % k) / 32];
-    if (b[i] != dgpp::float_to_bf16_bits(want)) throw std::runtime_error("e8m0 dequant value differs from bf16(e4m3 x 2^k)");
+    if (std::isnan(want)) {
+      ++nan_codes;
+      if ((b[i] & 0x7FFFu) <= 0x7F80u) throw std::runtime_error("e8m0 dequant of a NaN code is not a NaN");
+    } else if (b[i] != dgpp::float_to_bf16_bits(want)) {
+      throw std::runtime_error("e8m0 dequant value differs from bf16(e4m3 x 2^k)");
+    }
+  }
+  if (nan_codes == 0) throw std::runtime_error("the sample holds no NaN code: the NaN check is vacuous");
+  // The same grids without a NaN code: with one in nearly every row above,
+  // the rows compared there are NaN against NaN.
+  for (auto& c : w8) c = (c == 0x7F) ? static_cast<uint8_t>(0x7E) : c;
+  DGPP_CUDA_OK(cudaMemcpy(dw, w8.data(), w8.size(), cudaMemcpyHostToDevice));
+  for (const int m : {1, 17}) {
+    dgpp::launch_mma_gemv_fp8_bf16(dact, k, dw, dsf, out_f, m, n, k, 0, 0, 5, nullptr);
+    dgpp::launch_mma_gemv_fp8e8m0_bf16(dact, k, dw, dsb, out_b, m, n, k, 0, 0, 5, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> fa(static_cast<size_t>(m) * n), fb(fa.size());
+    DGPP_CUDA_OK(cudaMemcpy(fa.data(), out_f, fa.size() * 2, cudaMemcpyDeviceToHost));
+    DGPP_CUDA_OK(cudaMemcpy(fb.data(), out_b, fb.size() * 2, cudaMemcpyDeviceToHost));
+    size_t finite = 0;
+    for (const uint16_t v : fa) finite += (v & 0x7FFFu) < 0x7F80u ? 1 : 0;
+    if (finite != fa.size()) throw std::runtime_error("NaN-free weights gave a non-finite output at m = " + std::to_string(m));
+    if (std::memcmp(fa.data(), fb.data(), fa.size() * 2) != 0)
+      throw std::runtime_error("e8m0 grid differs from the f32 grid on NaN-free weights at m = " + std::to_string(m));
   }
   cudaFree(dw); cudaFree(dsb); cudaFree(dsf); cudaFree(dact); cudaFree(out_f); cudaFree(out_b); cudaFree(deq_f); cudaFree(deq_b);
   std::printf("[ OK ] the e8m0 byte grid is bitwise the f32 grid (mma_gemv at 1/3/17/40 rows, the dequant bridge)\n");

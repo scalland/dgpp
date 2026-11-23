@@ -36,6 +36,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(DGPP_WERROR "Treat compiler warnings as errors" OFF)
 option(DGPP_BUILD_BENCHMARKS "Build platform, kernel and transport microbenchmarks" ON)
+option(DGPP_ENABLE_VIDEO "Build native MP4/WebM video input decoding with FFmpeg" ON)
 set(DGPP_SANITIZE "" CACHE STRING "Host sanitizer (address or undefined)")
 set_property(CACHE DGPP_SANITIZE PROPERTY STRINGS "" address undefined)
 
@@ -61,6 +62,7 @@ target_include_directories(dgpp_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src
 
 find_package(CUDAToolkit 13 REQUIRED COMPONENTS cudart cublasLt)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
 
 include(cmake/pcre2.cmake)
@@ -120,6 +122,7 @@ endif()
 # ---- libraries ------------------------------------------------------------
 
 add_library(dgpp_core STATIC
+  src/common/cache_storage.cpp
   src/common/log.cpp
   src/common/bf16_residency.cpp
   src/common/process_memory.cpp
@@ -158,6 +161,7 @@ target_link_libraries(dgpp_device_ranges PUBLIC CUDA::cudart CUDA::cuda_driver)
 dgpp_set_common(dgpp_device_ranges)
 
 add_library(dgpp_kernels STATIC
+  src/kernels/low_rank.cu
   src/kernels/gemm_cublaslt.cpp
   src/kernels/kernels.cu
   src/kernels/doll_attention.cu
@@ -165,6 +169,7 @@ add_library(dgpp_kernels STATIC
   src/kernels/dsa.cu
   src/kernels/fp8_dequant.cu
   src/kernels/fp8_gemm.cu
+  src/kernels/mxfp8_gemm.cu
   src/kernels/fp8w_gemm.cu
   src/kernels/fp4w_gemm.cu
   src/kernels/fp8_per_tensor.cu
@@ -192,10 +197,13 @@ add_library(dgpp_kernels STATIC
   src/kernels/gdn_chunk.cu
   src/kernels/glm_vision.cu
   src/kernels/qwen_vision.cu
+  src/kernels/minimax_vision.cu
+  src/kernels/fp32_gemm.cpp
   src/kernels/glm_norm.cu
   src/kernels/pick.cu
   src/kernels/sample_pick.cu
   src/kernels/glm_spec.cu
+  src/kernels/device_copy.cu
   src/kernels/qwen_norm.cu
   src/kernels/qwen_gr.cu
   src/kernels/qwen_moe.cu
@@ -213,13 +221,21 @@ add_library(dgpp_kernels STATIC
   src/kernels/full_attn.cu
   src/kernels/glm4_attn.cu
   src/kernels/sink_attn.cu
+  src/kernels/minimax.cu
+  src/kernels/minimax_native_attention.cu
+  src/kernels/minimax_native_moe.cu
   src/kernels/mimo_mtp_history.cu
   src/kernels/sink_attn_prefill.cu
   src/kernels/add_rmsnorm.cu
   src/kernels/dory_norm.cu
   src/kernels/dory_attn.cu
-  src/kernels/dory_head.cu)
-target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublasLt CUDA::cuda_driver dgpp_core dgpp_rope_scaling)
+  src/kernels/dory_head.cu
+  src/kernels/inkling2.cu
+  src/kernels/inkling2_attn.cu
+  src/kernels/inkling2_attn_prefill.cu
+  src/kernels/inkling2_draft.cu
+  src/kernels/inkling2_vision.cu)
+target_link_libraries(dgpp_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver dgpp_core dgpp_rope_scaling)
 dgpp_set_common(dgpp_kernels)
 # The device sampler mirrors the host oracle bit for bit: no contraction of
 # its multiplies and adds (the host builds with -ffp-contract=off).
@@ -266,6 +282,8 @@ add_library(dgpp_text STATIC
   src/text/dsv4_prompt.cpp
   src/text/tool_parser.cpp
   src/text/tool_grammar.cpp
+  src/text/minimax_tool_grammar.cpp
+  src/text/inkling_tool_grammar.cpp
   src/text/string_constraint.cpp
   src/text/json_grammar.cpp)
 target_link_libraries(dgpp_text PUBLIC dgpp_loaders dgpp_pcre2)
@@ -366,6 +384,38 @@ target_include_directories(dgpp_models_flint PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(dgpp_models_flint PUBLIC dgpp_loaders dgpp_common)
 dgpp_set_common(dgpp_models_flint)
 
+# Inkling 2 (docs/inkling2_mini_plan.md): the host-side config and binding
+# tables of the looped model.
+add_library(dgpp_models_inkling2 STATIC
+  src/models/inkling2/config.cpp
+  src/models/inkling2/binding.cpp)
+target_include_directories(dgpp_models_inkling2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_inkling2 PUBLIC dgpp_loaders dgpp_common)
+dgpp_set_common(dgpp_models_inkling2)
+
+add_library(dgpp_models_minimax STATIC
+  src/models/minimax/dspark_config.cpp
+  src/models/minimax/config.cpp
+  src/models/minimax/binding.cpp
+  src/models/minimax/reference.cpp)
+target_include_directories(dgpp_models_minimax PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_minimax PUBLIC dgpp_models_dflash2 dgpp_loaders dgpp_common CUDA::cudart)
+dgpp_set_common(dgpp_models_minimax)
+
+add_library(dgpp_models_minimax_loader STATIC src/models/minimax/loader.cpp src/models/minimax/dspark_loader.cpp src/models/minimax/vision.cpp)
+target_include_directories(dgpp_models_minimax_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_minimax_loader PUBLIC dgpp_models_dflash2 dgpp_models_minimax dgpp_loaders dgpp_kernels CUDA::cudart dgpp_device_ranges)
+dgpp_set_common(dgpp_models_minimax_loader)
+
+add_library(dgpp_models_minimax_layers STATIC
+  src/models/minimax/kv_pool.cpp
+  src/models/minimax/layers.cpp
+  src/models/minimax/image_prefill.cpp
+  src/models/minimax/forward.cpp)
+target_include_directories(dgpp_models_minimax_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_minimax_layers PUBLIC dgpp_models_minimax dgpp_models_minimax_loader dgpp_kernels CUDA::cudart)
+dgpp_set_common(dgpp_models_minimax_layers)
+
 # The MiMo resident loader (loaders/resident_stream.hpp + the family's builders).
 add_library(dgpp_models_mimo_loader STATIC
   src/models/mimo/loader.cpp)
@@ -410,21 +460,49 @@ target_link_libraries(dgpp_models_flint_layers
   PUBLIC dgpp_models_flint dgpp_models_flint_loader dgpp_models_mimo_kv dgpp_models_qwen_moe dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_flint_layers)
 
+# The Inkling 2 loader (docs/inkling2_mini_plan.md section 2): the shared
+# resident stream over the family's bindings and TP geometry.
+add_library(dgpp_models_inkling2_loader STATIC
+  src/models/inkling2/loader.cpp)
+target_include_directories(dgpp_models_inkling2_loader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_inkling2_loader PUBLIC dgpp_models_inkling2 dgpp_models_glm dgpp_loaders CUDA::cudart dgpp_device_ranges)
+dgpp_set_common(dgpp_models_inkling2_loader)
+
+# The Inkling 2 layers and model: the relative-bias attention kernels, the
+# shared grouped expert kernels under the family's activation recipe, the
+# MiMo paged pool with one plane per visit.
+add_library(dgpp_models_inkling2_layers STATIC
+  src/models/inkling2/layers.cpp
+  src/models/inkling2/draft.cpp
+  src/models/inkling2/vision.cpp
+  src/models/inkling2/image_prefill.cpp
+  src/models/inkling2/forward.cpp)
+target_include_directories(dgpp_models_inkling2_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dgpp_models_inkling2_layers
+  PUBLIC dgpp_models_inkling2 dgpp_models_inkling2_loader dgpp_models_dflash2 dgpp_models_mimo_kv dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
+dgpp_set_common(dgpp_models_inkling2_layers)
+
 # The full GLM-5.3 model on the session core (docs/glm53_plan.md G5).
 add_library(dgpp_models_glm_dsa_layers STATIC
-  src/models/glm_dsa/model.cpp)
+  src/models/glm_dsa/model.cpp
+  src/adapters/runtime.cpp)
 target_include_directories(dgpp_models_glm_dsa_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_glm_dsa_layers
-  PUBLIC dgpp_models_glm_dsa dgpp_models_glm_dsa_loader dgpp_models_dsa dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
+  PUBLIC dgpp_adapters dgpp_models_glm_dsa dgpp_models_glm_dsa_loader dgpp_models_dsa dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_glm_dsa_layers)
 
 # Full GLM-5.3 (2026-09-12, docs/glm53_plan.md): the host-side model description.
 add_library(dgpp_models_glm_dsa STATIC
   src/models/glm_dsa/config.cpp
+  src/models/glm_dsa/modification_targets.cpp
   src/models/glm_dsa/binding.cpp)
 target_include_directories(dgpp_models_glm_dsa PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_glm_dsa PUBLIC dgpp_loaders dgpp_common)
 dgpp_set_common(dgpp_models_glm_dsa)
+
+add_library(dgpp_adapters STATIC src/adapters/artifact.cpp)
+target_link_libraries(dgpp_adapters PUBLIC dgpp_models_glm_dsa OpenSSL::Crypto)
+dgpp_set_common(dgpp_adapters)
 
 # The full GLM-5.3 resident loader (G3): the shared weight builder at the
 # family's TP geometry, the packed-int slices, the draft's requant.
@@ -919,7 +997,8 @@ if(DGPP_ENABLE_IBV)
   target_link_libraries(dgpp_serve_app PRIVATE dgpp_models_glm_loader dgpp_models_qwen_layers dgpp_models_glm4_layers dgpp_models_glm_dsa_layers
                                              dgpp_models_dsv41_layers dgpp_models_dsv4_layers dgpp_models_mimo_layers
                                              dgpp_models_dory_layers
-                                             dgpp_models_flint_layers
+                                             dgpp_models_flint_layers dgpp_models_minimax_layers
+                                             dgpp_models_inkling2_layers
                                              dgpp_loaders dgpp_bus
                                              dgpp_serve CUDA::cudart
                                              Threads::Threads)
@@ -938,10 +1017,11 @@ if(DGPP_ENABLE_IBV)
   target_include_directories(dgpp_serve_app PRIVATE ${CMAKE_BINARY_DIR}/generated)
   # The install layout (the versioned artifact, scripts/release.sh): the
   # binary finds the CUDA runtime it was built against beside itself, so
-  # a node needs only the driver, rdma-core, libnl and libstdc++.
+  # a node needs the driver, rdma-core, libnl, libstdc++ and (with video
+  # enabled) the system FFmpeg runtime libraries.
   set_target_properties(dgpp_serve_app PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
   install(TARGETS dgpp_serve_app RUNTIME DESTINATION bin)
-  foreach(_lib cudart cublasLt)
+  foreach(_lib cudart cublas cublasLt)
     get_target_property(_loc CUDA::${_lib} IMPORTED_LOCATION)
     if(NOT _loc)
       get_target_property(_loc CUDA::${_lib} LOCATION)
@@ -995,10 +1075,13 @@ add_executable(unit_tests
   tests/unit/glm_route_audit_test.cpp
   tests/unit/sampler_test.cpp
   tests/unit/tool_parser_test.cpp
+  tests/unit/minimax_tool_test.cpp
+  tests/unit/inkling_tool_test.cpp
   tests/unit/tool_grammar_test.cpp
   tests/unit/json_grammar_test.cpp
   tests/unit/net_test.cpp
   tests/unit/cluster_config_test.cpp
+  tests/unit/runtime_adapter_test.cpp
   tests/unit/qwen_config_test.cpp
   tests/unit/qwen_csf_test.cpp
   tests/unit/qwen_image_stage_test.cpp
@@ -1014,10 +1097,12 @@ add_executable(unit_tests
   tests/unit/glm4_binding_test.cpp
   tests/unit/glm_dsa_config_test.cpp
   tests/unit/glm_dsa_binding_test.cpp
+  tests/unit/glm_dsa_modification_targets_test.cpp
   tests/unit/dsv41_config_test.cpp
   tests/unit/dsv41_binding_test.cpp
   tests/unit/dsv4_config_test.cpp
   tests/unit/dsv4_binding_test.cpp
+  tests/unit/dsv4_prompt_test.cpp
   tests/unit/mimo_config_test.cpp
   tests/unit/mimo_binding_test.cpp
   tests/unit/dory_config_test.cpp
@@ -1025,16 +1110,22 @@ add_executable(unit_tests
   tests/unit/dory_reference_test.cpp
   tests/unit/flint_config_test.cpp
   tests/unit/flint_binding_test.cpp
+  tests/unit/inkling2_config_test.cpp
+  tests/unit/inkling2_binding_test.cpp
+  tests/unit/minimax_dspark_config_test.cpp
+  tests/unit/minimax_config_test.cpp
+  tests/unit/minimax_binding_test.cpp
+  tests/unit/minimax_reference_test.cpp
   tests/unit/nvfp4_quant_test.cpp
   tests/unit/verify_schedule_test.cpp
   tests/unit/lookup_draft_test.cpp
   src/core/trace.cpp)
 target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
+target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders dgpp_adapters
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_qwen_loader
                                         dgpp_models_glm4
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo
-                                        dgpp_models_dory
+                                        dgpp_models_dory dgpp_models_minimax dgpp_models_inkling2
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo dgpp_models_flint
                                         dgpp_rope_scaling
                                         dgpp_net dgpp_serve Threads::Threads)
@@ -1136,6 +1227,9 @@ set_tests_properties(mimo_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
 add_test(NAME flint_tokenizer_test
   COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/flint_tokenizer_goldens.jsonl)
 set_tests_properties(flint_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
+add_test(NAME inkling2_tokenizer_test
+  COMMAND tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/inkling2_tokenizer_goldens.jsonl)
+set_tests_properties(inkling2_tokenizer_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # M6 Stage 3b: the chat-template differential gate (host). Skips with rc 2
 # when the model cache is absent, same as above.
@@ -1171,6 +1265,9 @@ set_tests_properties(mimo_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
 add_test(NAME flint_chat_template_test
   COMMAND chat_template_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/flint_chat_template_goldens.jsonl)
 set_tests_properties(flint_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
+add_test(NAME inkling2_chat_template_test
+  COMMAND chat_template_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/inkling2_chat_template_goldens.jsonl)
+set_tests_properties(inkling2_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # M6 Stage 4: the serving capstone — HTTP/SSE over epoll + the OpenAI
 # generation service (host-only; the engine adapters live in the apps,
@@ -1179,9 +1276,11 @@ set_tests_properties(flint_chat_template_test PROPERTIES SKIP_RETURN_CODE 2)
 # journal (fabric_serve.cpp over the host-only dgpp_net TCP primitives).
 add_library(dgpp_serve STATIC
   src/serve/image_inputs.cpp
+  src/serve/video_inputs.cpp
   src/serve/vision_frontend.cpp
   src/serve/glm_vision_frontend.cpp
   src/serve/qwen_vision_frontend.cpp
+  src/serve/inkling_vision_frontend.cpp
   src/serve/file_inputs.cpp
   src/serve/cluster_config.cpp
   src/serve/nvme_cache_check.cpp
@@ -1193,7 +1292,41 @@ add_library(dgpp_serve STATIC
   src/serve/rank_metrics.cpp)
 target_link_libraries(dgpp_serve
   PUBLIC dgpp_core dgpp_models_glm dgpp_loaders dgpp_net Threads::Threads)
+if(DGPP_ENABLE_VIDEO)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(DGPP_FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
+  target_link_libraries(dgpp_serve PRIVATE PkgConfig::DGPP_FFMPEG)
+  target_compile_definitions(dgpp_serve PRIVATE DGPP_ENABLE_VIDEO=1)
+endif()
 dgpp_set_common(dgpp_serve)
+
+add_executable(dgpp_heretic_inspect apps/dgpp_heretic_inspect.cpp)
+target_link_libraries(dgpp_heretic_inspect PRIVATE dgpp_models_glm_dsa dgpp_serve)
+set_target_properties(dgpp_heretic_inspect PROPERTIES OUTPUT_NAME dgpp-heretic-inspect)
+dgpp_set_common(dgpp_heretic_inspect)
+add_executable(dgpp_heretic_worker apps/dgpp_heretic_worker.cpp)
+target_link_libraries(dgpp_heretic_worker PRIVATE dgpp_models_glm_dsa_layers dgpp_serve CUDA::cudart Threads::Threads)
+set_target_properties(dgpp_heretic_worker PROPERTIES OUTPUT_NAME dgpp-heretic-worker)
+dgpp_set_common(dgpp_heretic_worker)
+if(TARGET dgpp_bus)
+  target_link_libraries(dgpp_heretic_worker PRIVATE dgpp_bus)
+  target_compile_definitions(dgpp_heretic_worker PRIVATE DGPP_HERETIC_FABRIC=1)
+  add_dependencies(dgpp_heretic_worker dgpp_version)
+  target_include_directories(dgpp_heretic_worker PRIVATE ${CMAKE_BINARY_DIR}/generated)
+  add_test(NAME heretic_distributed_host COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_distributed_check.py host
+    $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heretic_glm_dsa_config.json)
+endif()
+add_test(NAME heretic_worker_host COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_worker_check.py host
+  $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heretic_glm_dsa_config.json)
+add_test(NAME heretic_launcher_host COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_launcher_check.py
+  $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heretic_glm_dsa_config.json)
+add_test(NAME heretic_inspect_test COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_inspect_test.py
+  $<TARGET_FILE:dgpp_heretic_inspect>
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/heretic_glm_dsa_config.json)
 
 add_executable(http_server_test tests/host/http_server_test.cpp)
 target_link_libraries(http_server_test PRIVATE dgpp_serve Threads::Threads)
@@ -1204,6 +1337,11 @@ add_executable(nvme_cache_test tests/host/nvme_cache_test.cpp)
 target_link_libraries(nvme_cache_test PRIVATE dgpp_serve)
 dgpp_set_common(nvme_cache_test)
 add_test(NAME nvme_cache_test COMMAND nvme_cache_test)
+
+add_executable(cache_storage_test tests/host/cache_storage_test.cpp)
+target_link_libraries(cache_storage_test PRIVATE dgpp_serve)
+dgpp_set_common(cache_storage_test)
+add_test(NAME cache_storage_test COMMAND cache_storage_test)
 
 # M6 Stage 4 service gate: the REAL HTTP/SSE service over a fake engine
 # + fake frontend — the OpenAI surface, host-only, always runs.
@@ -1284,6 +1422,8 @@ add_test(NAME serve_campaign_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/serve_campaign_test.py)
 add_test(NAME serve_admission_bench_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/serve_admission_bench_test.py)
+add_test(NAME serve_cancel_prefix_check_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/serve_cancel_prefix_check_test.py)
 add_test(NAME qwen_yarn_release_check_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/qwen_yarn_release_check_test.py)
 add_test(NAME qwen_head_compare_test
@@ -1713,7 +1853,7 @@ set_tests_properties(qwen_dflash2_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
 
 add_executable(dflash2_integration_test tests/cuda/dflash2_integration_test.cpp)
 target_include_directories(dflash2_integration_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
-target_link_libraries(dflash2_integration_test PRIVATE dgpp_models_qwen_layers dgpp_bus dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+target_link_libraries(dflash2_integration_test PRIVATE dgpp_models_minimax_layers dgpp_models_qwen_layers dgpp_models_inkling2_layers dgpp_bus dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(dflash2_integration_test)
 add_test(NAME dflash2_integration_test COMMAND dflash2_integration_test)
 set_tests_properties(dflash2_integration_test PROPERTIES RUN_SERIAL TRUE LABELS "gpu")
@@ -1876,9 +2016,219 @@ add_test(NAME flint_forward_test
           --dump-file ${CMAKE_CURRENT_BINARY_DIR}/flint_teacher_ref.fdump)
 set_tests_properties(flint_forward_test PROPERTIES DEPENDS flint_forward_generate_teacher)
 
+# The Inkling 2 row kernels against host statements, and the two activation
+# quantizers against the numpy reference's (docs/inkling2_mini_plan.md G2).
+add_executable(inkling2_kernels_test tests/cuda/inkling2_kernels_test.cu)
+target_include_directories(inkling2_kernels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_kernels_test PRIVATE dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_kernels_test)
+add_test(NAME inkling2_kernels_test
+  COMMAND inkling2_kernels_test --dump-quant ${CMAKE_CURRENT_BINARY_DIR}/inkling2_quant.bin)
+add_test(NAME inkling2_quantizers_reference
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+          check-quant --dump ${CMAKE_CURRENT_BINARY_DIR}/inkling2_quant.bin)
+set_tests_properties(inkling2_quantizers_reference PROPERTIES DEPENDS inkling2_kernels_test)
+
+# The Inkling 2 forward (docs/inkling2_mini_plan.md G3): fixture -> smoke;
+# the python reference end to end (relaxed) -> teacher-forced (strict), once
+# per expert activation recipe.
+add_executable(inkling2_forward_test tests/cuda/inkling2_forward_test.cpp)
+target_include_directories(inkling2_forward_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_forward_test PRIVATE dgpp_models_inkling2_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_forward_test)
+set(INKLING2_FORWARD_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/inkling2_forward_fixture)
+add_test(NAME inkling2_forward_fixture COMMAND inkling2_forward_test --write-fixture ${INKLING2_FORWARD_FIXTURE})
+foreach(INK2_ACT bf16 native)
+  add_test(NAME inkling2_forward_smoke_${INK2_ACT}
+    COMMAND inkling2_forward_test --smoke ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT})
+  set_tests_properties(inkling2_forward_smoke_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_fixture)
+  add_test(NAME inkling2_forward_generate_${INK2_ACT}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+            gen-pure --checkpoint-dir ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT}
+            --out ${CMAKE_CURRENT_BINARY_DIR}/inkling2_pure_ref_${INK2_ACT}.idump)
+  set_tests_properties(inkling2_forward_generate_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_fixture)
+  add_test(NAME inkling2_forward_test_e2e_${INK2_ACT}
+    COMMAND ${CMAKE_COMMAND} -E env
+            DGPP_INKLING2_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/inkling2_engine_states_${INK2_ACT}.bin
+            $<TARGET_FILE:inkling2_forward_test> --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+            --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_pure_ref_${INK2_ACT}.idump
+            --activations ${INK2_ACT} --relaxed)
+  set_tests_properties(inkling2_forward_test_e2e_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_generate_${INK2_ACT})
+  add_test(NAME inkling2_forward_generate_teacher_${INK2_ACT}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+            gen-pure --checkpoint-dir ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT}
+            --out ${CMAKE_CURRENT_BINARY_DIR}/inkling2_teacher_ref_${INK2_ACT}.idump
+            --teacher ${CMAKE_CURRENT_BINARY_DIR}/inkling2_engine_states_${INK2_ACT}.bin)
+  set_tests_properties(inkling2_forward_generate_teacher_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_test_e2e_${INK2_ACT})
+  add_test(NAME inkling2_forward_test_${INK2_ACT}
+    COMMAND inkling2_forward_test --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+            --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_teacher_ref_${INK2_ACT}.idump
+            --activations ${INK2_ACT})
+  set_tests_properties(inkling2_forward_test_${INK2_ACT} PROPERTIES DEPENDS inkling2_forward_generate_teacher_${INK2_ACT})
+endforeach()
+
+# The Inkling 2 tensor-parallel forwards (docs/inkling2_mini_plan.md section
+# 2): loopback worlds of 2 and 4 ranks, bitwise across ranks and
+# teacher-forced against the reference at that world, once per activation
+# recipe (ports 30042 to 30055).
+add_executable(inkling2_tp_test tests/cuda/inkling2_tp_test.cpp)
+target_include_directories(inkling2_tp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_tp_test PRIVATE dgpp_models_inkling2_layers dgpp_bus dgpp_loaders CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_tp_test)
+set(INKLING2_TP_TESTS "")
+foreach(INK2_ACT bf16 native)
+  foreach(INK2_WORLD 2 4)
+    if(INK2_ACT STREQUAL "native")
+      math(EXPR INK2_PORT "30050 + ${INK2_WORLD}")
+    else()
+      math(EXPR INK2_PORT "30040 + ${INK2_WORLD}")
+    endif()
+    set(INK2_TAG w${INK2_WORLD}_${INK2_ACT})
+    add_test(NAME inkling2_tp_states_${INK2_TAG}
+      COMMAND ${CMAKE_COMMAND} -E env
+              DGPP_INKLING2_DUMP_ENGINE_STATES=${CMAKE_CURRENT_BINARY_DIR}/inkling2_engine_states_${INK2_TAG}.bin
+              $<TARGET_FILE:inkling2_tp_test> --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+              --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_pure_ref_${INK2_ACT}.idump
+              --world ${INK2_WORLD} --port ${INK2_PORT} --activations ${INK2_ACT} --report)
+    set_tests_properties(inkling2_tp_states_${INK2_TAG} PROPERTIES DEPENDS inkling2_forward_generate_${INK2_ACT})
+    add_test(NAME inkling2_tp_generate_teacher_${INK2_TAG}
+      COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+              gen-pure --checkpoint-dir ${INKLING2_FORWARD_FIXTURE} --activations ${INK2_ACT} --world ${INK2_WORLD}
+              --out ${CMAKE_CURRENT_BINARY_DIR}/inkling2_teacher_ref_${INK2_TAG}.idump
+              --teacher ${CMAKE_CURRENT_BINARY_DIR}/inkling2_engine_states_${INK2_TAG}.bin)
+    set_tests_properties(inkling2_tp_generate_teacher_${INK2_TAG} PROPERTIES DEPENDS inkling2_tp_states_${INK2_TAG})
+    add_test(NAME inkling2_tp_test_${INK2_TAG}
+      COMMAND inkling2_tp_test --checkpoint-dir ${INKLING2_FORWARD_FIXTURE}
+              --dump-file ${CMAKE_CURRENT_BINARY_DIR}/inkling2_teacher_ref_${INK2_TAG}.idump
+              --world ${INK2_WORLD} --port ${INK2_PORT} --activations ${INK2_ACT})
+    set_tests_properties(inkling2_tp_test_${INK2_TAG} PROPERTIES DEPENDS inkling2_tp_generate_teacher_${INK2_TAG})
+    list(APPEND INKLING2_TP_TESTS inkling2_tp_states_${INK2_TAG} inkling2_tp_test_${INK2_TAG})
+  endforeach()
+endforeach()
+set_tests_properties(${INKLING2_TP_TESTS} PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
+
+# The Inkling 2 engines (docs/inkling2_mini_plan.md G5): the eager and graph
+# adapters on a loopback world of 2, once per activation recipe.
+add_executable(inkling2_engine_test tests/cuda/inkling2_engine_test.cpp)
+target_include_directories(inkling2_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_engine_test PRIVATE dgpp_models_inkling2_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_engine_test)
+add_test(NAME inkling2_engine_test COMMAND inkling2_engine_test)
+set_tests_properties(inkling2_engine_test PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
+
+# The Inkling 2 session surface (docs/inkling2_mini_plan.md G4): decode
+# against the re-forward, snapshots, verify rows, slots, the prefix cache.
+add_executable(inkling2_decode_test tests/cuda/inkling2_decode_test.cpp)
+target_include_directories(inkling2_decode_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_decode_test PRIVATE dgpp_models_inkling2_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_decode_test)
+foreach(INK2_ACT bf16 native)
+  add_test(NAME inkling2_decode_test_${INK2_ACT}
+    COMMAND inkling2_decode_test --fixture ${CMAKE_CURRENT_BINARY_DIR}/inkling2_decode_fixture --activations ${INK2_ACT})
+endforeach()
+set_tests_properties(inkling2_decode_test_native PROPERTIES DEPENDS inkling2_decode_test_bf16)
+
+# The Inkling 2 draft model (docs/inkling2_mini_plan.md section 1.7): the
+# structural checks once per activation recipe, then the draft's context
+# rows, block rows and proposals at worlds 1, 2 and 4 against the numpy
+# reference (loopback ports 30072 and 30074).
+add_executable(inkling2_draft_test tests/cuda/inkling2_draft_test.cpp)
+target_include_directories(inkling2_draft_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_draft_test PRIVATE dgpp_models_inkling2_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_draft_test)
+set(INKLING2_DRAFT_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/inkling2_draft_fixture)
+add_test(NAME inkling2_draft_fixture COMMAND inkling2_draft_test --write-fixture ${INKLING2_DRAFT_FIXTURE})
+set(INKLING2_DRAFT_TESTS "")
+foreach(INK2_ACT bf16 native)
+  add_test(NAME inkling2_draft_test_${INK2_ACT}
+    COMMAND inkling2_draft_test --fixture ${INKLING2_DRAFT_FIXTURE} --activations ${INK2_ACT})
+  set_tests_properties(inkling2_draft_test_${INK2_ACT} PROPERTIES DEPENDS inkling2_draft_fixture)
+  list(APPEND INKLING2_DRAFT_TESTS inkling2_draft_test_${INK2_ACT})
+endforeach()
+foreach(INK2_WORLD 1 2 4)
+  math(EXPR INK2_PORT "30070 + ${INK2_WORLD}")
+  add_test(NAME inkling2_draft_cases_w${INK2_WORLD}
+    COMMAND inkling2_draft_test --fixture ${INKLING2_DRAFT_FIXTURE}
+            --dump ${CMAKE_CURRENT_BINARY_DIR}/inkling2_draft_w${INK2_WORLD}.bin
+            --world ${INK2_WORLD} --port ${INK2_PORT})
+  set_tests_properties(inkling2_draft_cases_w${INK2_WORLD} PROPERTIES DEPENDS inkling2_draft_fixture)
+  add_test(NAME inkling2_draft_reference_w${INK2_WORLD}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_reference_dump.py
+            check-draft --checkpoint-dir ${INKLING2_DRAFT_FIXTURE}
+            --dump ${CMAKE_CURRENT_BINARY_DIR}/inkling2_draft_w${INK2_WORLD}.bin)
+  set_tests_properties(inkling2_draft_reference_w${INK2_WORLD} PROPERTIES DEPENDS inkling2_draft_cases_w${INK2_WORLD})
+  list(APPEND INKLING2_DRAFT_TESTS inkling2_draft_cases_w${INK2_WORLD})
+endforeach()
+set_tests_properties(${INKLING2_DRAFT_TESTS} PROPERTIES LABELS "gpu;rdma" RUN_SERIAL TRUE)
+
+# The Inkling 2 vision tower against its numpy reference on the tiny tower
+# tools/inkling2_vision_reference.py writes, and the image prefill on the tiny
+# release with a tower.
+add_executable(inkling2_vision_test tests/cuda/inkling2_vision_test.cpp)
+target_include_directories(inkling2_vision_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_vision_test PRIVATE dgpp_models_inkling2_layers CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_vision_test)
+set(INKLING2_VISION_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/inkling2_vision_fixture)
+add_test(NAME inkling2_vision_fixture
+  COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_vision_reference.py
+          write-fixture --out ${INKLING2_VISION_FIXTURE})
+set_tests_properties(inkling2_vision_fixture PROPERTIES LABELS "host")
+set(INKLING2_VISION_DUMPS "")
+set(INKLING2_VISION_REFERENCES "")
+foreach(INK2_CASE rect padded minimum tiled)
+  set(INK2_DUMP ${CMAKE_CURRENT_BINARY_DIR}/inkling2_vision_${INK2_CASE}.idump)
+  add_test(NAME inkling2_vision_reference_${INK2_CASE}
+    COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/inkling2_vision_reference.py
+            gen --checkpoint-dir ${INKLING2_VISION_FIXTURE} --case ${INK2_CASE} --out ${INK2_DUMP})
+  set_tests_properties(inkling2_vision_reference_${INK2_CASE} PROPERTIES
+    DEPENDS inkling2_vision_fixture LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=1")
+  list(APPEND INKLING2_VISION_DUMPS ${INK2_DUMP})
+  list(APPEND INKLING2_VISION_REFERENCES inkling2_vision_reference_${INK2_CASE})
+endforeach()
+add_test(NAME inkling2_vision_test COMMAND inkling2_vision_test ${INKLING2_VISION_FIXTURE} ${INKLING2_VISION_DUMPS})
+set_tests_properties(inkling2_vision_test PROPERTIES DEPENDS "${INKLING2_VISION_REFERENCES}" LABELS "gpu")
+
+add_executable(inkling2_image_prefill_test tests/cuda/inkling2_image_prefill_test.cpp)
+target_include_directories(inkling2_image_prefill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(inkling2_image_prefill_test PRIVATE dgpp_models_inkling2_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
+dgpp_set_common(inkling2_image_prefill_test)
+add_test(NAME inkling2_image_prefill_test
+  COMMAND inkling2_image_prefill_test --fixture ${CMAKE_CURRENT_BINARY_DIR}/inkling2_image_fixture)
+set_tests_properties(inkling2_image_prefill_test PROPERTIES LABELS "gpu")
+
 # The full GLM-5.3 forward (docs/glm53_plan.md G5): fixture -> smoke; the
 # python reference -> the dump parity.
 add_executable(glm_dsa_forward_test tests/cuda/glm_dsa_forward_test.cpp)
+add_executable(heretic_capture_test tests/cuda/heretic_capture_test.cpp)
+target_include_directories(heretic_capture_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(heretic_capture_test PRIVATE dgpp_models_glm_dsa_layers CUDA::cudart Threads::Threads)
+dgpp_set_common(heretic_capture_test)
+add_executable(heretic_batch_test tests/cuda/heretic_batch_test.cpp)
+target_include_directories(heretic_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(heretic_batch_test PRIVATE dgpp_models_glm_dsa_layers CUDA::cudart Threads::Threads)
+dgpp_set_common(heretic_batch_test)
+foreach(_format int8 m346)
+  add_test(NAME heretic_capture_${_format} COMMAND heretic_capture_test
+    ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture ${_format})
+  set_tests_properties(heretic_capture_${_format} PROPERTIES
+    FIXTURES_SETUP heretic_${_format} RUN_SERIAL TRUE TIMEOUT 120)
+  add_test(NAME heretic_batch_${_format} COMMAND heretic_batch_test
+    ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture ${_format})
+  set_tests_properties(heretic_batch_${_format} PROPERTIES
+    FIXTURES_REQUIRED heretic_${_format} LABELS "gpu" RUN_SERIAL TRUE TIMEOUT 180)
+  add_test(NAME heretic_worker_${_format} COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_worker_check.py gpu
+    $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture)
+  set_tests_properties(heretic_worker_${_format} PROPERTIES
+    FIXTURES_REQUIRED heretic_${_format} RUN_SERIAL TRUE TIMEOUT 120)
+  if(TARGET dgpp_bus)
+    add_test(NAME heretic_distributed_${_format} COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/heretic_distributed_check.py gpu
+      $<TARGET_FILE:dgpp_heretic_worker> ${CMAKE_CURRENT_BINARY_DIR}/heretic_${_format}_fixture)
+    set_tests_properties(heretic_distributed_${_format} PROPERTIES
+      FIXTURES_REQUIRED heretic_${_format} RUN_SERIAL TRUE TIMEOUT 180)
+  endif()
+endforeach()
 target_include_directories(glm_dsa_forward_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(glm_dsa_forward_test PRIVATE dgpp_models_glm_dsa_layers dgpp_models_glm_loader CUDA::cudart Threads::Threads)
 dgpp_set_common(glm_dsa_forward_test)
@@ -1991,9 +2341,25 @@ target_include_directories(glm_dsa_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(glm_dsa_engine_test PRIVATE dgpp_models_glm_dsa_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(glm_dsa_engine_test)
 add_test(NAME glm_dsa_engine_test COMMAND glm_dsa_engine_test)
+add_executable(runtime_adapter_native_test tests/cuda/runtime_adapter_native_test.cpp)
+target_include_directories(runtime_adapter_native_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(runtime_adapter_native_test PRIVATE dgpp_models_glm_dsa_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(runtime_adapter_native_test)
+foreach(_format int8 m346)
+  foreach(_world 1 2 4)
+    add_test(NAME runtime_adapter_native_${_format}_w${_world}
+      COMMAND runtime_adapter_native_test ${CMAKE_CURRENT_BINARY_DIR}/adapter_native_${_format}_fixture ${_format} ${_world})
+    set_tests_properties(runtime_adapter_native_${_format}_w${_world} PROPERTIES
+      RUN_SERIAL TRUE LABELS "gpu" TIMEOUT 240 ENVIRONMENT "CUDA_MODULE_LOADING=EAGER")
+  endforeach()
+endforeach()
 add_test(NAME glm_dsa_engine_test_draft_screen
   COMMAND ${CMAKE_COMMAND} -E env DGPP_TEST_DRAFT_SCREEN=2 $<TARGET_FILE:glm_dsa_engine_test>)
 set_tests_properties(glm_dsa_engine_test_draft_screen PROPERTIES RUN_SERIAL TRUE LABELS "gpu" SKIP_RETURN_CODE 2)
+add_test(NAME runtime_adapter_native_m346_w4_full_layers
+  COMMAND runtime_adapter_native_test ${CMAKE_CURRENT_BINARY_DIR}/adapter_native_full_fixture m346 4 78)
+set_tests_properties(runtime_adapter_native_m346_w4_full_layers PROPERTIES
+  RUN_SERIAL TRUE LABELS "gpu" TIMEOUT 300 ENVIRONMENT "CUDA_MODULE_LOADING=EAGER")
 # The wide gate at eight slots x depth 2 (24 rows; the cap is 32 since 2026-10-13).
 add_test(NAME glm_dsa_engine_test_twenty_four_rows
   COMMAND ${CMAKE_COMMAND} -E env DGPP_WIDE_SLOTS=8 DGPP_WIDE_DEPTH=2 $<TARGET_FILE:glm_dsa_engine_test>)
@@ -2196,6 +2562,10 @@ dgpp_set_common(mimo_forward_check)
 add_executable(flint_forward_check apps/flint_forward_check.cpp)
 target_link_libraries(flint_forward_check PRIVATE dgpp_models_flint_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(flint_forward_check)
+
+add_executable(minimax_forward_check apps/minimax_forward_check.cpp)
+target_link_libraries(minimax_forward_check PRIVATE dgpp_models_minimax_layers dgpp_bus dgpp_loaders dgpp_sched dgpp_text CUDA::cudart Threads::Threads)
+dgpp_set_common(minimax_forward_check)
 
 add_executable(qwen_load_check apps/qwen_load_check.cpp)
 target_link_libraries(qwen_load_check PRIVATE dgpp_models_qwen_loader dgpp_loaders CUDA::cudart Threads::Threads)
@@ -2483,6 +2853,34 @@ set_tests_properties(glm_pick_test PROPERTIES SKIP_RETURN_CODE 2)
 
 # MoE module parity (M4): router vs oracle at real geometry, expert path on
 # small geometry, swiglu clamps, accumulation order, determinism.
+add_executable(mxfp8_gemm_test tests/cuda/mxfp8_gemm_test.cu)
+target_link_libraries(mxfp8_gemm_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(mxfp8_gemm_test)
+add_test(NAME mxfp8_gemm_test COMMAND mxfp8_gemm_test)
+set_tests_properties(mxfp8_gemm_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
+
+add_executable(minimax_nvfp4_decode_test tests/cuda/minimax_nvfp4_decode_test.cu)
+target_link_libraries(minimax_nvfp4_decode_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(minimax_nvfp4_decode_test)
+add_test(NAME minimax_nvfp4_decode_test COMMAND minimax_nvfp4_decode_test)
+set_tests_properties(minimax_nvfp4_decode_test PROPERTIES SKIP_RETURN_CODE 2 LABELS "cuda")
+
+add_executable(minimax_native_attention_test tests/cuda/minimax_native_attention_test.cpp)
+target_link_libraries(minimax_native_attention_test PRIVATE dgpp_kernels dgpp_common)
+dgpp_set_common(minimax_native_attention_test)
+add_test(NAME minimax_native_attention_test COMMAND ${DSV41_PYTHON}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_native_attention_regression.py
+  --app $<TARGET_FILE:minimax_native_attention_test>)
+set_tests_properties(minimax_native_attention_test PROPERTIES LABELS "cuda")
+
+add_executable(minimax_native_moe_test tests/cuda/minimax_native_moe_test.cpp)
+target_link_libraries(minimax_native_moe_test PRIVATE dgpp_kernels dgpp_common)
+dgpp_set_common(minimax_native_moe_test)
+add_test(NAME minimax_native_moe_test COMMAND ${DSV41_PYTHON}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_native_moe_regression.py
+  --app $<TARGET_FILE:minimax_native_moe_test>)
+set_tests_properties(minimax_native_moe_test PROPERTIES LABELS "cuda")
+
 add_executable(moe_w4a4_test tests/cuda/moe_w4a4_test.cu)
 target_include_directories(moe_w4a4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(moe_w4a4_test PRIVATE dgpp_models_glm_loader dgpp_models_glm CUDA::cudart)
@@ -2539,7 +2937,7 @@ add_test(NAME glm_forward_fixture
 set_tests_properties(glm_forward_fixture PROPERTIES SKIP_RETURN_CODE 2)
 add_executable(nvme_tier_families_test tests/cuda/nvme_tier_families_test.cpp)
 target_include_directories(nvme_tier_families_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
-target_link_libraries(nvme_tier_families_test PRIVATE dgpp_models_dory_layers dgpp_models_mimo_layers dgpp_models_flint_layers dgpp_models_qwen_layers dgpp_models_qwen_loader dgpp_models_qwen dgpp_models_glm_loader dgpp_kernels CUDA::cudart Threads::Threads)
+target_link_libraries(nvme_tier_families_test PRIVATE dgpp_models_dory_layers dgpp_models_mimo_layers dgpp_models_flint_layers dgpp_models_inkling2_layers dgpp_models_qwen_layers dgpp_models_qwen_loader dgpp_models_qwen dgpp_models_glm_loader dgpp_kernels CUDA::cudart Threads::Threads)
 dgpp_set_common(nvme_tier_families_test)
 add_test(NAME nvme_tier_families_test COMMAND nvme_tier_families_test)
 set_tests_properties(nvme_tier_families_test PROPERTIES RUN_SERIAL TRUE)
@@ -2680,6 +3078,18 @@ if(DGPP_BUILD_BENCHMARKS)
   dgpp_add_benchmark(mhc_site_bench
     SOURCES benchmarks/micro/mhc_site_bench.cu src/common/log.cpp
     LIBRARIES dgpp_kernels CUDA::cudart)
+  dgpp_add_benchmark(minimax_moe_bench
+    SOURCES benchmarks/micro/minimax_moe_bench.cpp
+    LIBRARIES dgpp_models_minimax_layers CUDA::cudart Threads::Threads)
+  dgpp_add_benchmark(minimax_index_bench
+    SOURCES benchmarks/micro/minimax_index_bench.cpp
+    LIBRARIES dgpp_kernels CUDA::cudart)
+  dgpp_add_benchmark(mxfp8_gemm_bench
+    SOURCES benchmarks/micro/mxfp8_gemm_bench.cu
+    LIBRARIES dgpp_kernels CUDA::cudart)
+  dgpp_add_benchmark(minimax_head_bench
+    SOURCES benchmarks/micro/minimax_head_bench.cpp
+    LIBRARIES dgpp_models_minimax_layers CUDA::cudart Threads::Threads)
   dgpp_add_benchmark(moe_tile_bench
     SOURCES benchmarks/micro/moe_tile_bench.cu src/common/log.cpp
     LIBRARIES dgpp_models_glm_loader dgpp_models_glm CUDA::cudart CUDA::cublasLt)
@@ -2700,6 +3110,10 @@ if(DGPP_BUILD_BENCHMARKS)
 
   dgpp_add_benchmark(dsa_select_bench
     SOURCES benchmarks/micro/dsa_select_bench.cu
+    LIBRARIES dgpp_models_dsa CUDA::cudart)
+
+  dgpp_add_benchmark(dsa_attn_tile_bench
+    SOURCES benchmarks/micro/dsa_attn_tile_bench.cu
     LIBRARIES dgpp_models_dsa CUDA::cudart)
 
   dgpp_add_benchmark(qsa_prefill_bench
@@ -2751,11 +3165,15 @@ get_property(DGPP_ALL_TESTS DIRECTORY PROPERTY TESTS)
 foreach(_test IN LISTS DGPP_ALL_TESTS)
   set_tests_properties(${_test} PROPERTIES LABELS "gpu")
 endforeach()
-set_tests_properties(tokenizer_patterns_test word_cache_test bpe_test unit unit_tests http_server_test nvme_cache_test serve_test serve_test_wake fabric_serve_test fabric_serve_test_wake scheduler_test shutdown_watchdog_test engine_watchdog_test
+set_tests_properties(tokenizer_patterns_test word_cache_test bpe_test unit unit_tests http_server_test nvme_cache_test cache_storage_test serve_test serve_test_wake fabric_serve_test fabric_serve_test_wake scheduler_test shutdown_watchdog_test engine_watchdog_test
   qwen_yarn_fixture_test qwen_w4a4_plan_default qwen_w4a4_plan_mode_0 qwen_w4a4_plan_mode_1
   qwen_w4a4_plan_mode_empty qwen_w4a4_plan_mode_invalid PROPERTIES LABELS "host")
-set_tests_properties(checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test
-  site_env_test script_reports_test timed_load_test serve_admission_bench_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test cluster_process_swap_test PROPERTIES LABELS "host;python")
+set_tests_properties(heretic_launcher_host heretic_worker_host heretic_inspect_test checkpoint_audit_test chat_template_generator_test route_trace_test sampling_profile_test spec_ab_probe_test
+  site_env_test script_reports_test timed_load_test serve_admission_bench_test serve_cancel_prefix_check_test qwen_yarn_release_check_test qwen_head_compare_test portability_test spark_cross_test setup_tools_test bootstrap_test launcher_test cluster_process_swap_test PROPERTIES LABELS "host;python")
+if(TARGET dgpp_bus)
+  set_tests_properties(heretic_distributed_host PROPERTIES LABELS "host;python" TIMEOUT 60)
+  set_tests_properties(heretic_distributed_int8 heretic_distributed_m346 PROPERTIES LABELS "gpu;rdma")
+endif()
 set_tests_properties(cluster_process_swap_systemd_test PROPERTIES LABELS "systemd" TIMEOUT 180)
 if(TARGET dgpp_serve_app)
   set_tests_properties(serve_startup_test PROPERTIES LABELS "host;python" TIMEOUT 180)
@@ -2763,7 +3181,9 @@ endif()
 set_tests_properties(tokenizer_test qwen_tokenizer_test glm4_tokenizer_test dsv41_tokenizer_test
   chat_template_test qwen_chat_template_test glm4_chat_template_test dsv41_prompt_test
   dsv4_tokenizer_test dsv4_prompt_test glm_dsa_tokenizer_test mimo_tokenizer_test flint_tokenizer_test
-  glm_dsa_chat_template_test mimo_chat_template_test flint_chat_template_test dory_grammar_repro
+  inkling2_tokenizer_test
+  glm_dsa_chat_template_test mimo_chat_template_test flint_chat_template_test inkling2_chat_template_test
+  dory_grammar_repro
   PROPERTIES LABELS "host;checkpoint")
 foreach(_test qwen_forward_fixture qwen_forward_generate glm4_forward_fixture
     glm4_forward_generate mimo_forward_fixture mimo_forward_generate mimo_forward_generate_teacher
@@ -2797,6 +3217,50 @@ add_executable(qwen_vision_check apps/qwen_vision_check.cpp)
 target_link_libraries(qwen_vision_check PRIVATE dgpp_models_qwen_loader CUDA::cudart)
 dgpp_set_common(qwen_vision_check)
 
+add_executable(minimax_vision_check apps/minimax_vision_check.cpp)
+target_link_libraries(minimax_vision_check PRIVATE dgpp_models_minimax_loader CUDA::cudart)
+dgpp_set_common(minimax_vision_check)
+
+add_executable(minimax_vision_test tests/cuda/minimax_vision_test.cpp)
+target_link_libraries(minimax_vision_test PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(minimax_vision_test)
+add_test(NAME minimax_vision_test COMMAND minimax_vision_test)
+set_tests_properties(minimax_vision_test PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 2)
+add_executable(minimax_image_prefill_test tests/cuda/minimax_image_prefill_test.cpp)
+target_link_libraries(minimax_image_prefill_test PRIVATE dgpp_models_minimax_layers CUDA::cudart)
+dgpp_set_common(minimax_image_prefill_test)
+add_test(NAME minimax_image_model_fixture COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_vision_fixture.py --output ${CMAKE_BINARY_DIR}/minimax_image_model_fixture --target-checkpoint ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture)
+set_tests_properties(minimax_image_model_fixture PROPERTIES FIXTURES_REQUIRED minimax_dspark_model_fixture FIXTURES_SETUP minimax_image_model LABELS "host")
+add_test(NAME minimax_image_prefill_test COMMAND minimax_image_prefill_test ${CMAKE_BINARY_DIR}/minimax_image_model_fixture)
+set_tests_properties(minimax_image_prefill_test PROPERTIES FIXTURES_REQUIRED minimax_image_model LABELS "gpu")
+add_test(NAME minimax_vision_fixture COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_vision_fixture.py --output ${CMAKE_BINARY_DIR}/minimax_vision_fixture)
+set_tests_properties(minimax_vision_fixture PROPERTIES FIXTURES_SETUP minimax_vision_checkpoint LABELS "host")
+foreach(shape IN ITEMS rect tiled minimum)
+  if(shape STREQUAL "rect")
+    set(vw 84)
+    set(vh 56)
+  elseif(shape STREQUAL "tiled")
+    set(vw 196)
+    set(vh 196)
+  else()
+    set(vw 28)
+    set(vh 28)
+  endif()
+  set(vdump ${CMAKE_BINARY_DIR}/minimax_vision_${shape})
+  add_test(NAME minimax_vision_forward_${shape} COMMAND minimax_vision_check ${CMAKE_BINARY_DIR}/minimax_vision_fixture ${vw} ${vh} ${vdump}.bf16 ${vdump})
+  set_tests_properties(minimax_vision_forward_${shape} PROPERTIES FIXTURES_REQUIRED minimax_vision_checkpoint FIXTURES_SETUP minimax_vision_${shape}_output LABELS "gpu")
+  add_test(NAME minimax_vision_reference_${shape} COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_vision_reference.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_vision_fixture --engine-dir ${vdump} --width ${vw} --height ${vh})
+  set_tests_properties(minimax_vision_reference_${shape} PROPERTIES FIXTURES_REQUIRED minimax_vision_${shape}_output LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=1")
+endforeach()
+
+foreach(frames IN ITEMS 2 4 6 8)
+  set(vdump ${CMAKE_BINARY_DIR}/minimax_video_${frames})
+  add_test(NAME minimax_video_forward_${frames} COMMAND minimax_vision_check ${CMAKE_BINARY_DIR}/minimax_vision_fixture 84 56 ${vdump}.bf16 ${vdump} - ".*" ${frames})
+  set_tests_properties(minimax_video_forward_${frames} PROPERTIES FIXTURES_REQUIRED minimax_vision_checkpoint FIXTURES_SETUP minimax_video_${frames}_output LABELS "gpu")
+  add_test(NAME minimax_video_reference_${frames} COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_vision_reference.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_vision_fixture --engine-dir ${vdump} --width 84 --height 56 --frames ${frames})
+  set_tests_properties(minimax_video_reference_${frames} PROPERTIES FIXTURES_REQUIRED minimax_video_${frames}_output LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=1")
+endforeach()
+
 add_executable(qwen_vision_test tests/cuda/qwen_vision_test.cpp)
 target_link_libraries(qwen_vision_test PRIVATE dgpp_kernels CUDA::cudart)
 dgpp_set_common(qwen_vision_test)
@@ -2820,6 +3284,21 @@ target_link_libraries(glm_vision_frontend_test PRIVATE dgpp_serve)
 dgpp_set_common(glm_vision_frontend_test)
 add_test(NAME glm_vision_frontend_test COMMAND glm_vision_frontend_test)
 set_tests_properties(glm_vision_frontend_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)
+add_executable(minimax_vision_frontend_test tests/host/minimax_vision_frontend_test.cpp)
+target_link_libraries(minimax_vision_frontend_test PRIVATE dgpp_serve)
+dgpp_set_common(minimax_vision_frontend_test)
+add_test(NAME minimax_vision_frontend_test COMMAND minimax_vision_frontend_test)
+set_tests_properties(minimax_vision_frontend_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)
+add_executable(inkling_vision_frontend_test tests/host/inkling_vision_frontend_test.cpp)
+target_link_libraries(inkling_vision_frontend_test PRIVATE dgpp_serve)
+dgpp_set_common(inkling_vision_frontend_test)
+add_test(NAME inkling_vision_frontend_test COMMAND inkling_vision_frontend_test)
+set_tests_properties(inkling_vision_frontend_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)
+add_executable(minimax_video_frontend_test tests/host/minimax_video_frontend_test.cpp)
+target_link_libraries(minimax_video_frontend_test PRIVATE dgpp_serve)
+dgpp_set_common(minimax_video_frontend_test)
+add_test(NAME minimax_video_frontend_test COMMAND minimax_video_frontend_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data)
+set_tests_properties(minimax_video_frontend_test PROPERTIES LABELS "host" SKIP_RETURN_CODE 2)
 
 # Isolated upstream-port regression: paged BF16/FP8 history and head rows.
 add_executable(mimo_port_test tests/cuda/mimo_port_test.cpp)
@@ -2842,6 +3321,7 @@ target_link_libraries(shared_prefill_test PRIVATE dgpp_models_glm_loader dgpp_mo
   dgpp_models_glm_dsa_layers dgpp_models_mimo_layers dgpp_models_qwen_layers
   dgpp_models_dsv4_layers dgpp_models_dsv41_layers dgpp_text CUDA::cudart Threads::Threads)
 dgpp_set_common(shared_prefill_test)
+target_link_libraries(shared_prefill_test PRIVATE dgpp_models_minimax_layers dgpp_models_inkling2_layers)
 if(TARGET dgpp_bus)
   target_link_libraries(shared_prefill_test PRIVATE dgpp_bus dgpp_serve)
   target_compile_definitions(shared_prefill_test PRIVATE DGPP_TEST_HAS_BUS=1)
@@ -2866,3 +3346,56 @@ if(TARGET dgpp_bus)
     dgpp_bus dgpp_text CUDA::cudart Threads::Threads)
   dgpp_set_common(serving_head_check)
 endif()
+
+add_executable(minimax_test tests/cuda/minimax_test.cpp tests/cuda/minimax_pdl_test.cu)
+target_link_libraries(minimax_test PRIVATE dgpp_models_minimax_layers dgpp_kernels dgpp_serve CUDA::cudart Threads::Threads)
+dgpp_set_common(minimax_test)
+add_test(NAME minimax_kernel_test COMMAND minimax_test --kernels)
+add_test(NAME minimax_dspark_fixture COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_dspark_fixture.py --output ${CMAKE_BINARY_DIR}/minimax_dspark_fixture)
+set_tests_properties(minimax_dspark_fixture PROPERTIES FIXTURES_SETUP minimax_dspark_fixture LABELS "host")
+add_test(NAME minimax_dspark_target_fixture COMMAND minimax_test --write-fixture ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture --config ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/minimax/tiny_config.json)
+set_tests_properties(minimax_dspark_target_fixture PROPERTIES FIXTURES_SETUP minimax_dspark_target_fixture LABELS "host")
+add_test(NAME minimax_dspark_model_fixture COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_dspark_fixture.py --output ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture/dspark)
+set_tests_properties(minimax_dspark_model_fixture PROPERTIES FIXTURES_REQUIRED minimax_dspark_target_fixture FIXTURES_SETUP minimax_dspark_model_fixture LABELS "host")
+set_tests_properties(dflash2_integration_test PROPERTIES FIXTURES_REQUIRED minimax_dspark_model_fixture)
+add_test(NAME minimax_dspark_forward COMMAND minimax_test --dspark-model-dir ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture --dump ${CMAKE_BINARY_DIR}/minimax_dspark_oracle)
+set_tests_properties(minimax_dspark_forward PROPERTIES FIXTURES_REQUIRED minimax_dspark_model_fixture FIXTURES_SETUP minimax_dspark_output RUN_SERIAL TRUE LABELS "gpu")
+add_test(NAME minimax_dspark_reference COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_dspark_reference.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture --engine-dir ${CMAKE_BINARY_DIR}/minimax_dspark_oracle)
+set_tests_properties(minimax_dspark_reference PROPERTIES FIXTURES_REQUIRED minimax_dspark_output LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=2")
+add_test(NAME minimax_dspark_native_forward COMMAND minimax_test --dspark-model-dir ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture --native-activations --dump ${CMAKE_BINARY_DIR}/minimax_dspark_native_oracle)
+set_tests_properties(minimax_dspark_native_forward PROPERTIES FIXTURES_REQUIRED minimax_dspark_model_fixture FIXTURES_SETUP minimax_dspark_native_output RUN_SERIAL TRUE LABELS "gpu")
+add_test(NAME minimax_dspark_native_reference COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_dspark_reference.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_dspark_target_fixture --engine-dir ${CMAKE_BINARY_DIR}/minimax_dspark_native_oracle --native-activations)
+set_tests_properties(minimax_dspark_native_reference PROPERTIES FIXTURES_REQUIRED minimax_dspark_native_output LABELS "host" ENVIRONMENT "OPENBLAS_NUM_THREADS=2")
+add_test(NAME minimax_dspark_loader COMMAND minimax_test --dspark-dir ${CMAKE_BINARY_DIR}/minimax_dspark_fixture)
+set_tests_properties(minimax_dspark_loader PROPERTIES FIXTURES_REQUIRED minimax_dspark_fixture RUN_SERIAL TRUE LABELS "gpu")
+set_tests_properties(minimax_kernel_test PROPERTIES LABELS "cuda")
+add_test(NAME minimax_forward_fixture COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_reference_dump.py --fixture ${CMAKE_BINARY_DIR}/minimax_fixture)
+set_tests_properties(minimax_forward_fixture PROPERTIES FIXTURES_SETUP minimax_fixture LABELS "host")
+add_test(NAME minimax_scoring_probe COMMAND ${Python3_EXECUTABLE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/minimax_scoring_probe.py
+  --app $<TARGET_FILE:minimax_forward_check> --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture)
+set_tests_properties(minimax_scoring_probe PROPERTIES FIXTURES_REQUIRED minimax_fixture LABELS "cuda")
+set_tests_properties(shared_prefill_test PROPERTIES FIXTURES_REQUIRED minimax_fixture)
+add_test(NAME minimax_forward_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --dump ${CMAKE_BINARY_DIR}/minimax_oracle)
+set_tests_properties(minimax_forward_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture FIXTURES_SETUP minimax_output LABELS "cuda")
+add_test(NAME minimax_native_forward_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture
+  --native-activations --native-cache --dump ${CMAKE_BINARY_DIR}/minimax_native_oracle)
+set_tests_properties(minimax_native_forward_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture LABELS "cuda")
+add_test(NAME minimax_native_activations_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --native-activations)
+set_tests_properties(minimax_native_activations_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture LABELS "cuda")
+add_test(NAME minimax_native_cache_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --native-cache)
+set_tests_properties(minimax_native_cache_smoke PROPERTIES FIXTURES_REQUIRED minimax_fixture LABELS "cuda")
+add_test(NAME minimax_forward_reference COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_reference_dump.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_fixture --check-engine-dir ${CMAKE_BINARY_DIR}/minimax_oracle)
+set_tests_properties(minimax_forward_reference PROPERTIES FIXTURES_REQUIRED minimax_output LABELS "cuda" ENVIRONMENT "OPENBLAS_NUM_THREADS=2")
+add_test(NAME minimax_binding_fixture COMMAND minimax_test --write-fixture ${CMAKE_BINARY_DIR}/minimax_binding_fixture --config ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/minimax/tiny_config.json)
+set_tests_properties(minimax_binding_fixture PROPERTIES FIXTURES_SETUP minimax_binding_fixture LABELS "host")
+add_test(NAME minimax_binding_smoke COMMAND minimax_test --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_binding_fixture --dump ${CMAKE_BINARY_DIR}/minimax_binding_oracle)
+set_tests_properties(minimax_binding_smoke PROPERTIES FIXTURES_REQUIRED minimax_binding_fixture FIXTURES_SETUP minimax_binding_output LABELS "cuda")
+add_test(NAME minimax_binding_reference COMMAND ${DSV41_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/tools/minimax_reference_dump.py --checkpoint-dir ${CMAKE_BINARY_DIR}/minimax_binding_fixture --check-engine-dir ${CMAKE_BINARY_DIR}/minimax_binding_oracle)
+set_tests_properties(minimax_binding_reference PROPERTIES FIXTURES_REQUIRED minimax_binding_output LABELS "cuda" ENVIRONMENT "OPENBLAS_NUM_THREADS=2")
+
+add_executable(minimax_prompt_test tests/host/minimax_prompt_test.cpp)
+target_link_libraries(minimax_prompt_test PRIVATE dgpp_text dgpp_loaders Threads::Threads)
+dgpp_set_common(minimax_prompt_test)
+add_test(NAME minimax_prompt_test COMMAND minimax_prompt_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/minimax_prompt_goldens.jsonl)
+set_tests_properties(minimax_prompt_test PROPERTIES LABELS "host;checkpoint" SKIP_RETURN_CODE 2)

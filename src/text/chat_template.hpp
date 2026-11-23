@@ -10,18 +10,34 @@
 // Supported statement forms: text and {{ output }} (with the full
 // whitespace-trim marker set), set (name or namespace-attribute target),
 // if/elif/else, for (single or (k, v) tuple targets, with loop meta and
-// {% break %}), and macro definitions. Macros resolve at RENDER time
+// {% break %}), macro definitions, and transformers' {% generation %}
+// block, which renders its body as written in a scope of its own (the
+// span an assistant turn generates). Macros resolve at RENDER time
 // (tool_to_json lives inside {% if tools %} — a falsy `tools` leaves it
 // undefined, exactly like Jinja), close over the root frame only, and
 // return their rendered body as a string.
 //
-// Supported expressions: string/int/true/false/none literals, names,
-// attribute access (digit names index lists, like Jinja's foo.0),
-// subscripts (negative indexes included), method calls (items/split/
-// strip), filters (capitalize/tojson/replace/length), the is-tests
-// (defined/none/string/mapping/iterable, with `is not`), in/not in,
-// ==/!=/</<=/>/>=, and/or/not, + and ~ concatenation, unary minus on
-// int literals, and a if b else c. The globals namespace() and range(a,b)
+// Names resolve as jinja2 resolves them, from the syntax tree: the top
+// level, a for body, a macro body, the body of a block set and a generation
+// block are each a scope, and a scope that assigns a name owns it for its
+// whole extent. When the assignment is the scope's first mention of the
+// name and is not under an `if`, the name is undefined in that scope until
+// the assignment runs: also for a nested scope that reads it earlier, and
+// also when the render supplies a global of the same name. A macro
+// parameter's default is evaluated in the macro's scope, where it reads the
+// parameters before it and the top level.
+//
+// Supported expressions: string/int/float/true/false/none literals, list,
+// tuple and dict literals, names, attribute access (digit names index
+// lists, like Jinja's foo.0), subscripts and slices (negative indexes
+// included), method calls (items/split/strip/startswith/endswith/rstrip/
+// lstrip), filters (capitalize/tojson/replace/length/trim/default/string/
+// safe/items/float/dictsort), the is-tests (defined/undefined/none/string/
+// mapping/iterable/sequence/true/false/boolean, with `is not`), in/not in,
+// ==/!=/</<=/>/>=, and/or/not, + on numbers, strings and lists, - on
+// numbers, ~ concatenation, unary minus on number literals, and a if b else
+// c. tojson takes ensure_ascii, sort_keys and separators as transformers'
+// override does. The globals raise_exception(), namespace() and range(a,b)
 // are the only functions.
 //
 // Unsupported constructs are rejected during parsing with the construct
@@ -115,6 +131,16 @@ class Value {
   // json.dumps(ensure_ascii=...) semantics — the transformers tojson
   // override. Throws for Namespace/Macro (Python raises on objects).
   std::string to_json(bool ensure_ascii) const;
+  // json.dumps with its sort_keys and separators arguments: keys in code
+  // point order at every level, and the two separators between items and
+  // after a key (Python's defaults are ", " and ": ").
+  struct JsonStyle {
+    bool ensure_ascii = false;
+    bool sort_keys = false;
+    std::string item_separator = ", ";
+    std::string key_separator = ": ";
+  };
+  std::string to_json(const JsonStyle& style) const;
 
   // Attribute read. Digit names are list/string indexes (Jinja's foo.0).
   // 'items' on a Map and 'split'/'strip' on a String produce Method
